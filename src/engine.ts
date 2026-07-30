@@ -235,7 +235,8 @@ export class EngineImpl implements Engine {
   private async evaluateDecision(flow: FlowModel, inst: ProcessInstance, node: FlowNode, operator: string, vars: Record<string, any>): Promise<void> {
     // 自定义决策处理器
     if (this.ext?.decisionHandler) {
-      const branchId = await this.ext.decisionHandler(node, inst, vars)
+      const handlerName = (node.properties?.decisionHandler as string) ?? ''
+      const branchId = await this.ext.decisionHandler(handlerName, node, inst, vars)
       if (branchId) {
         for (const edge of flow.edges) {
           if (edge.id === branchId) {
@@ -266,7 +267,7 @@ export class EngineImpl implements Engine {
   }
 
   private async createTask(node: FlowNode, inst: ProcessInstance, operator: string, _vars: Record<string, any>): Promise<void> {
-    const actors = this.resolveActors(node, inst)
+    const actors = await this.resolveActors(node, inst)
     if (!actors.length) return
     const performType = parseInt(String(node.properties?.performType ?? '0'))
     const ct = node.properties?.countersignType as string | undefined
@@ -306,10 +307,11 @@ export class EngineImpl implements Engine {
     }
   }
 
-  private resolveActors(node: FlowNode, inst: ProcessInstance): string[] {
+  private async resolveActors(node: FlowNode, inst: ProcessInstance): Promise<string[]> {
     // 1. 动态指派（优先级最高）
     if (this.ext?.assignmentHandler) {
-      const result = this.ext.assignmentHandler(node, inst)
+      const handlerName = (node.properties?.assignmentHandler as string) ?? ''
+      const result = await this.ext.assignmentHandler(handlerName, node, inst)
       if (Array.isArray(result) && result.length > 0) return result
     }
     // 2. 固定指派 assignee
