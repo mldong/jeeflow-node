@@ -5,6 +5,7 @@ import {
   InstanceState, TaskState,
 } from './model.js'
 import type { ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
+import { type EngineExtensions, type FlowInterceptor, type AssignmentHandler, type DecisionHandler, type ProcessEventListener, EventType, type ProcessEvent } from './extensions.js'
 
 export const KeySubmitType   = 'submitType'
 export const KeyBusinessNo   = 'BUSINESS_NO'
@@ -23,12 +24,31 @@ export interface Engine {
 }
 
 export class EngineImpl implements Engine {
+  private ext?: EngineExtensions
+
   constructor(
     private repo: ProcessRepository,
     private userProv?: UserProvider,
     private idGen?: IDGenerator,
     private exprEval?: ExpressionEvaluator,
   ) {}
+
+  setExtensions(ext: EngineExtensions) { this.ext = ext }
+
+  private async firePre(node: FlowNode, inst: ProcessInstance): Promise<boolean> {
+    if (!this.ext?.interceptors) return true
+    for (const ic of this.ext.interceptors.sort((a, b) => a.order - b.order))
+      if (!(await ic.preHandle(node, inst))) return false
+    return true
+  }
+  private async firePost(node: FlowNode, inst: ProcessInstance) {
+    if (!this.ext?.interceptors) return
+    for (const ic of this.ext.interceptors) await ic.postHandle(node, inst)
+  }
+  private async fireEvent(evt: ProcessEvent) {
+    if (!this.ext?.listeners) return
+    for (const l of this.ext.listeners) await l(evt)
+  }
 
   // ─── Start ─────────────────────────────────────────────────────────────────
 
@@ -50,6 +70,7 @@ export class EngineImpl implements Engine {
       tasks: [],
     }
     await this.repo.saveInstance(inst)
+    await this.fireEvent({ type: EventType.ProcessStart, instanceId: inst.id, operator })
 
     const startNode = findNodeByType(flow, TypeStart)
     if (!startNode) throw new Error('no start node')
@@ -181,6 +202,8 @@ export class EngineImpl implements Engine {
   }
 
   private async executeNode(flow: FlowModel, inst: ProcessInstance, node: FlowNode, operator: string, vars: Record<string, any>): Promise<void> {
+    if (!(await this.firePre(node, inst))) return
+    try {
     switch (node.type) {
       case TypeTask: case TypeCustom:
         return this.createTask(node, inst, operator, vars)
@@ -202,6 +225,7 @@ export class EngineImpl implements Engine {
         await this.repo.updateInstance(inst)
         return
     }
+    } finally { await this.firePost(node, inst) }
   }
 
   private async evaluateDecision(flow: FlowModel, inst: ProcessInstance, node: FlowNode, operator: string, vars: Record<string, any>): Promise<void> {
