@@ -6,6 +6,7 @@ import {
 } from './model.js'
 import type { ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
 import { type EngineExtensions, type FlowInterceptor, type AssignmentHandler, type DecisionHandler, type ProcessEventListener, EventType, type ProcessEvent } from './extensions.js'
+import { HandlerRegistry } from './registry.js'
 
 export const KeySubmitType   = 'submitType'
 export const KeyBusinessNo   = 'BUSINESS_NO'
@@ -25,6 +26,7 @@ export interface Engine {
 
 export class EngineImpl implements Engine {
   private ext?: EngineExtensions
+  private registry?: HandlerRegistry
 
   constructor(
     private repo: ProcessRepository,
@@ -34,6 +36,7 @@ export class EngineImpl implements Engine {
   ) {}
 
   setExtensions(ext: EngineExtensions) { this.ext = ext }
+  setRegistry(reg: HandlerRegistry) { this.registry = reg }
 
   private async firePre(node: FlowNode, inst: ProcessInstance): Promise<boolean> {
     if (!this.ext?.interceptors) return true
@@ -233,7 +236,25 @@ export class EngineImpl implements Engine {
   }
 
   private async evaluateDecision(flow: FlowModel, inst: ProcessInstance, node: FlowNode, operator: string, vars: Record<string, any>): Promise<void> {
-    // 自定义决策处理器
+    // 自定义决策（Registry 优先）
+    if (this.registry) {
+      const handlerName = (node.properties?.decisionHandler as string) ?? ''
+      if (handlerName) {
+        const h = this.registry.resolveDecision(handlerName)
+        if (h) {
+          const branchId = await h.decide(node, inst, vars)
+          if (branchId) {
+            for (const edge of flow.edges) {
+              if (edge.id === branchId) {
+                const target = findNode(flow, edge.targetNodeId)
+                if (target) return this.executeNode(flow, inst, target, operator, vars)
+              }
+            }
+          }
+        }
+      }
+    }
+    // 自定义决策（Extensions 兼容）
     if (this.ext?.decisionHandler) {
       const handlerName = (node.properties?.decisionHandler as string) ?? ''
       const branchId = await this.ext.decisionHandler(handlerName, node, inst, vars)
@@ -308,7 +329,15 @@ export class EngineImpl implements Engine {
   }
 
   private async resolveActors(node: FlowNode, inst: ProcessInstance): Promise<string[]> {
-    // 1. 动态指派（优先级最高）
+    // 1a. Registry 按名称解析（推荐）
+    if (this.registry) {
+      const handlerName = (node.properties?.assignmentHandler as string) ?? ''
+      if (handlerName) {
+        const h = this.registry.resolveAssignment(handlerName)
+        if (h) return await h.assign(node, inst)
+      }
+    }
+    // 1b. Extensions 兼容
     if (this.ext?.assignmentHandler) {
       const handlerName = (node.properties?.assignmentHandler as string) ?? ''
       const result = await this.ext.assignmentHandler(handlerName, node, inst)
