@@ -1,0 +1,41 @@
+{
+  "name": "jeeflow",
+  "version": "0.1.0",
+  "description": "jeeflow workflow engine — Node.js / TypeScript implementation",
+  "type": "module",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
+  "exports": {
+    ".": "./src/index.js",
+    "./engine": "./src/engine.js",
+    "./model": "./src/model.js",
+    "./spi": "./src/spi.js",
+    "./memory": "./src/memory.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "node --import tsx __tests__/spec.test.ts",
+    "demo": "node --import tsx demo/main.ts"
+  },
+  "keywords": [
+    "workflow",
+    "engine",
+    "jeeflow",
+    "typescript"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "@nestjs/common": "^11.1.28",
+    "@nestjs/core": "^11.1.28",
+    "@nestjs/platform-express": "^11.1.28",
+    "@nestjs/serve-static": "^5.0.5",
+    "@types/express": "^5.0.6",
+    "express": "^5.2.1",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2"
+  }
+}
