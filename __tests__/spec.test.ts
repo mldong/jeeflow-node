@@ -5,6 +5,7 @@ import { EngineImpl } from '../src/engine.js'
 import { MemoryRepository } from '../src/memory.js'
 import { InstanceState, type ProcessDefine, type ProcessInstance, type ProcessTask } from '../src/model.js'
 import type { ExpressionEvaluator, UserProvider } from '../src/spi.js'
+import { type FlowInterceptor, EventType, type EngineExtensions } from '../src/extensions.js'
 
 const flowDir = '../jeeflow-java/jeeflow-core/src/test/resources/flows/'
 
@@ -182,5 +183,31 @@ describe('jeeflow compliance tests', () => {
     await repo.addTaskActor(doing[0].id, ['leader'])
     doing[0].actorIds = ['leader']
     await assert.rejects(() => engine.executeProcessTask(doing[0].id, 'intruder'), /not allowed/)
+  })
+
+  it('10 interceptor + events', async () => {
+    const { engine, repo } = setup()
+    const def = loadFlow(repo, '01-simple.json')
+    let preCalled = false, postCalled = false
+    const events: string[] = []
+    engine.setExtensions({
+      interceptors: [{ order: 1,
+        async preHandle() { preCalled = true; return true },
+        async postHandle() { postCalled = true },
+      }],
+      listeners: [(e) => {
+        if (e.type === EventType.ProcessStart) events.push('start')
+        if (e.type === EventType.TaskComplete) events.push('taskDone')
+        if (e.type === EventType.ProcessFinish) events.push('finish')
+      }],
+    })
+    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    const doing = await repo.findDoingTasks(inst.id)
+    await repo.addTaskActor(doing[0].id, ['applicant'])
+    doing[0].actorIds.push('applicant')
+    await engine.executeProcessTask(doing[0].id, 'applicant')
+    assert.ok(preCalled)
+    assert.ok(postCalled)
+    assert.deepStrictEqual(events, ['start', 'taskDone', 'finish'])
   })
 })

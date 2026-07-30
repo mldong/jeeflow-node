@@ -96,6 +96,7 @@ export class EngineImpl implements Engine {
     task.updateUser = operator
     task.variables = vars
     await this.repo.updateTask(task)
+    await this.fireEvent({ type: EventType.TaskComplete, instanceId: inst.id, taskId: task.id, nodeId: task.taskName, operator })
 
     const def = await this.repo.findDefineById(inst.defineId)
     const flow: FlowModel = JSON.parse(typeof def!.content === 'string' ? def!.content : new TextDecoder().decode(def!.content as Uint8Array))
@@ -133,6 +134,7 @@ export class EngineImpl implements Engine {
           inst.updateTime = new Date()
           inst.variables = vars
           await this.repo.updateInstance(inst)
+          await this.fireEvent({ type: EventType.ProcessFinish, instanceId: inst.id, operator })
         } else {
           await this.executeNode(flow, inst, node, operator, vars)
         }
@@ -158,8 +160,9 @@ export class EngineImpl implements Engine {
     task.updateTime = now
     await this.repo.updateTask(task)
     inst.state = InstanceState.Reject
-    inst.updateTime = now
+    inst.updateTime = new Date()
     await this.repo.updateInstance(inst)
+    await this.fireEvent({ type: EventType.ProcessReject, instanceId: inst.id, taskId, operator })
     return inst
   }
 
@@ -223,12 +226,26 @@ export class EngineImpl implements Engine {
         inst.updateTime = new Date()
         inst.variables = vars
         await this.repo.updateInstance(inst)
+        await this.fireEvent({ type: EventType.ProcessFinish, instanceId: inst.id, operator })
         return
     }
     } finally { await this.firePost(node, inst) }
   }
 
   private async evaluateDecision(flow: FlowModel, inst: ProcessInstance, node: FlowNode, operator: string, vars: Record<string, any>): Promise<void> {
+    // 自定义决策处理器
+    if (this.ext?.decisionHandler) {
+      const branchId = await this.ext.decisionHandler(node, inst, vars)
+      if (branchId) {
+        for (const edge of flow.edges) {
+          if (edge.id === branchId) {
+            const target = findNode(flow, edge.targetNodeId)
+            if (target) return this.executeNode(flow, inst, target, operator, vars)
+          }
+        }
+      }
+    }
+    // 表达式决策
     for (const edge of flow.edges) {
       if (edge.sourceNodeId !== node.id) continue
       const expr = edge.properties?.expr as string | undefined
@@ -249,7 +266,7 @@ export class EngineImpl implements Engine {
   }
 
   private async createTask(node: FlowNode, inst: ProcessInstance, operator: string, _vars: Record<string, any>): Promise<void> {
-    const actors = this.resolveActors(node)
+    const actors = this.resolveActors(node, inst)
     if (!actors.length) return
     const performType = parseInt(String(node.properties?.performType ?? '0'))
     const ct = node.properties?.countersignType as string | undefined
@@ -289,7 +306,13 @@ export class EngineImpl implements Engine {
     }
   }
 
-  private resolveActors(node: FlowNode): string[] {
+  private resolveActors(node: FlowNode, inst: ProcessInstance): string[] {
+    // 1. 动态指派（优先级最高）
+    if (this.ext?.assignmentHandler) {
+      const result = this.ext.assignmentHandler(node, inst)
+      if (Array.isArray(result) && result.length > 0) return result
+    }
+    // 2. 固定指派 assignee
     const assignee = node.properties?.assignee as string | undefined
     if (assignee) return assignee.split(',').map(s => s.trim()).filter(Boolean)
     return []
