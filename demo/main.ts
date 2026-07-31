@@ -1,6 +1,6 @@
-// jeeflow-node Express demo — 对齐 Java/Go 版 REST 路径
+// jeeflow-node Express demo — 对齐 Java/Go/Python 版 REST 路径
 import express from 'express'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { EngineImpl } from '../src/engine.js'
@@ -10,27 +10,55 @@ import type { ProcessDefine } from '../src/model.js'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
 const repo = new MemoryRepository()
-const engine = new EngineImpl(repo)
+const engine = new EngineImpl(repo, undefined, undefined, {
+  async eval(expr: string, vars: Record<string, any>) {
+    const amt = Number(vars?.amount)
+    if (isNaN(amt)) return false
+    if (expr === 'amount > 1000') return amt > 1000
+    if (expr === 'amount >= 1000') return amt >= 1000
+    if (expr === 'amount < 1000') return amt < 1000
+    if (expr === 'amount <= 1000') return amt <= 1000
+    if (expr === 'amount == 1000') return amt === 1000
+    if (expr === 'amount != 1000') return amt !== 1000
+    return false
+  }
+})
 
-// ─── 预置流程 ──────────────────────────────────────────────────────────────────
-const flows: ProcessDefine[] = [
-  { id: 1, name: 'leave', displayName: '请假审批', type: 'approval', state: 1, version: 1,
-    content: `{"name":"leave","displayName":"请假审批","type":"approval","nodes":[{"id":"start","type":"snaker:start","x":100,"y":200,"properties":{},"text":{"value":"开始"}},{"id":"task1","type":"snaker:task","x":300,"y":200,"properties":{"form":"leave-form","assignee":"leader","taskType":0,"performType":0},"text":{"value":"组长审批"}},{"id":"end","type":"snaker:end","x":500,"y":200,"properties":{},"text":{"value":"结束"}}],"edges":[{"id":"e1","sourceNodeId":"start","targetNodeId":"task1","properties":{}},{"id":"e2","sourceNodeId":"task1","targetNodeId":"end","properties":{}}]}`,
-    createTime: new Date(), updateTime: new Date(), createUser: '', updateUser: '' },
-  { id: 2, name: 'three-level', displayName: '三级审批', type: 'approval', state: 1, version: 1,
-    content: `{"name":"three-level","displayName":"三级审批","type":"approval","nodes":[{"id":"start","type":"snaker:start","x":100,"y":200,"properties":{},"text":{"value":"开始"}},{"id":"t1","type":"snaker:task","x":250,"y":200,"properties":{"form":"approval-form","assignee":"leader","taskType":0,"performType":0},"text":{"value":"组长审批"}},{"id":"t2","type":"snaker:task","x":400,"y":200,"properties":{"form":"approval-form","assignee":"manager","taskType":0,"performType":0},"text":{"value":"经理审批"}},{"id":"t3","type":"snaker:task","x":550,"y":200,"properties":{"form":"approval-form","assignee":"boss","taskType":0,"performType":0},"text":{"value":"总监审批"}},{"id":"end","type":"snaker:end","x":700,"y":200,"properties":{},"text":{"value":"结束"}}],"edges":[{"id":"e1","sourceNodeId":"start","targetNodeId":"t1","properties":{}},{"id":"e2","sourceNodeId":"t1","targetNodeId":"t2","properties":{}},{"id":"e3","sourceNodeId":"t2","targetNodeId":"t3","properties":{}},{"id":"e4","sourceNodeId":"t3","targetNodeId":"end","properties":{}}]}`,
-    createTime: new Date(), updateTime: new Date(), createUser: '', updateUser: '' },
-  { id: 3, name: 'expense', displayName: '报销审批', type: 'finance', state: 1, version: 1,
-    content: `{"name":"expense","displayName":"报销审批","type":"finance","nodes":[{"id":"start","type":"snaker:start","x":100,"y":200,"properties":{},"text":{"value":"开始"}},{"id":"apply","type":"snaker:task","x":300,"y":200,"properties":{"form":"expense-form","assignee":"leader","taskType":0,"performType":0},"text":{"value":"填写报销单"}},{"id":"decision","type":"snaker:decision","x":500,"y":200,"properties":{"expr":"amount > 1000"},"text":{"value":"金额>1000?"}},{"id":"manager","type":"snaker:task","x":700,"y":100,"properties":{"form":"expense-form","assignee":"manager","taskType":0,"performType":0},"text":{"value":"经理审批"}},{"id":"director","type":"snaker:task","x":700,"y":300,"properties":{"form":"expense-form","assignee":"director","taskType":0,"performType":0},"text":{"value":"总监审批"}},{"id":"end","type":"snaker:end","x":900,"y":200,"properties":{},"text":{"value":"结束"}}],"edges":[{"id":"e1","sourceNodeId":"start","targetNodeId":"apply","properties":{}},{"id":"e2","sourceNodeId":"apply","targetNodeId":"decision","properties":{}},{"id":"e3","sourceNodeId":"decision","targetNodeId":"manager","properties":{"expr":"amount > 1000"},"text":{"value":"金额>1000"}},{"id":"e4","sourceNodeId":"decision","targetNodeId":"director","properties":{"expr":"amount <= 1000"},"text":{"value":"金额≤1000"}},{"id":"e5","sourceNodeId":"manager","targetNodeId":"end","properties":{}},{"id":"e6","sourceNodeId":"director","targetNodeId":"end","properties":{}}]}`,
-    createTime: new Date(), updateTime: new Date(), createUser: '', updateUser: '' },
-]
-flows.forEach(f => repo.addDefine(f))
+// ─── 从共享 JSON 文件加载所有流程 ────────────────────────────────────────────────
+let flowsDir = join(__dirname, '..', '..', 'jeeflow-java', 'jeeflow-core', 'src', 'test', 'resources', 'flows')
+try {
+  const files = readdirSync(flowsDir).filter(f => f.endsWith('.json')).sort()
+  files.forEach((fname, i) => {
+    const content = readFileSync(join(flowsDir, fname), 'utf-8')
+    const raw = JSON.parse(content)
+    const def: ProcessDefine = {
+      id: i + 1,
+      name: raw.name || fname,
+      displayName: raw.displayName || fname,
+      type: raw.type || 'approval',
+      state: 1, version: 1,
+      content,
+      createTime: new Date(), updateTime: new Date(),
+      createUser: '', updateUser: '',
+    }
+    repo.addDefine(def)
+    console.log(`  loaded: ${def.id} ${def.displayName}`)
+  })
+} catch(e) {
+  console.error('Flow load error:', e)
+}
 
 const app = express()
 app.use(express.json())
 
-// 静态文件
-app.get('/', (_req, res) => res.sendFile(join(__dirname, 'web', 'index.html')))
+// CORS——允许 jeeflow-ui (localhost:5173) 跨域访问
+app.use((_req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*')
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS, PUT, DELETE')
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+  if (_req.method === 'OPTIONS') return res.sendStatus(204)
+  next()
+})
 
 // ─── API ──────────────────────────────────────────────────────────────────────
 
@@ -52,10 +80,26 @@ app.post('/wf/processDefine/page', (_req, res) => {
   res.json({ code: 200, data: { rows: repo.allDefines().map(d => ({ id: d.id, name: d.name, displayName: d.displayName })) } })
 })
 
+app.post('/wf/processDefine/detail', async (req, res) => {
+  const def = repo.allDefines().find(d => d.id === Number(req.body.id))
+  if (!def) return res.json({ code: 500, message: '流程定义不存在' })
+  res.json({ code: 200, data: { id: def.id, name: def.name, displayName: def.displayName,
+    type: def.type, state: def.state, version: def.version,
+    graphData: JSON.parse(def.content) } })
+})
+
 app.post('/wf/processInstance/startAndExecute', async (req, res) => {
-  const { processDefineId, operator = 'user1', amount } = req.body
-  const inst = await engine.startProcessInstanceById(Number(processDefineId), operator, { BUSINESS_NO: 'BIZ-' + Date.now(), amount: Number(amount ?? 0) })
-  res.json({ code: 200, data: { processInstanceId: String(inst.id) } })
+  try {
+    const { processDefineId, operator = 'user1', amount } = req.body
+    const inst = await engine.startProcessInstanceById(Number(processDefineId), operator, { BUSINESS_NO: 'BIZ-' + Date.now(), amount: Number(amount ?? 0) })
+    // boot2 契约：自动完成申请节点
+    const doing = await repo.findDoingTasks(inst.id)
+    for (const task of doing) {
+      await repo.addTaskActor(task.id, [operator])
+      await engine.executeProcessTask(task.id, operator, { submitType: 0 }) // APPLY
+    }
+    res.json({ code: 200, data: { processInstanceId: String(inst.id) } })
+  } catch (e: any) { res.json({ code: 500, message: e.message }) }
 })
 
 app.post('/wf/processInstance/page', (_req, res) => {
@@ -97,8 +141,17 @@ app.post('/wf/processTask/execute', async (req, res) => {
   try {
     const { processTaskId, operator, submitType } = req.body
     const args = { submitType: Number(submitType) }
-    if (Number(submitType) === 1) await engine.executeProcessTask(Number(processTaskId), operator, args)
-    else await engine.executeAndJumpToEnd(Number(processTaskId), operator, args)
+    switch (Number(submitType)) {
+      case 0: // APPLY
+      case 1: // AGREE
+        await engine.executeProcessTask(Number(processTaskId), operator, args)
+        break
+      case 2: // REJECT → jump back to apply node
+        await engine.executeAndJumpTask(Number(processTaskId), operator, args, 'apply')
+        break
+      default:
+        await engine.executeProcessTask(Number(processTaskId), operator, args)
+    }
     res.json({ code: 200, data: { message: '处理成功' } })
   } catch (e: any) { res.json({ code: 500, message: e.message }) }
 })
