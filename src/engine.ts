@@ -22,6 +22,7 @@ export interface Engine {
   executeProcessTask(taskId: number, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
   executeAndJumpToEnd(taskId: number, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
   executeAndJumpTask(taskId: number, operator: string, args: Record<string, any>, targetTaskName?: string): Promise<ProcessInstance>
+  executeAndJumpToFirstTaskNode(taskId: number, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
 }
 
 export class EngineImpl implements Engine {
@@ -175,6 +176,33 @@ export class EngineImpl implements Engine {
     return inst
   }
 
+  // ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）────────────
+
+  async executeAndJumpToFirstTaskNode(taskId: number, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
+    const { task, inst } = await this.loadAndCheck(taskId, operator)
+    const now = new Date()
+    // 聚合根：废弃所有进行中任务
+    for (const t of inst.abandonAllDoing(now)) await this.repo.updateTask(t)
+    // 子实体：完成任务
+    task.finish(operator, task.variables, now)
+    await this.repo.updateTask(task)
+    // 找到第一个任务节点，强制参与者为发起人，重新执行
+    const def = await this.repo.findDefineById(inst.defineId)
+    const flow: FlowModel = JSON.parse(typeof def!.content === 'string' ? def!.content : new TextDecoder().decode(def!.content as Uint8Array))
+    const startNode = findNodeByType(flow, TypeStart)
+    if (startNode) {
+      for (const node of followEdges(flow, startNode.id)) {
+        if (node.type === TypeTask || node.type === TypeCustom) {
+          node.properties = node.properties ?? {}
+          node.properties.assignee = inst.operator
+          await this.executeNode(flow, inst, node, operator, inst.variables)
+          break
+        }
+      }
+    }
+    return inst
+  }
+
   // ─── Helpers ───────────────────────────────────────────────────────────────
 
   private async loadAndCheck(taskId: number, operator: string) {
@@ -312,9 +340,12 @@ export class EngineImpl implements Engine {
       const result = await this.ext.assignmentHandler(handlerName, node, inst)
       if (Array.isArray(result) && result.length > 0) return result
     }
-    // 2. 固定指派 assignee
+    // 2. 固定指派 assignee（boot2 约定："applicant" → 解析为流程发起人）
     const assignee = node.properties?.assignee as string | undefined
-    if (assignee) return assignee.split(',').map(s => s.trim()).filter(Boolean)
+    if (assignee) {
+      const actors = assignee.split(',').map(s => s.trim()).filter(Boolean)
+      return actors.map(a => (a === 'applicant' ? inst.operator : a))
+    }
     return []
   }
 
