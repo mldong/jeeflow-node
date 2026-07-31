@@ -1,7 +1,7 @@
 import {
   type FlowModel, type FlowNode,
   TypeStart, TypeEnd, TypeTask, TypeDecision, TypeFork, TypeJoin, TypeCustom,
-  type ProcessInstance, type ProcessTask, type ProcessDefine,
+  ProcessInstance, type ProcessTask, type ProcessDefine,
   InstanceState, TaskState,
 } from './model.js'
 import type { ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
@@ -65,13 +65,8 @@ export class EngineImpl implements Engine {
     await this.addUserInfo(operator, vars)
 
     const now = new Date()
-    const inst: ProcessInstance = {
-      id: this.nextId(), defineId, state: InstanceState.Doing,
-      operator, variables: vars,
-      parentNodeName: '', businessNo: vars[KeyBusinessNo] ?? '',
-      createTime: now, updateTime: now, createUser: operator, updateUser: operator,
-      tasks: [],
-    }
+    // 聚合根工厂创建实例
+    const inst = ProcessInstance.create(this.nextId(), defineId, operator, vars, now)
     await this.repo.saveInstance(inst)
     await this.fireEvent({ type: EventType.ProcessStart, instanceId: inst.id, operator })
 
@@ -92,12 +87,8 @@ export class EngineImpl implements Engine {
     await this.addUserInfo(operator, vars)
 
     const now = new Date()
-    task.taskState = TaskState.Done
-    task.actorId = operator
-    task.finishTime = now
-    task.updateTime = now
-    task.updateUser = operator
-    task.variables = vars
+    // 聚合根：完成任务（子实体状态转换 + 实例变量合并）
+    inst.completeTask(task, operator, vars, now)
     await this.repo.updateTask(task)
     await this.fireEvent({ type: EventType.TaskComplete, instanceId: inst.id, taskId: task.id, nodeId: task.taskName, operator })
 
@@ -114,7 +105,8 @@ export class EngineImpl implements Engine {
         if (doing.length === 0) {
           const [actors, lc] = getCsState(vars, curNode.id)
           if (actors && lc + 1 < actors.length) {
-            const nt = this.newTask(curNode, inst, actors[lc + 1], operator, now)
+            // 聚合根：创建串行会签下一步任务
+            const nt = inst.createTask(this.nextId(), curNode.id, curNode.text.value, actors[lc + 1], operator, curNode.properties?.form ?? '', now)
             nt.variables = {
               [`nrOfInstances_${curNode.id}`]: actors.length,
               [`loopCounter_${curNode.id}`]: lc + 1,
@@ -133,8 +125,8 @@ export class EngineImpl implements Engine {
       }
       for (const node of followEdges(flow, curNode.id)) {
         if (node.type === TypeEnd) {
-          inst.state = InstanceState.Done
-          inst.updateTime = new Date()
+          // 聚合根：流程完成
+          inst.finish(new Date())
           inst.variables = vars
           await this.repo.updateInstance(inst)
           await this.fireEvent({ type: EventType.ProcessFinish, instanceId: inst.id, operator })
@@ -151,19 +143,13 @@ export class EngineImpl implements Engine {
   async executeAndJumpToEnd(taskId: number, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
     const { task, inst } = await this.loadAndCheck(taskId, operator)
     const now = new Date()
-    const doing = await this.repo.findDoingTasks(inst.id)
-    for (const t of doing) {
-      t.taskState = TaskState.Abandoned
-      t.updateTime = now
-      await this.repo.updateTask(t)
-    }
-    task.taskState = TaskState.Done
-    task.actorId = operator
-    task.finishTime = now
-    task.updateTime = now
+    // 聚合根：废弃所有进行中任务
+    for (const t of inst.abandonAllDoing(now)) await this.repo.updateTask(t)
+    // 子实体：完成任务
+    task.finish(operator, task.variables, now)
     await this.repo.updateTask(task)
-    inst.state = InstanceState.Reject
-    inst.updateTime = new Date()
+    // 聚合根：驳回
+    inst.reject(now)
     await this.repo.updateInstance(inst)
     await this.fireEvent({ type: EventType.ProcessReject, instanceId: inst.id, taskId, operator })
     return inst
@@ -174,16 +160,10 @@ export class EngineImpl implements Engine {
   async executeAndJumpTask(taskId: number, operator: string, args: Record<string, any> = {}, targetTaskName?: string): Promise<ProcessInstance> {
     const { task, inst } = await this.loadAndCheck(taskId, operator)
     const now = new Date()
-    const doing = await this.repo.findDoingTasks(inst.id)
-    for (const t of doing) {
-      t.taskState = TaskState.Abandoned
-      t.updateTime = now
-      await this.repo.updateTask(t)
-    }
-    task.taskState = TaskState.Done
-    task.actorId = operator
-    task.finishTime = now
-    task.updateTime = now
+    // 聚合根：废弃所有进行中任务
+    for (const t of inst.abandonAllDoing(now)) await this.repo.updateTask(t)
+    // 子实体：完成任务
+    task.finish(operator, task.variables, now)
     await this.repo.updateTask(task)
 
     if (targetTaskName) {
@@ -225,8 +205,7 @@ export class EngineImpl implements Engine {
         return
       }
       case TypeEnd:
-        inst.state = InstanceState.Done
-        inst.updateTime = new Date()
+        inst.finish(new Date())
         inst.variables = vars
         await this.repo.updateInstance(inst)
         await this.fireEvent({ type: EventType.ProcessFinish, instanceId: inst.id, operator })
@@ -293,14 +272,15 @@ export class EngineImpl implements Engine {
     const performType = parseInt(String(node.properties?.performType ?? '0'))
     const ct = node.properties?.countersignType as string | undefined
     const now = new Date()
+    const form = node.properties?.form ?? ''
 
     if (performType === 1 && ct) {
       switch (ct) {
         case 'PARALLEL':
-          for (const actor of actors) await this.repo.saveTask(this.newTask(node, inst, actor, operator, now))
+          for (const actor of actors) await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now))
           return
         case 'SEQUENTIAL': {
-          const nt = this.newTask(node, inst, actors[0], operator, now)
+          const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now)
           nt.variables = {
             [`nrOfInstances_${node.id}`]: actors.length,
             [`loopCounter_${node.id}`]: 0,
@@ -310,22 +290,11 @@ export class EngineImpl implements Engine {
           return
         }
         default:
-          for (const actor of actors) await this.repo.saveTask(this.newTask(node, inst, actor, operator, now))
+          for (const actor of actors) await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now))
           return
       }
     }
-    await this.repo.saveTask(this.newTask(node, inst, actors[0], operator, now))
-  }
-
-  private newTask(node: FlowNode, inst: ProcessInstance, actor: string, operator: string, now: Date): ProcessTask {
-    return {
-      id: this.nextId(), processInstanceId: inst.id,
-      taskName: node.id, displayName: node.text.value, taskState: TaskState.Doing,
-      actorId: '', actorIds: [actor],
-      taskType: 0, performType: 0, formKey: node.properties?.form ?? '',
-      variables: {},
-      createTime: now, updateTime: now, createUser: operator, updateUser: operator,
-    }
+    await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now))
   }
 
   private async resolveActors(node: FlowNode, inst: ProcessInstance): Promise<string[]> {
@@ -350,7 +319,8 @@ export class EngineImpl implements Engine {
   }
 
   private isAllowed(task: ProcessTask, operator: string): boolean {
-    return task.actorIds.includes(operator)
+    // 子实体：actorIds 权限判断
+    return task.isAllowed(operator)
   }
 
   private async addUserInfo(operator: string, vars: Record<string, any>) {

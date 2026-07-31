@@ -33,6 +33,19 @@ function loadFlow(repo: MemoryRepository, filename: string): ProcessDefine {
   return def
 }
 
+
+async function startAndExecute(engine: EngineImpl, repo: MemoryRepository, defineId: number, operator: string, args?: Record<string, any>) {
+  const inst = await engine.startProcessInstanceById(defineId, operator, args)
+  const doing = await repo.findDoingTasks(inst.id)
+  for (const task of doing) {
+    if (task.taskName === 'apply') {
+      await repo.addTaskActor(task.id, [operator])
+      await engine.executeProcessTask(task.id, operator)
+    }
+  }
+  return inst
+}
+
 async function assertDone(inst: ProcessInstance | null, msg: string) {
   assert.equal(inst?.state, InstanceState.Done, msg)
 }
@@ -42,7 +55,7 @@ describe('jeeflow compliance tests', () => {
   it('01 simple flow', async () => {
     const { engine, repo } = setup()
     const def = loadFlow(repo, '01-simple.json')
-    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
     const doing = await repo.findDoingTasks(inst.id)
     assert.equal(doing.length, 1)
     assert.equal(doing[0].taskName, 'task1')
@@ -55,7 +68,7 @@ describe('jeeflow compliance tests', () => {
   it('02 multi-task', async () => {
     const { engine, repo } = setup()
     const def = loadFlow(repo, '02-multi-task.json')
-    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
 
     let doing = await repo.findDoingTasks(inst.id)
     assert.equal(doing.length, 1, 'task1')
@@ -83,7 +96,7 @@ describe('jeeflow compliance tests', () => {
   it('03 decision', async () => {
     const { engine, repo } = setup()
     const def = loadFlow(repo, '03-decision-expr.json')
-    const inst = await engine.startProcessInstanceById(def.id, 'applicant', { amount: 3000 })
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant', { amount: 3000 })
     let doing = await repo.findDoingTasks(inst.id)
     await repo.addTaskActor(doing[0].id, ['applicant'])
     doing[0].actorIds.push('applicant')
@@ -95,7 +108,7 @@ describe('jeeflow compliance tests', () => {
   it('04 fork-join', async () => {
     const { engine, repo } = setup()
     const def = loadFlow(repo, '04-fork-join.json')
-    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
     let doing = await repo.findDoingTasks(inst.id)
     assert.equal(doing.length, 2, 'fork: 2 tasks')
     const tA = doing.find(t => t.taskName === 'taskA')!
@@ -114,7 +127,7 @@ describe('jeeflow compliance tests', () => {
   it('05 countersign parallel', async () => {
     const { engine, repo } = setup()
     const def = loadFlow(repo, '05-countersign-parallel.json')
-    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
     let doing = await repo.findDoingTasks(inst.id)
     assert.equal(doing.length, 3, 'parallel cs: 3 tasks')
     for (const actor of ['userA', 'userB', 'userC']) {
@@ -131,7 +144,7 @@ describe('jeeflow compliance tests', () => {
   it('06 countersign sequential', async () => {
     const { engine, repo } = setup()
     const def = loadFlow(repo, '06-countersign-sequential.json')
-    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
     let doing = await repo.findDoingTasks(inst.id)
     assert.equal(doing.length, 1, 'seq cs: 1 task')
     let t = doing[0]
@@ -150,7 +163,7 @@ describe('jeeflow compliance tests', () => {
   it('07 countersign ratio', async () => {
     const { engine, repo } = setup()
     const def = loadFlow(repo, '07-countersign-ratio.json')
-    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
     let doing = await repo.findDoingTasks(inst.id)
     assert.equal(doing.length, 4, 'ratio cs: 4 tasks')
     for (const actor of ['userA', 'userB', 'userC', 'userD']) {
@@ -167,7 +180,7 @@ describe('jeeflow compliance tests', () => {
   it('08 reject', async () => {
     const { engine, repo } = setup()
     const def = loadFlow(repo, '02-multi-task.json')
-    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
     const doing = await repo.findDoingTasks(inst.id)
     await repo.addTaskActor(doing[0].id, ['applicant'])
     doing[0].actorIds.push('applicant')
@@ -178,7 +191,7 @@ describe('jeeflow compliance tests', () => {
   it('09 permission', async () => {
     const { engine, repo } = setup()
     const def = loadFlow(repo, '02-multi-task.json')
-    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
     const doing = await repo.findDoingTasks(inst.id)
     await repo.addTaskActor(doing[0].id, ['leader'])
     doing[0].actorIds = ['leader']
@@ -201,13 +214,14 @@ describe('jeeflow compliance tests', () => {
         if (e.type === EventType.ProcessFinish) events.push('finish')
       }],
     })
-    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
     const doing = await repo.findDoingTasks(inst.id)
-    await repo.addTaskActor(doing[0].id, ['applicant'])
-    doing[0].actorIds.push('applicant')
-    await engine.executeProcessTask(doing[0].id, 'applicant')
+    await repo.addTaskActor(doing[0].id, ['leader'])
+    doing[0].actorIds.push('leader')
+    await engine.executeProcessTask(doing[0].id, 'leader')
     assert.ok(preCalled)
     assert.ok(postCalled)
-    assert.deepStrictEqual(events, ['start', 'taskDone', 'finish'])
+    // start + apply自动完成 + task1 + finish
+    assert.deepStrictEqual(events, ['start', 'taskDone', 'taskDone', 'finish'])
   })
 })

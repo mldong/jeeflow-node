@@ -63,42 +63,179 @@ export enum TaskState {
   Abandoned = 99,
 }
 
-export interface ProcessInstance {
-  id: number
+export const BusinessNoKey = 'BUSINESS_NO'
+
+// ─── 聚合根：ProcessInstance ───────────────────────────────────────────────────
+
+export class ProcessInstance {
+  id!: number
   parentId?: number
-  defineId: number
-  state: InstanceState
-  parentNodeName: string
-  businessNo: string
-  operator: string
+  defineId!: number
+  state!: InstanceState
+  parentNodeName!: string
+  businessNo!: string
+  operator!: string
   expireTime?: Date
-  variables: Record<string, any>
-  tasks: ProcessTask[]
-  createTime: Date
-  createUser: string
-  updateTime: Date
-  updateUser: string
+  variables!: Record<string, any>
+  tasks!: ProcessTask[]
+  createTime!: Date
+  createUser!: string
+  updateTime!: Date
+  updateUser!: string
+
+  constructor(data: any) {
+    Object.assign(this, data)
+  }
+
+  /** 工厂——创建流程实例 */
+  static create(id: number, defineId: number, operator: string, vars: Record<string, any>, now: Date): ProcessInstance {
+    return new ProcessInstance({
+      id, defineId, state: InstanceState.Doing,
+      operator, variables: vars,
+      parentNodeName: '', businessNo: vars[BusinessNoKey] ?? '',
+      createTime: now, updateTime: now, createUser: operator, updateUser: operator,
+      tasks: [],
+    })
+  }
+
+  /** 完成任务（子实体状态转换 + 实例变量合并） */
+  completeTask(task: ProcessTask, operator: string, vars: Record<string, any>, now: Date): void {
+    task.finish(operator, vars, now)
+    this.variables = vars
+    this.updateTime = now
+    this.updateUser = operator
+  }
+
+  /** 废弃单个任务 */
+  abandonTask(task: ProcessTask, now: Date): void {
+    task.abandon(now)
+    this.updateTime = now
+  }
+
+  /** 废弃所有进行中任务，返回被废弃列表（供调用方持久化） */
+  abandonAllDoing(now: Date): ProcessTask[] {
+    const abandoned: ProcessTask[] = []
+    for (const t of this.tasks) {
+      if (t.isDoing()) {
+        t.abandon(now)
+        abandoned.push(t)
+      }
+    }
+    this.updateTime = now
+    return abandoned
+  }
+
+  /** 流程完成 */
+  finish(now: Date): void {
+    this.state = InstanceState.Done
+    this.updateTime = now
+  }
+
+  /** 驳回流程 */
+  reject(now: Date): void {
+    this.state = InstanceState.Reject
+    this.updateTime = now
+  }
+
+  /** 追加变量 */
+  addVariable(vars: Record<string, any>): void {
+    Object.assign(this.variables, vars)
+  }
+
+  /** 获取进行中任务 */
+  getDoingTasks(): ProcessTask[] {
+    return this.tasks.filter(t => t.isDoing())
+  }
+
+  /** 获取已完成任务 */
+  getDoneTasks(): ProcessTask[] {
+    return this.tasks.filter(t => t.isFinished())
+  }
+
+  /** 所有任务是否都已完成（join 合并判断） */
+  isAllTasksFinished(): boolean {
+    return !this.tasks.some(t => t.isDoing())
+  }
+
+  /** 创建任务（子实体工厂） */
+  createTask(id: number, taskName: string, displayName: string, actor: string, operator: string, formKey: string, now: Date): ProcessTask {
+    const task = new ProcessTask({
+      id, processInstanceId: this.id,
+      taskName, displayName, taskState: TaskState.Doing,
+      actorId: '', actorIds: [actor],
+      taskType: 0, performType: 0, formKey,
+      variables: {},
+      createTime: now, updateTime: now, createUser: operator, updateUser: operator,
+    })
+    this.tasks.push(task)
+    return task
+  }
 }
 
-export interface ProcessTask {
-  id: number
-  processInstanceId: number
-  taskName: string
-  displayName: string
-  taskType: number
-  performType: number
-  taskState: TaskState
-  actorId: string
-  actorIds: string[]
+// ─── 子实体：ProcessTask ────────────────────────────────────────────────────────
+
+export class ProcessTask {
+  id!: number
+  processInstanceId!: number
+  taskName!: string
+  displayName!: string
+  taskType!: number
+  performType!: number
+  taskState!: TaskState
+  actorId!: string
+  actorIds!: string[]
   finishTime?: Date
   expireTime?: Date
-  formKey: string
+  formKey!: string
   parentTaskId?: number
-  variables: Record<string, any>
-  createTime: Date
-  createUser: string
-  updateTime: Date
-  updateUser: string
+  variables!: Record<string, any>
+  createTime!: Date
+  createUser!: string
+  updateTime!: Date
+  updateUser!: string
+
+  constructor(data: any) {
+    Object.assign(this, data)
+  }
+
+  /** 完成任务 */
+  finish(operator: string, vars: Record<string, any>, now: Date): void {
+    this.taskState = TaskState.Done
+    this.actorId = operator
+    this.finishTime = now
+    this.updateTime = now
+    this.updateUser = operator
+    this.variables = vars
+  }
+
+  /** 废弃任务 */
+  abandon(now: Date): void {
+    this.taskState = TaskState.Abandoned
+    this.updateTime = now
+  }
+
+  /** 是否进行中 */
+  isDoing(): boolean { return this.taskState === TaskState.Doing }
+
+  /** 是否已完成 */
+  isFinished(): boolean { return this.taskState === TaskState.Done }
+
+  /** 操作人是否有权限处理 */
+  isAllowed(operator: string): boolean {
+    return this.actorIds.includes(operator)
+  }
+}
+
+// ─── Clone Helpers（保留 class 原型）────────────────────────────────────────────
+
+export function cloneInstance(inst: ProcessInstance): ProcessInstance {
+  return Object.assign(Object.create(ProcessInstance.prototype), inst, {
+    tasks: inst.tasks.map(cloneTask),
+  })
+}
+
+export function cloneTask(task: ProcessTask): ProcessTask {
+  return Object.assign(Object.create(ProcessTask.prototype), task)
 }
 
 export interface UserInfo {

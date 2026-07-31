@@ -1,4 +1,5 @@
-import type { ProcessDefine, ProcessInstance, ProcessTask } from './model.js'
+import type { ProcessDefine } from './model.js'
+import { cloneInstance, cloneTask, type ProcessInstance, type ProcessTask } from './model.js'
 import type { ProcessRepository } from './spi.js'
 
 export class MemoryRepository implements ProcessRepository {
@@ -16,35 +17,48 @@ export class MemoryRepository implements ProcessRepository {
   async findDefineById(id: number) { return this.defines.get(id) ?? null }
   async saveInstance(inst: ProcessInstance) {
     if (!inst.id) inst.id = this.seq++
-    this.instances.set(inst.id, { ...inst, tasks: [] })
+    const cp = cloneInstance(inst)
+    cp.tasks = []
+    this.instances.set(inst.id, cp)
   }
   async updateInstance(inst: ProcessInstance) {
-    this.instances.set(inst.id, { ...inst, tasks: [] })
+    const cp = cloneInstance(inst)
+    cp.tasks = []
+    this.instances.set(inst.id, cp)
   }
   async findInstanceById(id: number) {
     const inst = this.instances.get(id)
     if (!inst) return null
-    const tasks: ProcessTask[] = []
+    const cp = cloneInstance(inst)
+    cp.tasks = []
     for (const t of this.tasks.values()) {
       if (t.processInstanceId === id) {
-        tasks.push({ ...t, actorIds: this.actors.get(t.id) ?? t.actorIds })
+        const tc = cloneTask(t)
+        tc.actorIds = this.actors.get(t.id) ?? t.actorIds
+        cp.tasks.push(tc)
       }
     }
-    return { ...inst, tasks }
+    return cp
   }
 
   async findTaskById(id: number) {
     const t = this.tasks.get(id)
     if (!t) return null
-    return { ...t, actorIds: this.actors.get(id) ?? t.actorIds }
+    const cp = cloneTask(t)
+    cp.actorIds = this.actors.get(id) ?? t.actorIds
+    return cp
   }
   async saveTask(task: ProcessTask) {
     if (!task.id) task.id = this.seq++
-    this.tasks.set(task.id, { ...task, actorIds: [] })
+    const cp = cloneTask(task)
+    cp.actorIds = []
+    this.tasks.set(task.id, cp)
     if (task.actorIds.length) this.actors.set(task.id, [...task.actorIds])
   }
   async updateTask(task: ProcessTask) {
-    this.tasks.set(task.id, { ...task, actorIds: [] })
+    const cp = cloneTask(task)
+    cp.actorIds = []
+    this.tasks.set(task.id, cp)
     if (task.actorIds.length) this.actors.set(task.id, [...task.actorIds])
   }
   async findDoingTasks(instanceId: number, taskNames?: string[]) {
@@ -52,7 +66,9 @@ export class MemoryRepository implements ProcessRepository {
     for (const t of this.tasks.values()) {
       if (t.processInstanceId === instanceId && t.taskState === 10) {
         if (taskNames?.length && !taskNames.includes(t.taskName)) continue
-        result.push({ ...t, actorIds: this.actors.get(t.id) ?? t.actorIds })
+        const cp = cloneTask(t)
+        cp.actorIds = this.actors.get(t.id) ?? t.actorIds
+        result.push(cp)
       }
     }
     return result
@@ -60,16 +76,22 @@ export class MemoryRepository implements ProcessRepository {
   async findDoneTasks(instanceId: number, _taskNames?: string[]) {
     const result: ProcessTask[] = []
     for (const t of this.tasks.values()) {
-      if (t.processInstanceId === instanceId && t.taskState === 20)
-        result.push({ ...t, actorIds: this.actors.get(t.id) ?? t.actorIds })
+      if (t.processInstanceId === instanceId && t.taskState === 20) {
+        const cp = cloneTask(t)
+        cp.actorIds = this.actors.get(t.id) ?? t.actorIds
+        result.push(cp)
+      }
     }
     return result
   }
   async findHistoryTasks(instanceId: number) {
     const result: ProcessTask[] = []
     for (const t of this.tasks.values()) {
-      if (t.processInstanceId === instanceId)
-        result.push({ ...t, actorIds: this.actors.get(t.id) ?? t.actorIds })
+      if (t.processInstanceId === instanceId) {
+        const cp = cloneTask(t)
+        cp.actorIds = this.actors.get(t.id) ?? t.actorIds
+        result.push(cp)
+      }
     }
     return result
   }
@@ -90,6 +112,10 @@ export class MemoryRepository implements ProcessRepository {
   allDefines() { return [...this.defines.values()] }
   allInstances() { return [...this.instances.values()] }
   allTasks() {
-    return [...this.tasks.values()].map(t => ({ ...t, actorIds: this.actors.get(t.id) ?? t.actorIds }))
+    return [...this.tasks.values()].map(t => {
+      const cp = cloneTask(t)
+      cp.actorIds = this.actors.get(t.id) ?? t.actorIds
+      return cp
+    })
   }
 }
