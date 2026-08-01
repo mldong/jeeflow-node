@@ -3,13 +3,13 @@
 [jeeflow](https://jeeflow-doc.mldong.com) 引擎规范的 **TypeScript 实现**。仅依赖 `node:*` 标准库，零外部依赖（引擎核心）。
 
 ```bash
-npm install jeeflow   # 等发布到 npm 后
+npm install @mldong/jeeflow   # 等发布到 npm 后
 ```
 
 ## 快速开始
 
 ```ts
-import { EngineImpl, MemoryRepository } from 'jeeflow'
+import { EngineImpl, MemoryRepository } from '@mldong/jeeflow'
 
 const repo = new MemoryRepository()
 const engine = new EngineImpl(repo)

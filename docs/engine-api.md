@@ -5,8 +5,8 @@
 ## 构造引擎
 
 ```ts
-import { EngineImpl } from 'jeeflow/engine'
-import { MemoryRepository } from 'jeeflow/memory'
+import { EngineImpl } from '@mldong/jeeflow/engine'
+import { MemoryRepository } from '@mldong/jeeflow/memory'
 
 const repo = new MemoryRepository()          // 内存仓储（演示/测试用）
 const engine = new EngineImpl(repo, userProv?, idGen?, exprEval?)

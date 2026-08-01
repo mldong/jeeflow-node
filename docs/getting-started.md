@@ -7,7 +7,7 @@
 ```bash
 # ⚠️ 尚未发布到 npm——源码方式使用：
 git clone https://github.com/mldong/jeeflow-node
-# 你的项目里引用源码目录（或后续发布后 npm install jeeflow）
+# 你的项目里引用源码目录（或后续发布后 npm install @mldong/jeeflow）
 ```
 
 引擎核心仅依赖 `node:*` 标准库（零外部依赖），需 Node 18+。
@@ -17,9 +17,9 @@ git clone https://github.com/mldong/jeeflow-node
 不依赖任何数据库，适合学习、测试：
 
 ```ts
-import { EngineImpl } from 'jeeflow/engine'
-import { MemoryRepository } from 'jeeflow/memory'
-import type { ProcessDefine } from 'jeeflow/model'
+import { EngineImpl } from '@mldong/jeeflow/engine'
+import { MemoryRepository } from '@mldong/jeeflow/memory'
+import type { ProcessDefine } from '@mldong/jeeflow/model'
 
 const repo = new MemoryRepository()
 // 1. 注册流程定义（LogicFlow JSON，见流程定义格式）

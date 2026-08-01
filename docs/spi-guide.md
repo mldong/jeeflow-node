@@ -33,15 +33,15 @@ interface ProcessRepository {
 ```ts
 // MySQL（npm i mysql2）
 import mysql from 'mysql2/promise'
-import { JdbcRepository } from 'jeeflow/jdbc'
-import { MysqlAdapter } from 'jeeflow/mysql'
+import { JdbcRepository } from '@mldong/jeeflow/jdbc'
+import { MysqlAdapter } from '@mldong/jeeflow/mysql'
 
 const pool = mysql.createPool({ host: '127.0.0.1', user: 'root', password: 'pwd', database: 'jeeflow' })
 const repo = new JdbcRepository(new MysqlAdapter(pool))  // 关系表主键用内置时间戳 ID 生成器
 
 // PostgreSQL（npm i pg）
 // import { Pool } from 'pg'
-// import { PostgresAdapter } from 'jeeflow/postgres'
+// import { PostgresAdapter } from '@mldong/jeeflow/postgres'
 // const pool = new Pool({ host: '127.0.0.1', user: 'root', password: 'pwd', database: 'jeeflow' })
 // const repo = new JdbcRepository(new PostgresAdapter(pool))
 ```

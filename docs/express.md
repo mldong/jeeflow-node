@@ -6,8 +6,8 @@
 
 ```ts
 import express from 'express'
-import { EngineImpl } from 'jeeflow/engine'
-import { MemoryRepository } from 'jeeflow/memory'
+import { EngineImpl } from '@mldong/jeeflow/engine'
+import { MemoryRepository } from '@mldong/jeeflow/memory'
 
 const app = express()
 app.use(express.json())

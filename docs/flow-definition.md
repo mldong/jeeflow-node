@@ -66,7 +66,7 @@
 ## Node 加载
 
 ```ts
-import type { FlowModel } from 'jeeflow/model'
+import type { FlowModel } from '@mldong/jeeflow/model'
 
 const flow: FlowModel = JSON.parse(content)   // 直接解析，类型见 src/model.ts
 ```
