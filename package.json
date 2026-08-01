@@ -1,24 +1,25 @@
 {
   "name": "jeeflow",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "jeeflow workflow engine — Node.js / TypeScript implementation",
   "type": "module",
-  "main": "./src/index.js",
-  "types": "./src/index.d.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.js",
-    "./engine": "./src/engine.js",
-    "./model": "./src/model.js",
-    "./spi": "./src/spi.js",
-    "./memory": "./src/memory.js",
-    "./jdbc": "./src/jdbc/index.js",
-    "./mysql": "./src/jdbc/mysql.js",
-    "./postgres": "./src/jdbc/postgres.js"
+    ".": "./dist/index.js",
+    "./engine": "./dist/engine.js",
+    "./model": "./dist/model.js",
+    "./spi": "./dist/spi.js",
+    "./memory": "./dist/memory.js",
+    "./jdbc": "./dist/jdbc/index.js",
+    "./mysql": "./dist/jdbc/mysql.js",
+    "./postgres": "./dist/jdbc/postgres.js"
   },
   "scripts": {
     "build": "tsc",
     "test": "node --import tsx __tests__/spec.test.ts",
-    "demo": "node --import tsx demo/main.ts"
+    "demo": "node --import tsx demo/main.ts",
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "workflow",
@@ -35,5 +36,10 @@
   "optionalDependencies": {
     "mysql2": "^3.11.0",
     "pg": "^8.13.0"
-  }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ]
 }
