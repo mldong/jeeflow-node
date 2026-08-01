@@ -11,6 +11,7 @@
 | [引擎 API](./engine-api.md) | `EngineImpl` 核心方法（TS 类型） |
 | [流程定义格式](./flow-definition.md) | LogicFlow JSON 结构、节点类型、加载 |
 | [SPI 实现指南](./spi-guide.md) | `ProcessRepository` / `UserProvider` 等 SPI |
+| [Express 集成](./express.md) | Express 应用接入（路由/CORS/端点） |
 
 ## 相关
 
