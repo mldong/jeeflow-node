@@ -3,7 +3,7 @@
 // 用法：JEFFLOW_DB=mysql|postgres node --import tsx --test __tests__/jdbc.test.ts（默认 mysql）
 // 前置条件：
 //   - 开发服务器（192.168.1.160）：MySQL(3306) / PostgreSQL(5432，Docker mldong-pg)
-//   - 建表 SQL 自动从 jeeflow-java 仓 resources/schema-<db>.sql 执行（唯一来源，IF NOT EXISTS 幂等）
+//   - 建表 SQL 自动从本仓 tests/schema/schema-<db>.sql 执行（各语言自带，IF NOT EXISTS 幂等）
 // 测试数据固定 define ID（mysql=900004 / postgres=910004），开头清理，可重复执行。
 import { after, describe, it } from 'node:test'
 import * as assert from 'node:assert/strict'
@@ -19,16 +19,22 @@ import type { IDGenerator, UserProvider } from '../src/spi.js'
 
 const dbType = process.env.JEFFLOW_DB ?? 'mysql'
 const isPg = dbType === 'postgres'
+// 连接信息可用环境变量覆盖（使用者指向自己的库），默认开发服务器
+const DB_HOST = process.env.JEFFLOW_DB_HOST ?? '192.168.1.160'
+const DB_PORT = Number(process.env.JEFFLOW_DB_PORT ?? (isPg ? 5432 : 3306))
+const DB_USER = process.env.JEFFLOW_DB_USER ?? (isPg ? 'postgres' : 'root')
+const DB_PWD = process.env.JEFFLOW_DB_PWD ?? '8Eli#gr#AUk'
 const DEFINE_ID = isPg ? 910004 : 900004
 const FLOW_DIR = '../jeeflow-java/jeeflow-core/src/test/resources/flows/'
 // 建表 SQL 唯一来源：jeeflow-java 仓 resources（schema-h2/mysql/postgres.sql，各语言引用）
-const SCHEMA_DIR = '../jeeflow-java/jeeflow-repository-jdbc/src/test/resources/'
+// 建表 SQL 各语言自带（维护者改 jeeflow-java 仓 resources 后用 scripts/sync-schema.sh 分发）
+const SCHEMA_DIR = 'tests/schema/'
 
 // ── 连接工厂：测试代码与数据库无关，只换 pool / adapter ─────────────────────
 
 const pool: any = isPg
-  ? new pg.Pool({ host: '192.168.1.160', port: 5432, user: 'postgres', password: '8Eli#gr#AUk', database: 'jeeflow', max: 5 })
-  : mysql.createPool({ host: '192.168.1.160', port: 3306, user: 'root', password: '8Eli#gr#AUk', database: 'jeeflow', charset: 'utf8mb4', connectionLimit: 5 })
+  ? new pg.Pool({ host: DB_HOST, port: DB_PORT, user: DB_USER, password: DB_PWD, database: 'jeeflow', max: 5 })
+  : mysql.createPool({ host: DB_HOST, port: DB_PORT, user: DB_USER, password: DB_PWD, database: 'jeeflow', charset: 'utf8mb4', connectionLimit: 5 })
 
 function makeAdapter(p: any) {
   return isPg ? new PostgresAdapter(p) : new MysqlAdapter(p)
@@ -36,8 +42,8 @@ function makeAdapter(p: any) {
 
 function makePool2(): any {
   return isPg
-    ? new pg.Pool({ host: '192.168.1.160', port: 5432, user: 'postgres', password: '8Eli#gr#AUk', database: 'jeeflow', max: 2 })
-    : mysql.createPool({ host: '192.168.1.160', port: 3306, user: 'root', password: '8Eli#gr#AUk', database: 'jeeflow', charset: 'utf8mb4', connectionLimit: 2 })
+    ? new pg.Pool({ host: DB_HOST, port: DB_PORT, user: DB_USER, password: DB_PWD, database: 'jeeflow', max: 2 })
+    : mysql.createPool({ host: DB_HOST, port: DB_PORT, user: DB_USER, password: DB_PWD, database: 'jeeflow', charset: 'utf8mb4', connectionLimit: 2 })
 }
 
 /** 直查（绕过仓储）：统一 `?` 占位符 + 两种驱动返回值差异 */
