@@ -1,6 +1,6 @@
 # jeeflow · Node.js / TypeScript
 
-[jeeflow](https://github.com/mldong/jeeflow-doc) 引擎规范的 **TypeScript 实现**。仅依赖 `node:*` 标准库，零外部依赖（引擎核心）。
+[jeeflow](https://jeeflow-doc.mldong.com) 引擎规范的 **TypeScript 实现**。仅依赖 `node:*` 标准库，零外部依赖（引擎核心）。
 
 ```bash
 npm install jeeflow   # 等发布到 npm 后
@@ -48,7 +48,7 @@ npm run demo     # http://localhost:8082
 
 ## 节点支持
 
-对齐 [SPEC.md](https://github.com/mldong/jeeflow-doc) v1.0——与 Java/Go 版一致。
+对齐 [SPEC.md](https://jeeflow-doc.mldong.com) v1.0——与 Java/Go 版一致。
 
 ## License
 
