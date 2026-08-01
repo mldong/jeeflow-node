@@ -94,3 +94,14 @@ const exprEval: ExpressionEvaluator = {
 const engine = new EngineImpl(new MyRepository(), userProv, idGen, exprEval)
 const inst = await engine.startProcessInstanceById(defineId, operator, args)
 ```
+
+## 集成测试
+
+`__tests__/jdbc.test.ts` **双库可跑**（同一套断言，与数据库无关）：
+
+```bash
+JEFFLOW_DB=mysql node --import tsx --test __tests__/jdbc.test.ts
+JEFFLOW_DB=postgres node --import tsx --test __tests__/jdbc.test.ts
+```
+
+建表 SQL 自动从 `tests/schema/<db>.sql` 执行（IF NOT EXISTS，幂等）。已实测：mysql 3/3、postgres 3/3 全过。

@@ -1,6 +1,6 @@
 // PostgreSQL 适配器（pg）——连接池 + `$n` 占位符。
 //
-// > 待 PostgreSQL 环境验证（MySQL 版已在开发服务器实测）。
+// > 已在开发服务器实测（PostgreSQL 16，Docker mldong-pg）。
 // > pg 无 beginTransaction API，直接执行 BEGIN/COMMIT/ROLLBACK；
 // > 其余接口与 mysql.ts 对齐——核心 SQL 由 shared.convertPlaceholder 统一转换。
 
