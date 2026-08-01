@@ -41,7 +41,7 @@ app.post('/wf/processDefine/startAndExecute', async (req, res) => {
 })
 ```
 
-端点清单与响应结构（code=0/msg、submitType 全枚举）见[文档站 REST API 指南](https://jeeflow-doc.mldong.com/guides/03-api)。
+端点清单与响应结构（code=0/msg、submitType 全枚举）见[文档站 REST API 指南](../../guides/03-api)。
 
 ## 启动
 

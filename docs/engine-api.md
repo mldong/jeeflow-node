@@ -45,4 +45,4 @@ for (const task of await repo.findDoingTasks(inst.id)) {
 - 实例：`10` 进行中 / `20` 已完成 / `45` 已拒绝（`InstanceState` 枚举）
 - 任务：`10` 待办 / `20` 已完成 / `99` 已废弃（`TaskState` 枚举）
 
-> submitType 全枚举行为见[设计原理 06](https://jeeflow-doc.mldong.com/concepts/06-contracts)。
+> submitType 全枚举行为见[设计原理 06](../../concepts/06-contracts)。
