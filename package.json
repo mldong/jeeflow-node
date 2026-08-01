@@ -10,7 +10,8 @@
     "./engine": "./src/engine.js",
     "./model": "./src/model.js",
     "./spi": "./src/spi.js",
-    "./memory": "./src/memory.js"
+    "./memory": "./src/memory.js",
+    "./jdbc": "./src/jdbc.js"
   },
   "scripts": {
     "build": "tsc",
@@ -35,6 +36,7 @@
     "@nestjs/serve-static": "^5.0.5",
     "@types/express": "^5.0.6",
     "express": "^5.2.1",
+    "mysql2": "^3.23.2",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2"
   }

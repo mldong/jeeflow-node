@@ -26,7 +26,30 @@ interface ProcessRepository {
 }
 ```
 
-> 开箱即用：`MemoryRepository`（`src/memory.ts`）供演示/测试；生产按上表映射到自己的数据库。
+> 开箱即用：
+> - `MemoryRepository`（`src/memory.ts`）供演示/测试；
+> - **`JdbcRepository`（`src/jdbc.ts`）— MySQL 参考实现**（mysql2 连接池）：
+
+```ts
+import mysql from 'mysql2/promise'
+import { JdbcRepository } from 'jeeflow/jdbc'
+
+const pool = mysql.createPool({ host: '127.0.0.1', user: 'root', password: 'pwd', database: 'jeeflow' })
+const repo = new JdbcRepository(pool)  // 关系表主键用内置时间戳 ID 生成器
+```
+
+仓储方法自动映射 `wf_*` 5 张表（spec §2）。`content` 为流程定义 JSON，`variable` 为变量 JSON。
+
+**事务（spec §7.4）**：`withTx` 用 `AsyncLocalStorage` 把事务连接绑定到当前异步上下文，回调内所有仓储调用走同一连接；异常自动回滚：
+
+```ts
+await repo.withTx(async () => {
+  await repo.saveInstance(inst)
+  await repo.createCcInstance(inst.id, 'zhangsan', 'lisi', 'wangwu')
+})
+```
+
+> 约定：**业务层是事务 owner**——先 `withTx` 再调引擎方法，引擎核心不感知事务。
 
 ## UserProvider（可选）
 

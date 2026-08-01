@@ -42,6 +42,7 @@ npm run demo     # http://localhost:8082
 | `src/model.ts` | 域类型 |
 | `src/spi.ts` | SPI 接口 |
 | `src/memory.ts` | 内存仓储 |
+| `src/jdbc.ts` | MySQL 参考实现（JdbcRepository，mysql2） |
 | `demo/main.ts` | Express 演示 |
 | `__tests__/` | 9 项合规测试 |
 
