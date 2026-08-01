@@ -51,4 +51,4 @@ npm run demo     # http://localhost:8082
 
 ## License
 
-MIT
+Apache-2.0
