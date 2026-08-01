@@ -3,7 +3,7 @@
 // 用法：JEFFLOW_DB=mysql|postgres node --import tsx --test __tests__/jdbc.test.ts（默认 mysql）
 // 前置条件：
 //   - 开发服务器（192.168.1.160）：MySQL(3306) / PostgreSQL(5432，Docker mldong-pg)
-//   - 建表 SQL 自动从 tests/schema/<db>.sql 执行（IF NOT EXISTS，幂等）
+//   - 建表 SQL 自动从 jeeflow-java 仓 resources/schema-<db>.sql 执行（唯一来源，IF NOT EXISTS 幂等）
 // 测试数据固定 define ID（mysql=900004 / postgres=910004），开头清理，可重复执行。
 import { after, describe, it } from 'node:test'
 import * as assert from 'node:assert/strict'
@@ -21,6 +21,8 @@ const dbType = process.env.JEFFLOW_DB ?? 'mysql'
 const isPg = dbType === 'postgres'
 const DEFINE_ID = isPg ? 910004 : 900004
 const FLOW_DIR = '../jeeflow-java/jeeflow-core/src/test/resources/flows/'
+// 建表 SQL 唯一来源：jeeflow-java 仓 resources（schema-h2/mysql/postgres.sql，各语言引用）
+const SCHEMA_DIR = '../jeeflow-java/jeeflow-repository-jdbc/src/test/resources/'
 
 // ── 连接工厂：测试代码与数据库无关，只换 pool / adapter ─────────────────────
 
@@ -71,7 +73,7 @@ class SeqIDGen implements IDGenerator {
 }
 
 async function applySchema(): Promise<void> {
-  const sql = readFileSync(`tests/schema/${dbType}.sql`, 'utf-8')
+  const sql = readFileSync(SCHEMA_DIR + `schema-${dbType}.sql`, 'utf-8')
   const conn = isPg ? await pool.connect() : await pool.getConnection()
   try {
     let buf = ''

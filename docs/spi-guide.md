@@ -49,7 +49,8 @@ const repo = new JdbcRepository(new MysqlAdapter(pool))  // 关系表主键用�
 > **新增数据库** = 写一个适配器（约 80 行，参考 `src/jdbc/mysql.ts`）：实现
 > `SqlAdapter`（占位符风格 + acquire/release）+ 连接包装（execute/fetchOne/fetchAll/
 > begin/commit/rollback）。SQL 核心统一用 `?` 占位符，由适配器转换
-> （MySQL `?` 原生 / PostgreSQL `$n`）。建表 SQL 见各语言 `tests/schema/<db>.sql`。
+> （MySQL `?` 原生 / PostgreSQL `$n`）。建表 SQL 唯一来源：jeeflow-java 仓
+> `jeeflow-repository-jdbc/src/test/resources/schema-<db>.sql`（h2/mysql/postgres 三份方言并排）。
 
 仓储方法自动映射 `wf_*` 5 张表（spec §2）。`content` 为流程定义 JSON，`variable` 为变量 JSON。
 
@@ -104,4 +105,4 @@ JEFFLOW_DB=mysql node --import tsx --test __tests__/jdbc.test.ts
 JEFFLOW_DB=postgres node --import tsx --test __tests__/jdbc.test.ts
 ```
 
-建表 SQL 自动从 `tests/schema/<db>.sql` 执行（IF NOT EXISTS，幂等）。已实测：mysql 3/3、postgres 3/3 全过。
+建表 SQL 自动从 jeeflow-java 仓 resources/ 执行（唯一来源，IF NOT EXISTS 幂等）。已实测：mysql 3/3、postgres 3/3 全过。
