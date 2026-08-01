@@ -28,15 +28,28 @@ interface ProcessRepository {
 
 > 开箱即用：
 > - `MemoryRepository`（`src/memory.ts`）供演示/测试；
-> - **`JdbcRepository`（`src/jdbc.ts`）— MySQL 参考实现**（mysql2 连接池）：
+> - **`JdbcRepository`（`src/jdbc/`）— 多数据库 JDBC 实现**：共享核心 `shared.ts`（SQL 逻辑唯一维护点）+ 每库一个薄适配器。按库装驱动（mysql2 / pg 均为 optionalDependencies）：
 
 ```ts
+// MySQL（npm i mysql2）
 import mysql from 'mysql2/promise'
 import { JdbcRepository } from 'jeeflow/jdbc'
+import { MysqlAdapter } from 'jeeflow/mysql'
 
 const pool = mysql.createPool({ host: '127.0.0.1', user: 'root', password: 'pwd', database: 'jeeflow' })
-const repo = new JdbcRepository(pool)  // 关系表主键用内置时间戳 ID 生成器
+const repo = new JdbcRepository(new MysqlAdapter(pool))  // 关系表主键用内置时间戳 ID 生成器
+
+// PostgreSQL（npm i pg）
+// import { Pool } from 'pg'
+// import { PostgresAdapter } from 'jeeflow/postgres'
+// const pool = new Pool({ host: '127.0.0.1', user: 'root', password: 'pwd', database: 'jeeflow' })
+// const repo = new JdbcRepository(new PostgresAdapter(pool))
 ```
+
+> **新增数据库** = 写一个适配器（约 80 行，参考 `src/jdbc/mysql.ts`）：实现
+> `SqlAdapter`（占位符风格 + acquire/release）+ 连接包装（execute/fetchOne/fetchAll/
+> begin/commit/rollback）。SQL 核心统一用 `?` 占位符，由适配器转换
+> （MySQL `?` 原生 / PostgreSQL `$n`）。建表 SQL 见各语言 `tests/schema/<db>.sql`。
 
 仓储方法自动映射 `wf_*` 5 张表（spec §2）。`content` 为流程定义 JSON，`variable` 为变量 JSON。
 

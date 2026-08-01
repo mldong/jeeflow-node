@@ -1,0 +1,375 @@
+// 共享 JDBC 仓储核心——SQL 逻辑与数据库无关。
+//
+// 设计（多数据库维护策略）：
+// - 本文件是**唯一维护点**：15 个仓储方法的 SQL 逻辑、行映射、ID 生成
+// - SQL 占位符统一使用 `?`，由各数据库适配器（SqlAdapter）转换为自家风格
+//   （MySQL `?` 原生 / PostgreSQL `$n`）
+// - 事务（spec §7.4）：withTx 用 AsyncLocalStorage 绑定当前异步上下文的事务连接
+//
+// 新增数据库 = 写一个适配器（约 80 行）：实现 SqlAdapter + 连接包装
+// （execute/fetchOne/fetchAll/begin/commit/rollback）。参考 mysql.ts / postgres.ts。
+
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { ProcessInstance, ProcessTask, type ProcessDefine } from '../model.js'
+import { InstanceState, TaskState } from '../model.js'
+import type { IDGenerator, ProcessRepository } from '../spi.js'
+
+// 当前异步上下文绑定的事务连接
+const txStore = new AsyncLocalStorage<SqlConnection>()
+
+/** 默认 ID 生成器：时间戳毫秒 + 同毫秒递增序号（对齐 Java nextId 默认实现） */
+export class TsIDGenerator implements IDGenerator {
+  private last = 0
+  private seq = 0
+
+  nextId(): number {
+    const now = Date.now()
+    if (now === this.last) {
+      this.seq++
+    } else {
+      this.last = now
+      this.seq = 0
+    }
+    return now * 1000 + this.seq
+  }
+}
+
+/** 适配器返回的连接包装——最小接口 */
+export interface SqlConnection {
+  execute(sql: string, args: any[]): Promise<void>
+  fetchOne(sql: string, args: any[]): Promise<any | null>
+  fetchAll(sql: string, args: any[]): Promise<any[]>
+  begin(): Promise<void>
+  commit(): Promise<void>
+  rollback(): Promise<void>
+}
+
+/** 数据库适配器——连接生命周期 + 占位符风格 */
+export interface SqlAdapter {
+  placeholder: '?' | '$n'
+  acquire(): Promise<SqlConnection>
+  release(conn: SqlConnection): Promise<void>
+}
+
+/** 把核心 SQL 的统一 `?` 占位符转换为适配器风格 */
+export function convertPlaceholder(sql: string, style: string): string {
+  if (style === '$n') {
+    let i = 0
+    return sql.replace(/\?/g, () => `$${++i}`)
+  }
+  return sql // '?' 原生
+}
+
+/** 生成 n 个 `?` 占位符（用于 IN 列表） */
+export function repeatPh(n: number): string {
+  return Array.from({ length: n }, () => '?').join(',')
+}
+
+export class JdbcRepository implements ProcessRepository {
+  constructor(
+    private readonly adapter: SqlAdapter,
+    private readonly idGen: IDGenerator = new TsIDGenerator(),
+  ) {}
+
+  private sql(s: string): string {
+    return convertPlaceholder(s, this.adapter.placeholder)
+  }
+
+  // ── 事务（spec §7.4：AsyncLocalStorage 绑定连接）─────────────────────────
+
+  async withTx<T>(fn: () => Promise<T>): Promise<T> {
+    const conn = await this.adapter.acquire()
+    try {
+      await conn.begin()
+      try {
+        const result = await txStore.run(conn, fn)
+        await conn.commit()
+        return result
+      } catch (err) {
+        await conn.rollback()
+        throw err
+      }
+    } finally {
+      await this.adapter.release(conn)
+    }
+  }
+
+  /** 返回当前连接：有事务绑定用事务连接，否则从适配器获取 */
+  private async c(): Promise<SqlConnection> {
+    return txStore.getStore() ?? (await this.adapter.acquire())
+  }
+
+  /** 归还非事务连接（事务连接由 withTx 统一释放） */
+  private async done(conn: SqlConnection): Promise<void> {
+    if (!txStore.getStore()) await this.adapter.release(conn)
+  }
+
+  // ── ProcessDefine ─────────────────────────────────────────────────────────
+
+  async findDefineById(id: number): Promise<ProcessDefine | null> {
+    const conn = await this.c()
+    try {
+      const row = await conn.fetchOne(this.sql(
+        'SELECT id, name, display_name, type, state, content, version, ' +
+        'create_time, create_user, update_time, update_user FROM wf_process_define WHERE id = ?'),
+        [id])
+      if (!row) return null
+      return {
+        id: row.id, name: row.name, displayName: row.display_name, type: row.type,
+        state: row.state,
+        content: row.content ? Buffer.from(row.content).toString('utf8') : '',
+        version: row.version, createTime: row.create_time, createUser: row.create_user,
+        updateTime: row.update_time, updateUser: row.update_user,
+      }
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  // ── ProcessInstance ───────────────────────────────────────────────────────
+
+  private static INSTANCE_COLS =
+    'id, parent_id, process_define_id, state, parent_node_name, business_no, ' +
+    'operator, expire_time, variable, create_time, create_user, update_time, update_user'
+
+  async findInstanceById(id: number): Promise<ProcessInstance | null> {
+    const conn = await this.c()
+    try {
+      const row = await conn.fetchOne(this.sql(
+        `SELECT ${JdbcRepository.INSTANCE_COLS} FROM wf_process_instance WHERE id = ?`), [id])
+      if (!row) return null
+      const inst = new ProcessInstance({
+        id: row.id, parentId: row.parent_id, defineId: row.process_define_id,
+        state: row.state, parentNodeName: row.parent_node_name, businessNo: row.business_no,
+        operator: row.operator, expireTime: row.expire_time,
+        createTime: row.create_time, createUser: row.create_user,
+        updateTime: row.update_time, updateUser: row.update_user,
+        tasks: [],
+      })
+      inst.variables = row.variable ? JSON.parse(row.variable) : {}
+      return inst
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async saveInstance(inst: ProcessInstance): Promise<void> {
+    const conn = await this.c()
+    try {
+      await conn.execute(this.sql(
+        'INSERT INTO wf_process_instance (id, parent_id, process_define_id, state, ' +
+        'parent_node_name, business_no, operator, expire_time, variable, ' +
+        'create_time, create_user, update_time, update_user) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'),
+        [inst.id, inst.parentId ?? null, inst.defineId, inst.state, inst.parentNodeName ?? '',
+          inst.businessNo ?? '', inst.operator, inst.expireTime ?? null,
+          JSON.stringify(inst.variables ?? {}), inst.createTime, inst.createUser,
+          inst.updateTime, inst.updateUser])
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async updateInstance(inst: ProcessInstance): Promise<void> {
+    const conn = await this.c()
+    try {
+      await conn.execute(this.sql(
+        'UPDATE wf_process_instance SET state=?, parent_node_name=?, business_no=?, ' +
+        'operator=?, expire_time=?, variable=?, update_time=?, update_user=? WHERE id=?'),
+        [inst.state, inst.parentNodeName ?? '', inst.businessNo ?? '', inst.operator,
+          inst.expireTime ?? null, JSON.stringify(inst.variables ?? {}),
+          inst.updateTime, inst.updateUser, inst.id])
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  // ── ProcessTask ───────────────────────────────────────────────────────────
+
+  private static TASK_COLS =
+    'id, process_instance_id, task_name, display_name, task_type, perform_type, ' +
+    'task_state, operator, finish_time, expire_time, form_key, task_parent_id, ' +
+    'variable, create_time, create_user, update_time, update_user'
+
+  async findTaskById(taskId: number): Promise<ProcessTask | null> {
+    const conn = await this.c()
+    try {
+      const row = await conn.fetchOne(this.sql(
+        `SELECT ${JdbcRepository.TASK_COLS} FROM wf_process_task WHERE id = ?`), [taskId])
+      if (!row) return null
+      const task = this.mapTask(row)
+      task.actorIds = await this.findTaskActors(taskId)
+      return task
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async saveTask(task: ProcessTask): Promise<void> {
+    const conn = await this.c()
+    try {
+      await conn.execute(this.sql(
+        'INSERT INTO wf_process_task (id, process_instance_id, task_name, display_name, ' +
+        'task_type, perform_type, task_state, operator, finish_time, expire_time, form_key, ' +
+        'task_parent_id, variable, create_time, create_user, update_time, update_user) ' +
+        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'),
+        [task.id, task.processInstanceId, task.taskName, task.displayName, task.taskType ?? 0,
+          task.performType ?? 0, task.taskState, task.actorId ?? '', task.finishTime ?? null,
+          task.expireTime ?? null, task.formKey ?? '', task.parentTaskId ?? null,
+          JSON.stringify(task.variables ?? {}), task.createTime, task.createUser,
+          task.updateTime, task.updateUser])
+      await this.replaceTaskActors(conn, task.id, task.actorIds ?? [])
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async updateTask(task: ProcessTask): Promise<void> {
+    const conn = await this.c()
+    try {
+      await conn.execute(this.sql(
+        'UPDATE wf_process_task SET task_state=?, operator=?, finish_time=?, expire_time=?, ' +
+        'variable=?, update_time=?, update_user=? WHERE id=?'),
+        [task.taskState, task.actorId ?? '', task.finishTime ?? null, task.expireTime ?? null,
+          JSON.stringify(task.variables ?? {}), task.updateTime, task.updateUser, task.id])
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  private async findTasksByState(
+    instanceId: number, state: TaskState | null, taskNames?: string[],
+  ): Promise<ProcessTask[]> {
+    let sql = `SELECT ${JdbcRepository.TASK_COLS} FROM wf_process_task WHERE process_instance_id = ?`
+    const args: any[] = [instanceId]
+    if (state !== null) {
+      sql += ' AND task_state = ?'
+      args.push(state)
+    }
+    if (taskNames && taskNames.length > 0) {
+      sql += ` AND task_name IN (${repeatPh(taskNames.length)})`
+      args.push(...taskNames)
+    }
+    sql += ' ORDER BY id ASC'
+    const conn = await this.c()
+    try {
+      const rows = await conn.fetchAll(this.sql(sql), args)
+      const tasks = rows.map(r => this.mapTask(r))
+      if (tasks.length > 0) {
+        const ids = tasks.map(t => t.id)
+        const actorRows = await conn.fetchAll(this.sql(
+          `SELECT process_task_id, actor_id FROM wf_process_task_actor WHERE process_task_id IN (${repeatPh(ids.length)}) ORDER BY id ASC`),
+          ids)
+        for (const t of tasks) t.actorIds = []
+        for (const r of actorRows) {
+          const t = tasks.find(x => x.id === r.process_task_id)
+          if (t) t.actorIds.push(r.actor_id)
+        }
+      }
+      return tasks
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async findDoingTasks(instanceId: number, taskNames?: string[]): Promise<ProcessTask[]> {
+    return this.findTasksByState(instanceId, TaskState.Doing, taskNames)
+  }
+
+  async findDoneTasks(instanceId: number, taskNames?: string[]): Promise<ProcessTask[]> {
+    return this.findTasksByState(instanceId, TaskState.Done, taskNames)
+  }
+
+  async findHistoryTasks(instanceId: number): Promise<ProcessTask[]> {
+    return this.findTasksByState(instanceId, null)
+  }
+
+  private mapTask(row: any): ProcessTask {
+    const task = new ProcessTask({
+      id: row.id, processInstanceId: row.process_instance_id, taskName: row.task_name,
+      displayName: row.display_name, taskType: row.task_type, performType: row.perform_type,
+      taskState: row.task_state, actorId: row.operator, finishTime: row.finish_time,
+      expireTime: row.expire_time, formKey: row.form_key, parentTaskId: row.task_parent_id,
+      createTime: row.create_time, createUser: row.create_user,
+      updateTime: row.update_time, updateUser: row.update_user,
+    })
+    task.variables = row.variable ? JSON.parse(row.variable) : {}
+    task.actorIds = []
+    return task
+  }
+
+  // ── TaskActor ─────────────────────────────────────────────────────────────
+
+  private async replaceTaskActors(conn: SqlConnection, taskId: number, actors: string[]): Promise<void> {
+    await conn.execute(this.sql('DELETE FROM wf_process_task_actor WHERE process_task_id = ?'), [taskId])
+    await this.insertTaskActors(conn, taskId, actors)
+  }
+
+  private async insertTaskActors(conn: SqlConnection, taskId: number, actors: string[]): Promise<void> {
+    const now = new Date()
+    for (const a of actors) {
+      await conn.execute(this.sql(
+        'INSERT INTO wf_process_task_actor (id, process_task_id, actor_id, create_time, create_user) VALUES (?,?,?,?,?)'),
+        [this.idGen.nextId(), taskId, a, now, 'jeeflow'])
+    }
+  }
+
+  async findTaskActors(taskId: number): Promise<string[]> {
+    const conn = await this.c()
+    try {
+      const rows = await conn.fetchAll(this.sql(
+        'SELECT actor_id FROM wf_process_task_actor WHERE process_task_id = ? ORDER BY id ASC'), [taskId])
+      return rows.map(r => r.actor_id)
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async addTaskActor(taskId: number, actors: string[]): Promise<void> {
+    const conn = await this.c()
+    try {
+      await this.insertTaskActors(conn, taskId, actors)
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async removeTaskActor(taskId: number, actors: string[]): Promise<void> {
+    if (actors.length === 0) return
+    const conn = await this.c()
+    try {
+      await conn.execute(this.sql(
+        `DELETE FROM wf_process_task_actor WHERE process_task_id = ? AND actor_id IN (${repeatPh(actors.length)})`),
+        [taskId, ...actors])
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  // ── CcInstance（抄送）─────────────────────────────────────────────────────
+
+  async createCcInstance(instanceId: number, creator: string, ...actorIds: string[]): Promise<void> {
+    const conn = await this.c()
+    try {
+      const now = new Date()
+      for (const actorId of actorIds) {
+        await conn.execute(this.sql(
+          'INSERT INTO wf_process_cc_instance (id, process_instance_id, actor_id, state, ' +
+          'create_time, create_user, update_time, update_user) VALUES (?,?,?,0,?,?,?,?)'),
+          [this.idGen.nextId(), instanceId, actorId, now, creator, now, creator])
+      }
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async updateCcStatus(instanceId: number, actorId: string): Promise<void> {
+    const conn = await this.c()
+    try {
+      await conn.execute(this.sql(
+        'UPDATE wf_process_cc_instance SET state=1, update_time=? WHERE process_instance_id=? AND actor_id=?'),
+        [new Date(), instanceId, actorId])
+    } finally {
+      await this.done(conn)
+    }
+  }
+}

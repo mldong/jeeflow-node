@@ -11,7 +11,9 @@
     "./model": "./src/model.js",
     "./spi": "./src/spi.js",
     "./memory": "./src/memory.js",
-    "./jdbc": "./src/jdbc.js"
+    "./jdbc": "./src/jdbc/index.js",
+    "./mysql": "./src/jdbc/mysql.js",
+    "./postgres": "./src/jdbc/postgres.js"
   },
   "scripts": {
     "build": "tsc",
@@ -26,18 +28,12 @@
   ],
   "license": "Apache-2.0",
   "devDependencies": {
+    "@types/pg": "^8.20.3",
     "tsx": "^4.19.0",
     "typescript": "^5.5.0"
   },
-  "dependencies": {
-    "@nestjs/common": "^11.1.28",
-    "@nestjs/core": "^11.1.28",
-    "@nestjs/platform-express": "^11.1.28",
-    "@nestjs/serve-static": "^5.0.5",
-    "@types/express": "^5.0.6",
-    "express": "^5.2.1",
-    "mysql2": "^3.23.2",
-    "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.2"
+  "optionalDependencies": {
+    "mysql2": "^3.11.0",
+    "pg": "^8.13.0"
   }
 }

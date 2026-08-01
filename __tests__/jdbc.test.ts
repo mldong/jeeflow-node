@@ -9,7 +9,8 @@ import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import mysql from 'mysql2/promise'
 import { EngineImpl } from '../src/engine.js'
-import { JdbcRepository, TsIDGenerator } from '../src/jdbc.js'
+import { JdbcRepository, TsIDGenerator } from '../src/jdbc/index.js'
+import { MysqlAdapter } from '../src/jdbc/mysql.js'
 import { InstanceState, TaskState, ProcessInstance, type ProcessDefine } from '../src/model.js'
 import type { IDGenerator, UserProvider } from '../src/spi.js'
 
@@ -65,7 +66,7 @@ describe('JdbcRepository (MySQL 192.168.1.160 jeeflow)', () => {
     await cleanup()
     try {
       await insertDefine()
-      const repo = new JdbcRepository(pool, new TsIDGenerator())
+      const repo = new JdbcRepository(new MysqlAdapter(pool), new TsIDGenerator())
       const engine = new EngineImpl(repo, userProv, new SeqIDGen())
 
       // ① 启动：start → apply（发起人 zhangsan，applicant→发起人）
@@ -95,7 +96,7 @@ describe('JdbcRepository (MySQL 192.168.1.160 jeeflow)', () => {
       // ④ 重新连接验证持久化
       const pool2 = mysql.createPool(DSN)
       try {
-        const repo2 = new JdbcRepository(pool2, new TsIDGenerator())
+        const repo2 = new JdbcRepository(new MysqlAdapter(pool2), new TsIDGenerator())
         const reloaded = await repo2.findInstanceById(inst.id)
         assert.ok(reloaded, '重新加载实例')
         assert.equal(reloaded.state, InstanceState.Done, '持久化状态完成')
@@ -117,7 +118,7 @@ describe('JdbcRepository (MySQL 192.168.1.160 jeeflow)', () => {
     await cleanup()
     try {
       await insertDefine()
-      const repo = new JdbcRepository(pool, new TsIDGenerator())
+      const repo = new JdbcRepository(new MysqlAdapter(pool), new TsIDGenerator())
       const engine = new EngineImpl(repo, userProv, new SeqIDGen())
       const inst = await engine.startProcessInstanceById(DEFINE_ID, 'zhangsan', { BUSINESS_NO: 'BIZ-NODE-002' })
       const doing = await repo.findDoingTasks(inst.id)
@@ -137,7 +138,7 @@ describe('JdbcRepository (MySQL 192.168.1.160 jeeflow)', () => {
     await cleanup()
     try {
       await insertDefine()
-      const repo = new JdbcRepository(pool, new TsIDGenerator())
+      const repo = new JdbcRepository(new MysqlAdapter(pool), new TsIDGenerator())
 
       // ① 事务内提交：实例 + 抄送同一连接落库
       await repo.withTx(async () => {
