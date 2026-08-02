@@ -387,6 +387,16 @@ describe('jeeflow compliance tests', () => {
     assert.ok(r2.data.jsonObject)
     assert.equal(r2.data.his.length, 1)
 
+    // issues/07：无 content 的设计 → jsonObject 补齐基本信息
+    const r2b = await facade.flow('processDesign/save',
+      { name: 'test_display', displayName: '回显测试', operator: 'zhangsan' })
+    assert.equal(r2b.code, 0, JSON.stringify(r2b))
+    const r2c = await facade.flow('processDesign/detail', { id: r2b.data.id })
+    assert.equal(r2c.code, 0, JSON.stringify(r2c))
+    assert.equal(r2c.data.jsonObject.name, 'test_display', JSON.stringify(r2c))
+    assert.equal(r2c.data.jsonObject.displayName, '回显测试', JSON.stringify(r2c))
+    assert.equal(r2c.data.jsonObject.processDesignId, r2b.data.id, JSON.stringify(r2c))
+
     const r3 = await facade.flow('processDesign/deploy', { id: designId, operator: 'zhangsan' })
     assert.equal(r3.code, 0, JSON.stringify(r3))
     assert.ok(r3.data.processDefineId > 0)

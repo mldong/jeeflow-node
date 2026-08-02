@@ -267,11 +267,19 @@ export class JeeflowFacade {
       type: design.type, icon: design.icon, isDeployed: design.isDeployed, remark: design.remark,
     }
     const hisList = await ext.listDesignHis(design.id)
+    let jsonObject: Record<string, any> | undefined
     if (hisList.length > 0) {
       try {
-        data.jsonObject = JSON.parse(toStr(hisList[0].content))
+        jsonObject = JSON.parse(toStr(hisList[0].content))
       } catch { /* ignore */ }
     }
+    // issues/07：jsonObject 缺失基本信息时从设计表补齐（对齐 boot3 ProcessDesignServiceImpl.findById）
+    if (!jsonObject || typeof jsonObject !== 'object') jsonObject = {}
+    if (!(jsonObject.name)) jsonObject.name = design.name
+    if (!(jsonObject.displayName)) jsonObject.displayName = design.displayName
+    if (!(jsonObject.type)) jsonObject.type = design.type
+    if (!(jsonObject.processDesignId)) jsonObject.processDesignId = design.id
+    data.jsonObject = jsonObject
     data.his = hisList
     return data
   }
