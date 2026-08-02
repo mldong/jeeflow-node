@@ -15,6 +15,24 @@ export class MemoryRepository implements ProcessRepository {
   }
 
   async findDefineById(id: number) { return this.defines.get(id) ?? null }
+
+  // ── 定义写操作（v1.0.1，对齐 SPI）──
+
+  async saveDefine(def: ProcessDefine) {
+    if (!def.id) def.id = this.seq++
+    this.defines.set(def.id, def)
+  }
+  async updateDefine(def: ProcessDefine) {
+    this.defines.set(def.id, def)
+  }
+  async updateDefineState(defineId: number, state: number) {
+    const d = this.defines.get(defineId)
+    if (d) d.state = state
+  }
+  async removeDefine(defineId: number) {
+    this.defines.delete(defineId)
+  }
+
   async saveInstance(inst: ProcessInstance) {
     if (!inst.id) inst.id = this.seq++
     const cp = cloneInstance(inst)
@@ -25,6 +43,14 @@ export class MemoryRepository implements ProcessRepository {
     const cp = cloneInstance(inst)
     cp.tasks = []
     this.instances.set(inst.id, cp)
+    // v1.0.1：级联保存聚合根内任务状态变更
+    for (const t of inst.tasks) {
+      if (!t.id) continue
+      const tc = cloneTask(t)
+      tc.actorIds = []
+      this.tasks.set(t.id, tc)
+      if (t.actorIds.length) this.actors.set(t.id, [...t.actorIds])
+    }
   }
   async findInstanceById(id: number) {
     const inst = this.instances.get(id)

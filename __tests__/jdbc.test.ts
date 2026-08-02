@@ -14,7 +14,7 @@ import { EngineImpl } from '../src/engine.js'
 import { JdbcRepository, TsIDGenerator, convertPlaceholder } from '../src/jdbc/index.js'
 import { MysqlAdapter } from '../src/jdbc/mysql.js'
 import { PostgresAdapter } from '../src/jdbc/postgres.js'
-import { InstanceState, TaskState, ProcessInstance } from '../src/model.js'
+import { InstanceState, TaskState, ProcessInstance, type ProcessDefine } from '../src/model.js'
 import type { IDGenerator, UserProvider } from '../src/spi.js'
 
 const dbType = process.env.JEFFLOW_DB ?? 'mysql'
@@ -245,6 +245,69 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
       // 清理固定事务数据
       await q(pool, 'DELETE FROM wf_process_instance WHERE id = ?', [txId])
       await q(pool, 'DELETE FROM wf_process_cc_instance WHERE process_instance_id = ?', [txId])
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('定义写操作 SPI（v1.0.1，集成反馈①）', async () => {
+    await cleanup()
+    try {
+      await applySchema()
+      const repo = new JdbcRepository(makeAdapter(pool), new TsIDGenerator())
+
+      // save：ID 由仓储生成
+      const def: ProcessDefine = {
+        id: 0, name: 'node-crud', displayName: 'CRUD 流程', type: 'test', state: 1,
+        content: '{}', version: 1, createTime: new Date(), createUser: 'tester',
+        updateTime: new Date(), updateUser: 'tester',
+      }
+      await repo.saveDefine(def)
+      assert.ok(def.id > 0, 'saveDefine 生成 ID')
+      const loaded = await repo.findDefineById(def.id)
+      assert.equal(loaded?.name, 'node-crud', '保存后可查询')
+
+      loaded!.displayName = 'CRUD 流程 v2'
+      loaded!.content = '{"v":2}'
+      await repo.updateDefine(loaded!)
+      const updated = await repo.findDefineById(def.id)
+      assert.equal(updated?.displayName, 'CRUD 流程 v2', 'updateDefine 生效')
+
+      await repo.updateDefineState(def.id, 0)
+      const st = await repo.findDefineById(def.id)
+      assert.equal(st?.state, 0, 'updateDefineState 生效')
+
+      await repo.removeDefine(def.id)
+      assert.equal(await repo.findDefineById(def.id), null, 'removeDefine 删除')
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('updateInstance 级联持久化任务状态（v1.0.1，集成反馈②）', async () => {
+    await cleanup()
+    try {
+      await applySchema()
+      await insertDefine()
+      const repo = new JdbcRepository(makeAdapter(pool), new TsIDGenerator())
+      const engine = new EngineImpl(repo, userProv, new SeqIDGen())
+      const inst = await engine.startProcessInstanceById(DEFINE_ID, 'zhangsan', { BUSINESS_NO: `BIZ-${dbType}-003` })
+
+      // 加载实例（含任务），修改任务状态后 updateInstance
+      const reloaded = await repo.findInstanceById(inst.id)
+      assert.ok(reloaded, '实例加载')
+      const tasks = await repo.findHistoryTasks(inst.id)
+      assert.ok(tasks.length > 0, '实例有任务')
+      reloaded!.tasks = tasks
+      for (const t of tasks) t.taskState = TaskState.Abandoned
+      await repo.updateInstance(reloaded!)
+
+      // 重新加载验证任务状态已落库
+      const after = await repo.findHistoryTasks(inst.id)
+      assert.ok(
+        after.every(t => t.taskState === TaskState.Abandoned),
+        'updateInstance 级联任务状态落库',
+      )
     } finally {
       await cleanup()
     }

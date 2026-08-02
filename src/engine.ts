@@ -91,6 +91,9 @@ export class EngineImpl implements Engine {
     // 聚合根：完成任务（子实体状态转换 + 实例变量合并）
     inst.completeTask(task, operator, vars, now)
     await this.repo.updateTask(task)
+    // v1.0.1：updateInstance 级联持久化依赖聚合内任务副本为最新状态，
+    // completeTask 改的是外部任务对象，需同步回聚合根
+    syncTaskToAggregate(inst, task)
     await this.fireEvent({ type: EventType.TaskComplete, instanceId: inst.id, taskId: task.id, nodeId: task.taskName, operator })
 
     const def = await this.repo.findDefineById(inst.defineId)
@@ -149,6 +152,8 @@ export class EngineImpl implements Engine {
     // 子实体：完成任务
     task.finish(operator, task.variables, now)
     await this.repo.updateTask(task)
+    // v1.0.1：同步回聚合根，避免 updateInstance 级联把任务写回旧状态
+    syncTaskToAggregate(inst, task)
     // 聚合根：驳回
     inst.reject(now)
     await this.repo.updateInstance(inst)
@@ -393,6 +398,17 @@ function getCsState(vars: Record<string, any>, nodeId: string): [string[] | null
   const actors = vars[`operatorList_${nodeId}`] as string[] | undefined ?? null
   const lc = parseInt(String(vars[`loopCounter_${nodeId}`] ?? '0'))
   return [actors, lc]
+}
+
+// syncTaskToAggregate 把外部任务对象的最新状态同步回聚合根任务副本
+// （v1.0.1：updateInstance 级联持久化依赖聚合内任务副本为最新状态）
+function syncTaskToAggregate(inst: ProcessInstance, task: ProcessTask): void {
+  for (let i = 0; i < inst.tasks.length; i++) {
+    if (inst.tasks[i].id === task.id) {
+      inst.tasks[i] = task
+      return
+    }
+  }
 }
 
 function isTruthy(v: any): boolean {

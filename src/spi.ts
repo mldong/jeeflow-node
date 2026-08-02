@@ -2,6 +2,11 @@ import type { ProcessDefine, ProcessInstance, ProcessTask, UserInfo } from './mo
 
 export interface ProcessRepository {
   findDefineById(id: number): Promise<ProcessDefine | null>
+  // 定义写操作（v1.0.1，集成反馈①）：保存/更新/启停/删除流程定义
+  saveDefine(define: ProcessDefine): Promise<void>
+  updateDefine(define: ProcessDefine): Promise<void>
+  updateDefineState(defineId: number, state: number): Promise<void>
+  removeDefine(defineId: number): Promise<void>
   findInstanceById(id: number): Promise<ProcessInstance | null>
   saveInstance(inst: ProcessInstance): Promise<void>
   updateInstance(inst: ProcessInstance): Promise<void>

@@ -126,6 +126,60 @@ export class JdbcRepository implements ProcessRepository {
     }
   }
 
+  // 定义写操作（v1.0.1，集成反馈①）。SQL 与 jeeflow-java JdbcProcessRepository 对齐；
+  // State/Version 零值按 Java null 语义默认 1。
+
+  async saveDefine(define: ProcessDefine): Promise<void> {
+    if (!define.id) define.id = this.idGen.nextId()
+    const now = new Date()
+    const createTime = define.createTime ?? now
+    const createUser = define.createUser || define.updateUser
+    const conn = await this.c()
+    try {
+      await conn.execute(this.sql(
+        'INSERT INTO wf_process_define (id, name, display_name, type, state, content, version, ' +
+        'create_time, create_user, update_time, update_user) VALUES (?,?,?,?,?,?,?,?,?,?,?)'),
+        [define.id, define.name, define.displayName, define.type, define.state || 1,
+          define.content, define.version || 1, createTime, createUser,
+          define.updateTime ?? now, define.updateUser])
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async updateDefine(define: ProcessDefine): Promise<void> {
+    const conn = await this.c()
+    try {
+      await conn.execute(this.sql(
+        'UPDATE wf_process_define SET name=?, display_name=?, type=?, state=?, content=?, ' +
+        'version=?, update_time=?, update_user=? WHERE id=?'),
+        [define.name, define.displayName, define.type, define.state || 1,
+          define.content, define.version || 1, new Date(), define.updateUser, define.id])
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async updateDefineState(defineId: number, state: number): Promise<void> {
+    const conn = await this.c()
+    try {
+      await conn.execute(this.sql(
+        'UPDATE wf_process_define SET state=?, update_time=? WHERE id=?'),
+        [state, new Date(), defineId])
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async removeDefine(defineId: number): Promise<void> {
+    const conn = await this.c()
+    try {
+      await conn.execute(this.sql('DELETE FROM wf_process_define WHERE id=?'), [defineId])
+    } finally {
+      await this.done(conn)
+    }
+  }
+
   // ── ProcessInstance ───────────────────────────────────────────────────────
 
   private static INSTANCE_COLS =
@@ -178,6 +232,10 @@ export class JdbcRepository implements ProcessRepository {
         [inst.state, inst.parentNodeName ?? '', inst.businessNo ?? '', inst.operator,
           inst.expireTime ?? null, JSON.stringify(inst.variables ?? {}),
           inst.updateTime, inst.updateUser, inst.id])
+      // v1.0.1：级联持久化聚合根内任务状态变更（同连接，spec §7.4）
+      for (const task of inst.tasks) {
+        if (task.id) await this.updateTaskWithConn(conn, task)
+      }
     } finally {
       await this.done(conn)
     }
@@ -226,14 +284,19 @@ export class JdbcRepository implements ProcessRepository {
   async updateTask(task: ProcessTask): Promise<void> {
     const conn = await this.c()
     try {
-      await conn.execute(this.sql(
-        'UPDATE wf_process_task SET task_state=?, operator=?, finish_time=?, expire_time=?, ' +
-        'variable=?, update_time=?, update_user=? WHERE id=?'),
-        [task.taskState, task.actorId ?? '', task.finishTime ?? null, task.expireTime ?? null,
-          JSON.stringify(task.variables ?? {}), task.updateTime, task.updateUser, task.id])
+      await this.updateTaskWithConn(conn, task)
     } finally {
       await this.done(conn)
     }
+  }
+
+  /** 用指定连接更新任务（实例级联时与实例更新同连接） */
+  private async updateTaskWithConn(conn: SqlConnection, task: ProcessTask): Promise<void> {
+    await conn.execute(this.sql(
+      'UPDATE wf_process_task SET task_state=?, operator=?, finish_time=?, expire_time=?, ' +
+      'variable=?, update_time=?, update_user=? WHERE id=?'),
+      [task.taskState, task.actorId ?? '', task.finishTime ?? null, task.expireTime ?? null,
+        JSON.stringify(task.variables ?? {}), task.updateTime, task.updateUser, task.id])
   }
 
   private async findTasksByState(
