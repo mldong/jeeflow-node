@@ -220,6 +220,7 @@ export class MemoryRepository implements ProcessRepository {
       variables: { ...t.variables }, createTime: t.createTime, createUser: t.createUser,
       updateTime: t.updateTime, updateUser: t.updateUser,
       processDefineName: def?.name ?? '', processDefineDisplayName: def?.displayName ?? '',
+      defineVersion: def?.version ?? 0,
       instanceVariable: inst ? JSON.stringify(inst.variables ?? {}) : '',
       instanceCreateTime: inst?.createTime ?? t.createTime,
     }

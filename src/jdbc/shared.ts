@@ -529,7 +529,8 @@ export class JdbcRepository implements ProcessRepository {
       const cols = 'DISTINCT t.id, t.process_instance_id, t.task_name, t.display_name, t.task_type, t.perform_type,' +
         ' t.task_state, t.operator, t.finish_time, t.expire_time, t.form_key, t.task_parent_id, t.variable,' +
         ' t.create_time, t.create_user, t.update_time, t.update_user,' +
-        ' pd.name, pd.display_name, pi.variable, pi.create_time'
+        ' pd.name, pd.display_name, pd.version AS process_define_version,' +
+        ' pi.variable AS instance_variable, pi.create_time AS instance_create_time'
       const rows = await conn.fetchAll(this.sql(
         `SELECT ${cols}${where} ORDER BY t.id DESC LIMIT ? OFFSET ?`),
         [filter, pageSize, (pageNum - 1) * pageSize])
@@ -570,7 +571,8 @@ export class JdbcRepository implements ProcessRepository {
       variables, createTime: r.create_time, createUser: r.create_user ?? '',
       updateTime: r.update_time, updateUser: r.update_user ?? '',
       processDefineName: r.name ?? '', processDefineDisplayName: r.display_name ?? '',
-      instanceVariable: r.variable ?? '', instanceCreateTime: r.create_time,
+      defineVersion: Number(r.process_define_version ?? 0),
+      instanceVariable: r.instance_variable ?? '', instanceCreateTime: r.instance_create_time,
     }
   }
 

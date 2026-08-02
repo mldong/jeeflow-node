@@ -472,6 +472,67 @@ describe('jeeflow compliance tests', () => {
     assert.equal(r13.data.recordCount, 1)
   })
 
+  it('19 列表字段契约（issues/05-2+05-3）：ext/instanceExt/version + 时间格式', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    const r0 = await facade.flow('processDefine/deploy', { content })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const r1 = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: r0.data.processDefineId, operator: 'zhangsan', amount: 500 })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const instanceId = r1.data.processInstanceId
+
+    const timeRe = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/
+
+    // todoList：ext（任务变量，空回退实例变量）+ instanceExt + version + 时间格式
+    const r2 = await facade.flow('processTask/todoList', { operator: 'leader' })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    assert.ok(r2.data.rows.length > 0, JSON.stringify(r2))
+    const row = r2.data.rows[0]
+    assert.ok(row.ext && typeof row.ext === 'object', JSON.stringify(row))
+    assert.ok(row.instanceExt && typeof row.instanceExt === 'object', JSON.stringify(row))
+    assert.equal(row.instanceExt.amount, 500, 'instanceExt 应含实例变量')
+    assert.ok(row.version != null, JSON.stringify(row))
+    assert.match(String(row.createTime), timeRe, '时间应为 yyyy-MM-dd HH:mm:ss（无 T）')
+    assert.ok(!String(row.createTime).includes('T'))
+
+    // 完成任务 → doneList：finishTime 同样格式化
+    let doing = await repo.findDoingTasks(instanceId)
+    await engine.executeProcessTask(doing[0].id, 'leader')
+    const r3 = await facade.flow('processTask/doneList', { operator: 'leader' })
+    assert.equal(r3.code, 0, JSON.stringify(r3))
+    assert.ok(r3.data.rows.length > 0, JSON.stringify(r3))
+    const drow = r3.data.rows[0]
+    assert.ok(drow.ext && typeof drow.ext === 'object', JSON.stringify(drow))
+    assert.ok(drow.instanceExt && typeof drow.instanceExt === 'object', JSON.stringify(drow))
+    assert.ok(drow.version != null, JSON.stringify(drow))
+    assert.match(String(drow.finishTime), timeRe, 'finishTime 应为 yyyy-MM-dd HH:mm:ss')
+    assert.match(String(drow.createTime), timeRe, 'createTime 应为 yyyy-MM-dd HH:mm:ss')
+
+    // instancePage：ext（实例变量对象）+ displayName/version（定义）
+    const r4 = await facade.flow('processInstance/page', { operator: 'zhangsan' })
+    assert.equal(r4.code, 0, JSON.stringify(r4))
+    assert.ok(r4.data.rows.length > 0, JSON.stringify(r4))
+    const irow = r4.data.rows[0]
+    assert.ok(irow.ext && typeof irow.ext === 'object', JSON.stringify(irow))
+    assert.ok(irow.displayName, JSON.stringify(irow))
+    assert.ok(irow.version != null, JSON.stringify(irow))
+    assert.match(String(irow.createTime), timeRe, '实例行时间应为 yyyy-MM-dd HH:mm:ss')
+
+    // ccList：ext + displayName + version
+    const r5 = await facade.flow('processInstance/createCCInstance',
+      { processInstanceId: instanceId, operator: 'zhangsan', actorIds: ['lisi'] })
+    assert.equal(r5.code, 0, JSON.stringify(r5))
+    const r6 = await facade.flow('processInstance/ccList', { operator: 'lisi' })
+    assert.equal(r6.code, 0, JSON.stringify(r6))
+    assert.ok(r6.data.rows.length > 0, JSON.stringify(r6))
+    const crow = r6.data.rows[0]
+    assert.ok(crow.ext && typeof crow.ext === 'object', JSON.stringify(crow))
+    assert.ok(crow.displayName && crow.version != null, JSON.stringify(crow))
+    assert.match(String(crow.createTime), timeRe, '抄送行时间应为 yyyy-MM-dd HH:mm:ss')
+  })
+
   it('16 门面错误路径：未知 action / 缺扩展仓储', async () => {
     const { engine, repo } = setup()
     const facade = new JeeflowFacade(engine, repo)

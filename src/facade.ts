@@ -5,8 +5,8 @@
 // （code=0 成功 / 99999999 失败）。操作人约定：args.operator 显式传入。
 
 import {
-  InstanceState, ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate,
-  TaskState,
+  CcInstanceRow, DefineRow, InstanceRow, InstanceState, ProcessDefine, ProcessDesign,
+  ProcessDesignHis, ProcessSurrogate, TaskRow, TaskState,
 } from './model.js'
 import type { ProcessExtRepository, ProcessRepository } from './spi.js'
 import type { EngineImpl } from './engine.js'
@@ -462,7 +462,7 @@ export class JeeflowFacade {
     const pageSize = toInt(args.pageSize ?? 10)
     const actorId = String(args.operator ?? 'user1')
     const { rows, total } = await this.repo.pageCcInstances(pageNum, pageSize, actorId)
-    return { rows, recordCount: total }
+    return { rows: rows.map(r => ccRowToMap(r)), recordCount: total }
   }
 
   private async taskDetail(args: Record<string, any>): Promise<any> {
@@ -595,7 +595,7 @@ export class JeeflowFacade {
     const pageNum = toInt(args.pageNum ?? 1)
     const pageSize = toInt(args.pageSize ?? 10)
     const { rows, total } = await this.repo.pageDefines(pageNum, pageSize)
-    return { rows, recordCount: total }
+    return { rows: rows.map(r => defineRowToMap(r)), recordCount: total }
   }
 
   private async defineDetail(args: Record<string, any>): Promise<Record<string, any>> {
@@ -614,7 +614,7 @@ export class JeeflowFacade {
     const pageSize = toInt(args.pageSize ?? 10)
     const operator = String(args.operator ?? 'user1')
     const { rows, total } = await this.repo.pageInstances(pageNum, pageSize, operator)
-    return { rows, recordCount: total }
+    return { rows: rows.map(r => instanceRowToMap(r)), recordCount: total }
   }
 
   private async instanceDetail(args: Record<string, any>): Promise<Record<string, any>> {
@@ -670,7 +670,7 @@ export class JeeflowFacade {
     const pageSize = toInt(args.pageSize ?? 10)
     const actorId = String(args.operator ?? 'user1')
     const { rows, total } = await this.repo.pageTodoTasks(pageNum, pageSize, actorId)
-    return { rows, recordCount: total }
+    return { rows: rows.map(r => taskRowToMap(r)), recordCount: total }
   }
 
   private async doneList(args: Record<string, any>): Promise<Record<string, any>> {
@@ -678,7 +678,7 @@ export class JeeflowFacade {
     const pageSize = toInt(args.pageSize ?? 10)
     const operator = String(args.operator ?? 'user1')
     const { rows, total } = await this.repo.pageDoneTasks(pageNum, pageSize, operator)
-    return { rows, recordCount: total }
+    return { rows: rows.map(r => taskRowToMap(r)), recordCount: total }
   }
 
   /** 定义 content 解析为 LogicFlow JSON（issues/05 jsonObject） */
@@ -692,6 +692,81 @@ export class JeeflowFacade {
     }
   }
 
+}
+
+// ── 行转 Map（issues/05-2 列表字段契约 + 05-3 时间格式）─────────────────────
+
+/** Date → 'yyyy-MM-dd HH:mm:ss'（null/undefined → null） */
+function fmtTime(v: Date | undefined | null): string | null {
+  if (v == null) return null
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${v.getFullYear()}-${p(v.getMonth() + 1)}-${p(v.getDate())} ${p(v.getHours())}:${p(v.getMinutes())}:${p(v.getSeconds())}`
+}
+
+/** JSON 字符串 → 对象（坏 JSON / 空返回空对象） */
+function parseVarMap(json: string): Record<string, any> {
+  if (!json) return {}
+  try {
+    const o = JSON.parse(json)
+    return o && typeof o === 'object' ? o : {}
+  } catch {
+    return {}
+  }
+}
+
+/** 定义行：时间格式化 */
+function defineRowToMap(r: DefineRow): Record<string, any> {
+  return {
+    id: r.id, name: r.name, displayName: r.displayName, type: r.type,
+    state: r.state, version: r.version,
+    createTime: fmtTime(r.createTime), createUser: r.createUser,
+    updateTime: fmtTime(r.updateTime), updateUser: r.updateUser,
+  }
+}
+
+/** 实例行：ext（实例变量对象）+ displayName/version（定义） */
+function instanceRowToMap(r: InstanceRow): Record<string, any> {
+  return {
+    id: r.id, parentId: r.parentId ?? null, processDefineId: r.defineId,
+    state: r.state, parentNodeName: r.parentNodeName, businessNo: r.businessNo,
+    operator: r.operator, expireTime: fmtTime(r.expireTime),
+    variable: r.variables, createTime: fmtTime(r.createTime), createUser: r.createUser,
+    updateTime: fmtTime(r.updateTime), updateUser: r.updateUser,
+    processDefineName: r.defineName, processDefineDisplayName: r.defineDisplayName,
+    processDefineVersion: r.defineVersion,
+    ext: r.variables, displayName: r.defineDisplayName, version: r.defineVersion,
+  }
+}
+
+/** 抄送行：ext（实例变量对象）+ displayName/version（定义） */
+function ccRowToMap(r: CcInstanceRow): Record<string, any> {
+  return {
+    id: r.id, parentId: r.parentId ?? null, processDefineId: r.defineId,
+    state: r.state, parentNodeName: r.parentNodeName, businessNo: r.businessNo,
+    operator: r.operator, expireTime: fmtTime(r.expireTime),
+    variable: r.variables, createTime: fmtTime(r.createTime), createUser: r.createUser,
+    updateTime: fmtTime(r.updateTime), updateUser: r.updateUser,
+    processDefineName: r.defineName, processDefineDisplayName: r.defineDisplayName,
+    processDefineVersion: r.defineVersion,
+    ext: r.variables, displayName: r.defineDisplayName, version: r.defineVersion,
+  }
+}
+
+/** 任务行：ext（任务变量，空回退实例变量）+ instanceExt + version */
+function taskRowToMap(r: TaskRow): Record<string, any> {
+  const instanceExt = parseVarMap(r.instanceVariable)
+  const ext = Object.keys(r.variables ?? {}).length > 0 ? r.variables : instanceExt
+  return {
+    id: r.id, processInstanceId: r.processInstanceId, taskName: r.taskName,
+    displayName: r.displayName, taskType: r.taskType, performType: r.performType,
+    taskState: r.taskState, operator: r.operator, finishTime: fmtTime(r.finishTime),
+    expireTime: fmtTime(r.expireTime), formKey: r.formKey, taskParentId: r.taskParentId ?? null,
+    variable: r.variables, createTime: fmtTime(r.createTime), createUser: r.createUser,
+    updateTime: fmtTime(r.updateTime), updateUser: r.updateUser,
+    processDefineName: r.processDefineName, processDefineDisplayName: r.processDefineDisplayName,
+    instanceVariable: r.instanceVariable, instanceCreateTime: fmtTime(r.instanceCreateTime),
+    ext, instanceExt, version: r.defineVersion,
+  }
 }
 
 // ── 工具 ──────────────────────────────────────────────────────────────────────

@@ -405,6 +405,7 @@ export interface TaskRow {
   updateUser: string
   processDefineName: string
   processDefineDisplayName: string
+  defineVersion: number
   instanceVariable: string
   instanceCreateTime: Date
 }
