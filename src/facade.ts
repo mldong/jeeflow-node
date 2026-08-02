@@ -622,23 +622,47 @@ export class JeeflowFacade {
     const inst = await this.repo.findInstanceById(id)
     if (!inst) throw new Error('流程实例不存在')
     const def0 = await this.repo.findDefineById(inst.defineId)
-    return {
-      id: inst.id, parentId: inst.parentId, processDefineId: inst.defineId,
-      state: inst.state, parentNodeName: inst.parentNodeName,
-      businessNo: inst.businessNo, operator: inst.operator,
-      variables: inst.variables, createTime: inst.createTime, createUser: inst.createUser,
-      jsonObject: def0 ? this.parseGraph(def0.content) : undefined, // issues/05
-      tasks: (inst.tasks ?? []).map(t => ({
+    const graph = def0 ? this.parseGraph(def0.content) : undefined
+    // 任务列表（issues/05-4）：全量 tasks + activeTaskList（仅 DOING）+ 任务行 ext/isFirstTaskNode
+    const firstTaskNodeId = this.firstTaskNodeId(graph)
+    const tasks: Record<string, any>[] = []
+    const activeTaskList: Record<string, any>[] = []
+    for (const t of inst.tasks ?? []) {
+      const vo: Record<string, any> = {
         id: t.id, processInstanceId: t.processInstanceId, taskName: t.taskName,
-        displayName: t.displayName, taskType: t.taskType, performType: t.performType,
-        taskState: t.taskState, operator: t.actorId ?? '', finishTime: t.finishTime,
+        displayName: t.displayName, taskType: t.taskType ?? null,
+        performType: t.performType ?? null, taskState: t.taskState,
+        operator: t.actorId ?? '', finishTime: t.finishTime,
         expireTime: t.expireTime, formKey: t.formKey ?? '', taskParentId: t.parentTaskId ?? null,
         variable: JSON.stringify(t.variables ?? {}),
         createTime: t.createTime, createUser: t.createUser,
         updateTime: t.updateTime, updateUser: t.updateUser,
         taskActorIdList: t.actorIds ?? [],
-      })),
+      }
+      const ext: Record<string, any> = { ...(t.variables ?? {}) }
+      const doing = t.taskState === TaskState.Doing
+      ext.isFirstTaskNode = doing && t.taskName === firstTaskNodeId
+      vo.ext = ext
+      tasks.push(vo)
+      if (doing) activeTaskList.push(vo)
     }
+    return {
+      id: inst.id, parentId: inst.parentId, processDefineId: inst.defineId,
+      state: inst.state, parentNodeName: inst.parentNodeName,
+      businessNo: inst.businessNo, operator: inst.operator,
+      variables: inst.variables, createTime: inst.createTime, createUser: inst.createUser,
+      jsonObject: graph, // issues/05
+      tasks,
+      activeTaskList,
+    }
+  }
+
+  /** 流程 JSON 中第一个任务节点 id（issues/05-4 isFirstTaskNode 用） */
+  private firstTaskNodeId(graph: Record<string, any> | undefined): string {
+    for (const n of graph?.nodes ?? []) {
+      if (n?.type === 'snaker:task') return n.id
+    }
+    return ''
   }
 
   private async todoList(args: Record<string, any>): Promise<Record<string, any>> {
