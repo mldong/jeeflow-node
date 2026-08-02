@@ -90,15 +90,61 @@ export interface ProcessSurrogate {
 }
 
 export enum InstanceState {
-  Doing  = 10,
-  Done   = 20,
-  Reject = 45,
+  Doing     = 10,
+  Done      = 20,
+  Withdraw  = 30,
+  Interrupt = 40,
+  Reject    = 45,
+  Pending   = 50,
+  Abandon   = 99,
 }
 
 export enum TaskState {
   Doing     = 10,
   Done      = 20,
+  Withdraw  = 30,
+  Interrupt = 40,
+  Pending   = 50,
   Abandoned = 99,
+}
+
+// ─── 字典枚举（v1.4.0，对齐 Java enums，值与 boot3 字典一致） ───────────────
+
+/** 流程定义状态（wf_process_define_state） */
+export enum DefineState {
+  Disable = 0,
+  Enable  = 1,
+}
+
+/** 流程提交类型（wf_process_submit_type） */
+export enum SubmitType {
+  Apply               = 0,
+  Agree               = 1,
+  Reject              = 2,
+  Rollback            = 3,
+  Jump                = 4,
+  ReApply             = 5,
+  RollbackToOperator  = 6,
+  CountersignDisagree = 20,
+}
+
+/** 任务类型（wf_process_task_type） */
+export enum TaskType {
+  Major     = 0,
+  Secondary = 1,
+  Record    = 2,
+}
+
+/** 任务参与方式（wf_process_task_perform_type） */
+export enum PerformType {
+  Normal     = 0,
+  Countersign = 1,
+}
+
+/** 会签类型（wf_countersign_type） */
+export enum CountersignType {
+  Parallel   = 0,
+  Sequential = 1,
 }
 
 export const BusinessNoKey = 'BUSINESS_NO'

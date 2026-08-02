@@ -1,5 +1,6 @@
 export { EngineImpl, type Engine } from './engine.js'
 export { MemoryRepository } from './memory.js'
-export { HandlerRegistry, type IAssignmentHandler, type IDecisionHandler } from './registry.js'
+export { HandlerRegistry, type IAssignmentHandler, type IDecisionHandler, type HandlerMeta } from './registry.js'
+export { enumDict, enumDictKeys, type DictItem } from './metadata.js'
 export * from './model.js'
 export type { ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
