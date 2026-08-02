@@ -48,6 +48,10 @@ export class JeeflowFacade {
 
   private async dispatch(action: string, args: Record<string, any>): Promise<any> {
     switch (action) {
+      case 'processDefine/page':
+        return this.definePage(args)
+      case 'processDefine/detail':
+        return this.defineDetail(args)
       case 'processDefine/startAndExecute':
       case 'processInstance/startAndExecute':
         return this.startAndExecute(args)
@@ -60,8 +64,16 @@ export class JeeflowFacade {
         return this.repo.removeDefine(toId(args.id))
       case 'processDefine/upAndDown':
         return this.repo.updateDefineState(toId(args.id), toInt(args.state))
+      case 'processInstance/page':
+        return this.instancePage(args)
+      case 'processInstance/detail':
+        return this.instanceDetail(args)
       case 'processInstance/withdraw':
         return this.withdraw(args)
+      case 'processTask/todoList':
+        return this.todoList(args)
+      case 'processTask/doneList':
+        return this.doneList(args)
       case 'processTask/execute':
         return this.execute(args)
       case 'processDesign/page':
@@ -551,6 +563,71 @@ export class JeeflowFacade {
     if (!this.extRepo) throw new Error('未配置 ProcessExtRepository（扩展仓储）')
     return this.extRepo
   }
+  // ═══ 基础分页/详情（v1.5.0 补齐，对齐 Java 门面）═══
+
+  private async definePage(args: Record<string, any>): Promise<Record<string, any>> {
+    const pageNum = toInt(args.pageNum ?? 1)
+    const pageSize = toInt(args.pageSize ?? 10)
+    const { rows, total } = await this.repo.pageDefines(pageNum, pageSize)
+    return { rows, recordCount: total }
+  }
+
+  private async defineDetail(args: Record<string, any>): Promise<Record<string, any>> {
+    const id = toId(args.id)
+    const def = await this.repo.findDefineById(id)
+    if (!def) throw new Error('流程定义不存在')
+    return {
+      id: def.id, name: def.name, displayName: def.displayName,
+      type: def.type, state: def.state, version: def.version,
+    }
+  }
+
+  private async instancePage(args: Record<string, any>): Promise<Record<string, any>> {
+    const pageNum = toInt(args.pageNum ?? 1)
+    const pageSize = toInt(args.pageSize ?? 10)
+    const operator = String(args.operator ?? 'user1')
+    const { rows, total } = await this.repo.pageInstances(pageNum, pageSize, operator)
+    return { rows, recordCount: total }
+  }
+
+  private async instanceDetail(args: Record<string, any>): Promise<Record<string, any>> {
+    const id = toId(args.id)
+    const inst = await this.repo.findInstanceById(id)
+    if (!inst) throw new Error('流程实例不存在')
+    return {
+      id: inst.id, parentId: inst.parentId, processDefineId: inst.defineId,
+      state: inst.state, parentNodeName: inst.parentNodeName,
+      businessNo: inst.businessNo, operator: inst.operator,
+      variables: inst.variables, createTime: inst.createTime, createUser: inst.createUser,
+      tasks: (inst.tasks ?? []).map(t => ({
+        id: t.id, processInstanceId: t.processInstanceId, taskName: t.taskName,
+        displayName: t.displayName, taskType: t.taskType, performType: t.performType,
+        taskState: t.taskState, operator: t.actorId ?? '', finishTime: t.finishTime,
+        expireTime: t.expireTime, formKey: t.formKey ?? '', taskParentId: t.parentTaskId ?? null,
+        variable: JSON.stringify(t.variables ?? {}),
+        createTime: t.createTime, createUser: t.createUser,
+        updateTime: t.updateTime, updateUser: t.updateUser,
+        taskActorIdList: t.actorIds ?? [],
+      })),
+    }
+  }
+
+  private async todoList(args: Record<string, any>): Promise<Record<string, any>> {
+    const pageNum = toInt(args.pageNum ?? 1)
+    const pageSize = toInt(args.pageSize ?? 10)
+    const actorId = String(args.operator ?? 'user1')
+    const { rows, total } = await this.repo.pageTodoTasks(pageNum, pageSize, actorId)
+    return { rows, recordCount: total }
+  }
+
+  private async doneList(args: Record<string, any>): Promise<Record<string, any>> {
+    const pageNum = toInt(args.pageNum ?? 1)
+    const pageSize = toInt(args.pageSize ?? 10)
+    const operator = String(args.operator ?? 'user1')
+    const { rows, total } = await this.repo.pageDoneTasks(pageNum, pageSize, operator)
+    return { rows, recordCount: total }
+  }
+
 }
 
 // ── 工具 ──────────────────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
-import type { CcInstanceRow, ProcessDefine } from './model.js'
+import { TaskState } from './model.js'
+import type { CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDefine } from './model.js'
 import { cloneInstance, cloneTask, type ProcessInstance, type ProcessTask } from './model.js'
 import type { ProcessRepository } from './spi.js'
 
@@ -149,6 +150,80 @@ export class MemoryRepository implements ProcessRepository {
     this.ccInstances.set(instanceId, existing)
   }
   async updateCcStatus(_instanceId: number, _actorId: string) {}
+
+  // ── 核心表分页（v1.5.0）──
+
+  async pageDefines(pageNum = 1, pageSize = 10) {
+    const rows: DefineRow[] = [...this.defines.values()].map(d => ({
+      id: d.id, name: d.name, displayName: d.displayName, type: d.type,
+      state: d.state, version: d.version,
+      createTime: d.createTime, createUser: d.createUser,
+      updateTime: d.updateTime, updateUser: d.updateUser,
+    }))
+    const total = rows.length
+    const start = (pageNum - 1) * pageSize
+    return { rows: rows.slice(start, start + pageSize), total }
+  }
+
+  async pageInstances(pageNum = 1, pageSize = 10, operator: string) {
+    const rows: InstanceRow[] = []
+    for (const inst of this.instances.values()) {
+      if (operator && inst.operator !== operator) continue
+      const def = this.defines.get(inst.defineId)
+      rows.push({
+        id: inst.id, parentId: inst.parentId, defineId: inst.defineId, state: inst.state,
+        parentNodeName: inst.parentNodeName, businessNo: inst.businessNo, operator: inst.operator,
+        expireTime: inst.expireTime, variables: { ...inst.variables },
+        createTime: inst.createTime, createUser: inst.createUser,
+        updateTime: inst.updateTime, updateUser: inst.updateUser,
+        defineName: def?.name ?? '', defineDisplayName: def?.displayName ?? '',
+        defineVersion: def?.version ?? 0,
+      })
+    }
+    const total = rows.length
+    const start = (pageNum - 1) * pageSize
+    return { rows: rows.slice(start, start + pageSize), total }
+  }
+
+  async pageTodoTasks(pageNum = 1, pageSize = 10, actorId: string) {
+    const rows: TaskRow[] = []
+    for (const t of this.tasks.values()) {
+      if (t.taskState !== TaskState.Doing) continue
+      if (actorId && !(this.actors.get(t.id) ?? []).includes(actorId)) continue
+      rows.push(this.taskRow(t))
+    }
+    const total = rows.length
+    const start = (pageNum - 1) * pageSize
+    return { rows: rows.slice(start, start + pageSize), total }
+  }
+
+  async pageDoneTasks(pageNum = 1, pageSize = 10, operator: string) {
+    const rows: TaskRow[] = []
+    for (const t of this.tasks.values()) {
+      if (t.taskState === TaskState.Doing) continue
+      if (operator && t.actorId !== operator) continue
+      rows.push(this.taskRow(t))
+    }
+    const total = rows.length
+    const start = (pageNum - 1) * pageSize
+    return { rows: rows.slice(start, start + pageSize), total }
+  }
+
+  private taskRow(t: ProcessTask): TaskRow {
+    const inst = this.instances.get(t.processInstanceId)
+    const def = inst ? this.defines.get(inst.defineId) : undefined
+    return {
+      id: t.id, processInstanceId: t.processInstanceId, taskName: t.taskName,
+      displayName: t.displayName, taskType: t.taskType, performType: t.performType,
+      taskState: t.taskState, operator: t.actorId ?? '', finishTime: t.finishTime,
+      expireTime: t.expireTime, formKey: t.formKey ?? '', taskParentId: t.parentTaskId,
+      variables: { ...t.variables }, createTime: t.createTime, createUser: t.createUser,
+      updateTime: t.updateTime, updateUser: t.updateUser,
+      processDefineName: def?.name ?? '', processDefineDisplayName: def?.displayName ?? '',
+      instanceVariable: inst ? JSON.stringify(inst.variables ?? {}) : '',
+      instanceCreateTime: inst?.createTime ?? t.createTime,
+    }
+  }
 
   // pageCcInstances 我的抄送分页（v1.3.0）：按抄送人 actorId 过滤，join 实例 + 定义
   async pageCcInstances(pageNum = 1, pageSize = 10, actorId: string) {

@@ -4,6 +4,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { EngineImpl } from '../src/engine.js'
+import { JeeflowFacade as Facade } from '../src/facade.js'
 import { MemoryRepository } from '../src/memory.js'
 import { TaskState, type ProcessDefine } from '../src/model.js'
 
@@ -23,6 +24,7 @@ const engine = new EngineImpl(repo, undefined, undefined, {
     return false
   }
 })
+const facade = new Facade(engine, repo, undefined)
 
 // ─── 从共享 JSON 文件加载所有流程 ────────────────────────────────────────────────
 let flowsDir = join(__dirname, '..', '..', 'jeeflow-java', 'jeeflow-core', 'src', 'test', 'resources', 'flows')
@@ -112,6 +114,31 @@ const taskVo = (t: any, inst: any = null, def: ProcessDefine | null = null): any
   vo.taskActorIdList = t.actorIds ?? []
   return vo
 }
+
+// ─── 仪表盘统计（UI 用，非 boot2 端点）───────────────────────────────────────────
+app.get('/api/stats', async (req, res) => {
+  const userId = String(req.query.userId ?? 'user1')
+  let todoCount = 0
+  for (const t of repo.allTasks()) {
+    if (t.taskState !== TaskState.Doing) continue
+    const actors = await repo.findTaskActors(t.id)
+    if (t.actorIds.includes(userId) || actors.includes(userId)) todoCount++
+  }
+  let myInstanceCount = 0
+  for (const i of repo.allInstances()) if (i.createUser === userId) myInstanceCount++
+  res.json(ok({ todoCount, myInstanceCount }))
+})
+
+// ─── 统一门面转发（v1.5.0）：/wf/{action}，action 多段（如 processDefine/page）──────────────
+app.post('/wf/*', async (req, res) => {
+  try {
+    const action = String(req.params[0] ?? '').replace(/^\//, '')
+    const body = req.body ?? {}
+    res.json(await facade.flow(action, body))
+  } catch (e: any) {
+    res.json({ code: 99999999, msg: e.message })
+  }
+})
 
 // ─── 仪表盘统计（UI 用，非 boot2 端点）───────────────────────────────────────────
 app.get('/api/stats', async (req, res) => {

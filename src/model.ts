@@ -350,3 +350,61 @@ export interface CcInstanceRow {
   defineDisplayName: string
   defineVersion: number
 }
+
+// ─── 核心表分页行数据（v1.5.0，对齐 Java DefineRow/InstanceRow/TaskRow） ─────
+
+export interface DefineRow {
+  id: number
+  name: string
+  displayName: string
+  type: string
+  state: number
+  version: number
+  createTime: Date
+  createUser: string
+  updateTime: Date
+  updateUser: string
+}
+
+export interface InstanceRow {
+  id: number
+  parentId?: number
+  defineId: number
+  state: InstanceState
+  parentNodeName: string
+  businessNo: string
+  operator: string
+  expireTime?: Date
+  variables: Record<string, any>
+  createTime: Date
+  createUser: string
+  updateTime: Date
+  updateUser: string
+  defineName: string
+  defineDisplayName: string
+  defineVersion: number
+}
+
+export interface TaskRow {
+  id: number
+  processInstanceId: number
+  taskName: string
+  displayName: string
+  taskType: number
+  performType: number
+  taskState: TaskState
+  operator: string
+  finishTime?: Date
+  expireTime?: Date
+  formKey: string
+  taskParentId?: number
+  variables: Record<string, any>
+  createTime: Date
+  createUser: string
+  updateTime: Date
+  updateUser: string
+  processDefineName: string
+  processDefineDisplayName: string
+  instanceVariable: string
+  instanceCreateTime: Date
+}

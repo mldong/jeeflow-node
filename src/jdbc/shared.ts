@@ -10,7 +10,7 @@
 // （execute/fetchOne/fetchAll/begin/commit/rollback）。参考 mysql.ts / postgres.ts。
 
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { ProcessInstance, ProcessTask, type ProcessDefine, type CcInstanceRow } from '../model.js'
+import { ProcessInstance, ProcessTask, type ProcessDefine, type CcInstanceRow, type DefineRow, type InstanceRow, type TaskRow } from '../model.js'
 import { InstanceState, TaskState } from '../model.js'
 import type { IDGenerator, ProcessRepository } from '../spi.js'
 
@@ -460,6 +460,117 @@ export class JdbcRepository implements ProcessRepository {
         [new Date(), instanceId, actorId])
     } finally {
       await this.done(conn)
+    }
+  }
+
+  // ── 核心表分页（v1.5.0，对齐 Java pageDefines/pageInstances/pageTodoTasks/pageDoneTasks）──
+
+  async pageDefines(pageNum: number, pageSize: number): Promise<{ rows: DefineRow[]; total: number }> {
+    const conn = await this.c()
+    try {
+      const countRow = await conn.fetchOne(this.sql('SELECT COUNT(*) FROM wf_process_define t'), [])
+      const total = Number(Object.values(countRow as Record<string, unknown>)[0] ?? 0)
+      const rows = await conn.fetchAll(this.sql(
+        'SELECT id, name, display_name, type, state, version, create_time, create_user, update_time, update_user' +
+        ' FROM wf_process_define t ORDER BY t.id DESC LIMIT ? OFFSET ?'),
+        [pageSize, (pageNum - 1) * pageSize])
+      return {
+        rows: rows.map(r => ({
+          id: Number(r.id), name: r.name, displayName: r.display_name, type: r.type,
+          state: Number(r.state), version: Number(r.version),
+          createTime: r.create_time, createUser: r.create_user ?? '',
+          updateTime: r.update_time, updateUser: r.update_user ?? '',
+        })),
+        total,
+      }
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async pageInstances(pageNum: number, pageSize: number, operator: string): Promise<{ rows: InstanceRow[]; total: number }> {
+    const where = ' FROM wf_process_instance t' +
+      ' LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id' +
+      ' WHERE t.operator = ?'
+    const conn = await this.c()
+    try {
+      const countRow = await conn.fetchOne(this.sql('SELECT COUNT(*) ' + where), [operator])
+      const total = Number(Object.values(countRow as Record<string, unknown>)[0] ?? 0)
+      const cols = 't.id, t.parent_id, t.process_define_id, t.state, t.parent_node_name, t.business_no,' +
+        ' t.operator, t.expire_time, t.variable, t.create_time, t.create_user, t.update_time, t.update_user,' +
+        ' pd.name, pd.display_name, pd.version'
+      const rows = await conn.fetchAll(this.sql(
+        `SELECT ${cols}${where} ORDER BY t.id DESC LIMIT ? OFFSET ?`),
+        [operator, pageSize, (pageNum - 1) * pageSize])
+      return { rows: rows.map(r => this.mapInstanceRow(r)), total }
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async pageTodoTasks(pageNum: number, pageSize: number, actorId: string): Promise<{ rows: TaskRow[]; total: number }> {
+    return this.pageTasks(pageNum, pageSize, false, actorId)
+  }
+
+  async pageDoneTasks(pageNum: number, pageSize: number, operator: string): Promise<{ rows: TaskRow[]; total: number }> {
+    return this.pageTasks(pageNum, pageSize, true, operator)
+  }
+
+  private async pageTasks(pageNum: number, pageSize: number, done: boolean, filter: string): Promise<{ rows: TaskRow[]; total: number }> {
+    const where = ' FROM wf_process_task t' +
+      ' LEFT JOIN wf_process_instance pi ON t.process_instance_id = pi.id' +
+      ' LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id' +
+      ' LEFT JOIN wf_process_task_actor pta ON t.id = pta.process_task_id' +
+      (done ? ' WHERE t.task_state <> 10 AND t.operator = ?' : ' WHERE t.task_state = 10 AND pta.actor_id = ?')
+    const conn = await this.c()
+    try {
+      const countRow = await conn.fetchOne(this.sql('SELECT COUNT(DISTINCT t.id) ' + where), [filter])
+      const total = Number(Object.values(countRow as Record<string, unknown>)[0] ?? 0)
+      const cols = 'DISTINCT t.id, t.process_instance_id, t.task_name, t.display_name, t.task_type, t.perform_type,' +
+        ' t.task_state, t.operator, t.finish_time, t.expire_time, t.form_key, t.task_parent_id, t.variable,' +
+        ' t.create_time, t.create_user, t.update_time, t.update_user,' +
+        ' pd.name, pd.display_name, pi.variable, pi.create_time'
+      const rows = await conn.fetchAll(this.sql(
+        `SELECT ${cols}${where} ORDER BY t.id DESC LIMIT ? OFFSET ?`),
+        [filter, pageSize, (pageNum - 1) * pageSize])
+      return { rows: rows.map(r => this.mapTaskRow(r)), total }
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  private mapInstanceRow(r: Record<string, any>): InstanceRow {
+    let variables: Record<string, any> = {}
+    if (r.variable) {
+      try { variables = JSON.parse(r.variable) } catch { /* 忽略坏 JSON */ }
+    }
+    return {
+      id: Number(r.id), parentId: r.parent_id != null ? Number(r.parent_id) : undefined,
+      defineId: Number(r.process_define_id), state: r.state as InstanceState,
+      parentNodeName: r.parent_node_name ?? '', businessNo: r.business_no ?? '', operator: r.operator ?? '',
+      expireTime: r.expire_time ?? undefined, variables,
+      createTime: r.create_time, createUser: r.create_user ?? '',
+      updateTime: r.update_time, updateUser: r.update_user ?? '',
+      defineName: r.name ?? '', defineDisplayName: r.display_name ?? '',
+      defineVersion: Number(r.version ?? 0),
+    }
+  }
+
+  private mapTaskRow(r: Record<string, any>): TaskRow {
+    let variables: Record<string, any> = {}
+    if (r.variable) {
+      try { variables = JSON.parse(r.variable) } catch { /* 忽略坏 JSON */ }
+    }
+    return {
+      id: Number(r.id), processInstanceId: Number(r.process_instance_id), taskName: r.task_name,
+      displayName: r.display_name, taskType: Number(r.task_type), performType: Number(r.perform_type),
+      taskState: r.task_state as TaskState, operator: r.operator ?? '', finishTime: r.finish_time ?? undefined,
+      expireTime: r.expire_time ?? undefined, formKey: r.form_key ?? '',
+      taskParentId: r.task_parent_id != null ? Number(r.task_parent_id) : undefined,
+      variables, createTime: r.create_time, createUser: r.create_user ?? '',
+      updateTime: r.update_time, updateUser: r.update_user ?? '',
+      processDefineName: r.name ?? '', processDefineDisplayName: r.display_name ?? '',
+      instanceVariable: r.variable ?? '', instanceCreateTime: r.create_time,
     }
   }
 
