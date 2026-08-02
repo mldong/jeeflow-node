@@ -5,9 +5,7 @@
 ## 安装
 
 ```bash
-# ⚠️ 尚未发布到 npm——源码方式使用：
-git clone https://github.com/mldong/jeeflow-node
-# 你的项目里引用源码目录（或后续发布后 npm install @mldong/jeeflow）
+npm install @mldong/jeeflow
 ```
 
 引擎核心仅依赖 `node:*` 标准库（零外部依赖），需 Node 18+。
