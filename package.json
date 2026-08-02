@@ -31,6 +31,7 @@
   "devDependencies": {
     "@types/express": "^4.17.25",
     "@types/pg": "^8.20.3",
+    "express": "^4.22.2",
     "tsx": "^4.19.0",
     "typescript": "^5.5.0"
   },
@@ -42,8 +43,5 @@
     "dist",
     "LICENSE",
     "README.md"
-  ],
-  "dependencies": {
-    "express": "^4.22.2"
-  }
+  ]
 }
