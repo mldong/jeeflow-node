@@ -4,7 +4,31 @@ import {
   ProcessDesign, ProcessDesignHis, ProcessSurrogate,
   type ProcessInstance,
 } from './model.js'
-import type { ProcessExtRepository } from './spi.js'
+import type { ProcessExtRepository, QueryCondition } from './spi.js'
+import { matchConditions } from './memory.js'
+
+// ═══ 条件匹配基建（issues/05-5） ═══
+
+const DESIGN_FIELDS: Record<string, string> = {
+  't.id': 'id', 't.name': 'name', 't.display_name': 'displayName', 't.type': 'type',
+  't.is_deployed': 'isDeployed', 't.remark': 'remark',
+  't.create_time': 'createTime', 't.update_time': 'updateTime',
+}
+
+const SURROGATE_FIELDS: Record<string, string> = {
+  't.id': 'id', 't.process_name': 'processName', 't.operator': 'operator',
+  't.surrogate': 'surrogate', 't.enabled': 'enabled',
+  't.start_time': 'startTime', 't.end_time': 'endTime',
+  't.create_time': 'createTime', 't.update_time': 'updateTime',
+}
+
+function pickFields(row: any, map: Record<string, string>): Record<string, any> {
+  const fields: Record<string, any> = {}
+  for (const [col, key] of Object.entries(map)) {
+    fields[col] = row[key]
+  }
+  return fields
+}
 
 export class MemoryExtRepository implements ProcessExtRepository {
   private designs = new Map<number, ProcessDesign>()
@@ -34,8 +58,10 @@ export class MemoryExtRepository implements ProcessExtRepository {
     this.designHis.delete(id)
   }
 
-  async pageDesigns(_pageNum = 1, _pageSize = 10, _filters?: Record<string, any>): Promise<[ProcessDesign[], number]> {
-    return [[...this.designs.values()], this.designs.size]
+  async pageDesigns(_pageNum = 1, _pageSize = 10, _filters?: Record<string, any>, conditions?: QueryCondition[]): Promise<[ProcessDesign[], number]> {
+    const rows = [...this.designs.values()].filter(d =>
+      matchConditions(conditions, pickFields(d, DESIGN_FIELDS)))
+    return [rows, rows.length]
   }
 
   // ── 设计历史 ──
@@ -74,8 +100,16 @@ export class MemoryExtRepository implements ProcessExtRepository {
     this.surrogates.delete(id)
   }
 
-  async pageSurrogates(_pageNum = 1, _pageSize = 10, _filters?: Record<string, any>): Promise<[ProcessSurrogate[], number]> {
-    return [[...this.surrogates.values()], this.surrogates.size]
+  async pageSurrogates(_pageNum = 1, _pageSize = 10, filters?: Record<string, any>, conditions?: QueryCondition[]): Promise<[ProcessSurrogate[], number]> {
+    const rows = [...this.surrogates.values()].filter(s => {
+      for (const [col, val] of Object.entries(filters ?? {})) {
+        if (val == null || val === '') continue
+        const k = col === 'process_name' ? 'processName' : col
+        if (String((s as any)[k]) !== String(val)) return false
+      }
+      return matchConditions(conditions, pickFields(s, SURROGATE_FIELDS))
+    })
+    return [rows, rows.length]
   }
 
   async getSurrogate(operator: string, processName: string, at: Date = new Date()): Promise<ProcessSurrogate | null> {

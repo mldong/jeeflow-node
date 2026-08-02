@@ -1,7 +1,71 @@
 import { TaskState } from './model.js'
 import type { CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDefine } from './model.js'
 import { cloneInstance, cloneTask, type ProcessInstance, type ProcessTask } from './model.js'
-import type { ProcessRepository } from './spi.js'
+import type { ProcessRepository, QueryCondition } from './spi.js'
+
+// ═══ 条件匹配基建（issues/05-5，对齐 JDBC 白名单语义） ═══
+
+// 行字段映射（列名 → 行属性，白名单列均可匹配）
+const TASK_FIELDS: Record<string, string> = {
+  't.id': 'id', 't.task_name': 'taskName', 't.display_name': 'displayName',
+  't.task_type': 'taskType', 't.perform_type': 'performType', 't.task_state': 'taskState',
+  't.operator': 'operator', 't.form_key': 'formKey', 't.create_time': 'createTime',
+  't.finish_time': 'finishTime', 't.expire_time': 'expireTime',
+  't.process_instance_id': 'processInstanceId', 't.task_parent_id': 'taskParentId',
+  'pd.name': 'processDefineName', 'pd.display_name': 'processDefineDisplayName',
+  'pd.version': 'defineVersion',
+}
+
+const INSTANCE_FIELDS: Record<string, string> = {
+  't.id': 'id', 't.parent_id': 'parentId', 't.process_define_id': 'defineId',
+  't.state': 'state', 't.parent_node_name': 'parentNodeName', 't.business_no': 'businessNo',
+  't.operator': 'operator', 't.expire_time': 'expireTime', 't.create_time': 'createTime',
+  'pd.name': 'defineName', 'pd.display_name': 'defineDisplayName', 'pd.version': 'defineVersion',
+}
+
+const DEFINE_FIELDS: Record<string, string> = {
+  't.id': 'id', 't.name': 'name', 't.display_name': 'displayName', 't.type': 'type',
+  't.state': 'state', 't.version': 'version', 't.create_time': 'createTime',
+  't.update_time': 'updateTime',
+}
+
+/** 行字段提取（列名 → 值） */
+function pickFields(row: any, map: Record<string, string>): Record<string, any> {
+  const fields: Record<string, any> = {}
+  for (const [col, key] of Object.entries(map)) {
+    fields[col] = row[key]
+  }
+  return fields
+}
+
+/** 条件全匹配（操作符对齐 JDBC buildWhere；列不在字段中则跳过） */
+export function matchConditions(conditions: QueryCondition[] | undefined, fields: Record<string, any>): boolean {
+  for (const c of conditions ?? []) {
+    const v = fields[c.column]
+    const expect = c.value
+    if (v == null || expect == null) continue
+    switch (c.operator.toUpperCase()) {
+      case 'EQ': if (!eqValue(v, expect)) return false; break
+      case 'NE': if (eqValue(v, expect)) return false; break
+      case 'LIKE': if (!String(v).includes(String(expect))) return false; break
+      case 'LLIKE': if (!String(v).endsWith(String(expect))) return false; break
+      case 'RLIKE': if (!String(v).startsWith(String(expect))) return false; break
+      case 'GT': if (Number(v) <= Number(expect)) return false; break
+      case 'GE': if (Number(v) < Number(expect)) return false; break
+      case 'LT': if (Number(v) >= Number(expect)) return false; break
+      case 'LE': if (Number(v) > Number(expect)) return false; break
+      case 'IN': if (!Array.isArray(expect) || !expect.includes(v)) return false; break
+      case 'NIN': if (Array.isArray(expect) && expect.includes(v)) return false; break
+    }
+  }
+  return true
+}
+
+/** EQ：值或集合包含判断（pta.actor_id/cc.actor_id 为数组） */
+export function eqValue(v: any, expect: any): boolean {
+  if (Array.isArray(v)) return v.includes(expect)
+  return String(v) === String(expect)
+}
 
 export class MemoryRepository implements ProcessRepository {
   private defines  = new Map<number, ProcessDefine>()
@@ -153,24 +217,24 @@ export class MemoryRepository implements ProcessRepository {
 
   // ── 核心表分页（v1.5.0）──
 
-  async pageDefines(pageNum = 1, pageSize = 10) {
+  async pageDefines(pageNum = 1, pageSize = 10, conditions?: QueryCondition[]) {
     const rows: DefineRow[] = [...this.defines.values()].map(d => ({
       id: d.id, name: d.name, displayName: d.displayName, type: d.type,
       state: d.state, version: d.version,
       createTime: d.createTime, createUser: d.createUser,
       updateTime: d.updateTime, updateUser: d.updateUser,
-    }))
+    })).filter(r => matchConditions(conditions, pickFields(r, DEFINE_FIELDS)))
     const total = rows.length
     const start = (pageNum - 1) * pageSize
     return { rows: rows.slice(start, start + pageSize), total }
   }
 
-  async pageInstances(pageNum = 1, pageSize = 10, operator: string) {
+  async pageInstances(pageNum = 1, pageSize = 10, operator: string, conditions?: QueryCondition[]) {
     const rows: InstanceRow[] = []
     for (const inst of this.instances.values()) {
       if (operator && inst.operator !== operator) continue
       const def = this.defines.get(inst.defineId)
-      rows.push({
+      const r: InstanceRow = {
         id: inst.id, parentId: inst.parentId, defineId: inst.defineId, state: inst.state,
         parentNodeName: inst.parentNodeName, businessNo: inst.businessNo, operator: inst.operator,
         expireTime: inst.expireTime, variables: { ...inst.variables },
@@ -178,31 +242,36 @@ export class MemoryRepository implements ProcessRepository {
         updateTime: inst.updateTime, updateUser: inst.updateUser,
         defineName: def?.name ?? '', defineDisplayName: def?.displayName ?? '',
         defineVersion: def?.version ?? 0,
-      })
+      }
+      if (matchConditions(conditions, pickFields(r, INSTANCE_FIELDS))) rows.push(r)
     }
     const total = rows.length
     const start = (pageNum - 1) * pageSize
     return { rows: rows.slice(start, start + pageSize), total }
   }
 
-  async pageTodoTasks(pageNum = 1, pageSize = 10, actorId: string) {
+  async pageTodoTasks(pageNum = 1, pageSize = 10, actorId: string, conditions?: QueryCondition[]) {
     const rows: TaskRow[] = []
     for (const t of this.tasks.values()) {
       if (t.taskState !== TaskState.Doing) continue
       if (actorId && !(this.actors.get(t.id) ?? []).includes(actorId)) continue
-      rows.push(this.taskRow(t))
+      const r = this.taskRow(t)
+      const fields = pickFields(r, TASK_FIELDS)
+      fields['pta.actor_id'] = this.actors.get(t.id) ?? []
+      if (matchConditions(conditions, fields)) rows.push(r)
     }
     const total = rows.length
     const start = (pageNum - 1) * pageSize
     return { rows: rows.slice(start, start + pageSize), total }
   }
 
-  async pageDoneTasks(pageNum = 1, pageSize = 10, operator: string) {
+  async pageDoneTasks(pageNum = 1, pageSize = 10, operator: string, conditions?: QueryCondition[]) {
     const rows: TaskRow[] = []
     for (const t of this.tasks.values()) {
       if (t.taskState === TaskState.Doing) continue
       if (operator && t.actorId !== operator) continue
-      rows.push(this.taskRow(t))
+      const r = this.taskRow(t)
+      if (matchConditions(conditions, pickFields(r, TASK_FIELDS))) rows.push(r)
     }
     const total = rows.length
     const start = (pageNum - 1) * pageSize
@@ -227,14 +296,14 @@ export class MemoryRepository implements ProcessRepository {
   }
 
   // pageCcInstances 我的抄送分页（v1.3.0）：按抄送人 actorId 过滤，join 实例 + 定义
-  async pageCcInstances(pageNum = 1, pageSize = 10, actorId: string) {
+  async pageCcInstances(pageNum = 1, pageSize = 10, actorId: string, conditions?: QueryCondition[]) {
     const rows: CcInstanceRow[] = []
     for (const [instId, actors] of this.ccInstances) {
       if (actorId && !actors.includes(actorId)) continue
       const inst = this.instances.get(instId)
       if (!inst) continue
       const def = this.defines.get(inst.defineId)
-      rows.push({
+      const r: CcInstanceRow = {
         id: inst.id, parentId: inst.parentId, defineId: inst.defineId, state: inst.state,
         parentNodeName: inst.parentNodeName, businessNo: inst.businessNo, operator: inst.operator,
         expireTime: inst.expireTime, variables: { ...inst.variables },
@@ -242,7 +311,10 @@ export class MemoryRepository implements ProcessRepository {
         updateTime: inst.updateTime, updateUser: inst.updateUser,
         defineName: def?.name ?? '', defineDisplayName: def?.displayName ?? '',
         defineVersion: def?.version ?? 0,
-      })
+      }
+      const fields = pickFields(r, INSTANCE_FIELDS)
+      fields['cc.actor_id'] = actors
+      if (matchConditions(conditions, fields)) rows.push(r)
     }
     const total = rows.length
     const start = (pageNum - 1) * pageSize

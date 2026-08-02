@@ -8,7 +8,7 @@ import {
   CcInstanceRow, DefineRow, InstanceRow, InstanceState, ProcessDefine, ProcessDesign,
   ProcessDesignHis, ProcessSurrogate, TaskRow, TaskState,
 } from './model.js'
-import type { ProcessExtRepository, ProcessRepository } from './spi.js'
+import type { ProcessExtRepository, ProcessRepository, QueryCondition } from './spi.js'
 import type { EngineImpl } from './engine.js'
 
 // submitType 枚举（对齐 boot3）
@@ -254,7 +254,7 @@ export class JeeflowFacade {
   // ── 流程设计（需扩展仓储） ───────────────────────────────────────────────
 
   private async designPage(args: Record<string, any>): Promise<Record<string, any>> {
-    const [rows, total] = await this.ext().pageDesigns(toInt(args.pageNum ?? 1), toInt(args.pageSize ?? 10))
+    const [rows, total] = await this.ext().pageDesigns(toInt(args.pageNum ?? 1), toInt(args.pageSize ?? 10), undefined, parseMQuery(args))
     return { rows, recordCount: total }
   }
 
@@ -316,7 +316,7 @@ export class JeeflowFacade {
   private async surrogatePage(args: Record<string, any>): Promise<Record<string, any>> {
     const filters = args.operator != null ? { operator: String(args.operator) } : undefined
     const [rows, total] = await this.ext().pageSurrogates(
-      toInt(args.pageNum ?? 1), toInt(args.pageSize ?? 10), filters)
+      toInt(args.pageNum ?? 1), toInt(args.pageSize ?? 10), filters, parseMQuery(args))
     return { rows, recordCount: total }
   }
 
@@ -461,7 +461,7 @@ export class JeeflowFacade {
     const pageNum = toInt(args.pageNum ?? 1)
     const pageSize = toInt(args.pageSize ?? 10)
     const actorId = String(args.operator ?? 'user1')
-    const { rows, total } = await this.repo.pageCcInstances(pageNum, pageSize, actorId)
+    const { rows, total } = await this.repo.pageCcInstances(pageNum, pageSize, actorId, parseMQuery(args))
     return { rows: rows.map(r => ccRowToMap(r)), recordCount: total }
   }
 
@@ -594,7 +594,7 @@ export class JeeflowFacade {
   private async definePage(args: Record<string, any>): Promise<Record<string, any>> {
     const pageNum = toInt(args.pageNum ?? 1)
     const pageSize = toInt(args.pageSize ?? 10)
-    const { rows, total } = await this.repo.pageDefines(pageNum, pageSize)
+    const { rows, total } = await this.repo.pageDefines(pageNum, pageSize, parseMQuery(args))
     return { rows: rows.map(r => defineRowToMap(r)), recordCount: total }
   }
 
@@ -613,7 +613,7 @@ export class JeeflowFacade {
     const pageNum = toInt(args.pageNum ?? 1)
     const pageSize = toInt(args.pageSize ?? 10)
     const operator = String(args.operator ?? 'user1')
-    const { rows, total } = await this.repo.pageInstances(pageNum, pageSize, operator)
+    const { rows, total } = await this.repo.pageInstances(pageNum, pageSize, operator, parseMQuery(args))
     return { rows: rows.map(r => instanceRowToMap(r)), recordCount: total }
   }
 
@@ -669,7 +669,7 @@ export class JeeflowFacade {
     const pageNum = toInt(args.pageNum ?? 1)
     const pageSize = toInt(args.pageSize ?? 10)
     const actorId = String(args.operator ?? 'user1')
-    const { rows, total } = await this.repo.pageTodoTasks(pageNum, pageSize, actorId)
+    const { rows, total } = await this.repo.pageTodoTasks(pageNum, pageSize, actorId, parseMQuery(args))
     return { rows: rows.map(r => taskRowToMap(r)), recordCount: total }
   }
 
@@ -677,7 +677,7 @@ export class JeeflowFacade {
     const pageNum = toInt(args.pageNum ?? 1)
     const pageSize = toInt(args.pageSize ?? 10)
     const operator = String(args.operator ?? 'user1')
-    const { rows, total } = await this.repo.pageDoneTasks(pageNum, pageSize, operator)
+    const { rows, total } = await this.repo.pageDoneTasks(pageNum, pageSize, operator, parseMQuery(args))
     return { rows: rows.map(r => taskRowToMap(r)), recordCount: total }
   }
 
@@ -770,6 +770,33 @@ function taskRowToMap(r: TaskRow): Record<string, any> {
 }
 
 // ── 工具 ──────────────────────────────────────────────────────────────────────
+
+/** m_ 前缀查询参数解析（issues/05-5，对齐 Java JeeflowQueryParser）：
+ *  m_EQ_taskName → t.task_name EQ；m_pd_LIKE_displayName → pd.display_name LIKE */
+function parseMQuery(args: Record<string, any>): QueryCondition[] {
+  const out: QueryCondition[] = []
+  for (const [key, value] of Object.entries(args)) {
+    if (!key.startsWith('m_') || value == null || value === '') continue
+    const parts = key.slice(2).split('_')
+    if (parts.length < 2) continue
+    let column: string
+    let operator: string
+    if (parts.length === 2) {
+      // 无别名 → 默认主表别名 t（对齐 Java，白名单列均带表别名）
+      operator = parts[0]
+      column = 't.' + toUnderscore(parts[1])
+    } else {
+      operator = parts[1]
+      column = parts[0] + '.' + toUnderscore(parts[2])
+    }
+    out.push({ column, operator: operator.toUpperCase(), value })
+  }
+  return out
+}
+
+function toUnderscore(camel: string): string {
+  return camel.replace(/[A-Z]/g, c => '_' + c.toLowerCase())
+}
 
 function toStr(v: any): string {
   if (v == null) return ''

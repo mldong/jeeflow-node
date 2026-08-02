@@ -12,7 +12,36 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { ProcessInstance, ProcessTask, type ProcessDefine, type CcInstanceRow, type DefineRow, type InstanceRow, type TaskRow } from '../model.js'
 import { InstanceState, TaskState } from '../model.js'
-import type { IDGenerator, ProcessRepository } from '../spi.js'
+import type { IDGenerator, ProcessRepository, QueryCondition } from '../spi.js'
+
+// ═══ 列白名单（issues/05-5，与 mldong-boot2 别名一致） ═══
+
+const TASK_WHITELIST = new Set([
+  't.id', 't.task_name', 't.display_name', 't.task_type', 't.perform_type', 't.task_state',
+  't.operator', 't.form_key', 't.create_time', 't.finish_time', 't.expire_time',
+  't.process_instance_id', 't.task_parent_id', 't.variable',
+  'pi.id', 'pi.business_no', 'pi.operator', 'pi.create_time', 'pi.state',
+  'pd.name', 'pd.display_name', 'pd.type',
+  'pta.actor_id', 'pta.process_task_id',
+])
+
+const INSTANCE_WHITELIST = new Set([
+  't.id', 't.parent_id', 't.process_define_id', 't.state', 't.business_no',
+  't.operator', 't.create_time', 't.expire_time', 't.variable',
+  'pd.name', 'pd.display_name', 'pd.type', 'pd.version',
+])
+
+const CC_WHITELIST = new Set([
+  't.id', 't.process_define_id', 't.state', 't.business_no', 't.operator',
+  't.create_time', 't.variable',
+  'pd.name', 'pd.display_name', 'pd.type', 'pd.version',
+  'cc.actor_id', 'cc.state',
+])
+
+const DEFINE_WHITELIST = new Set([
+  't.id', 't.name', 't.display_name', 't.type', 't.state', 't.version',
+  't.create_time', 't.update_time',
+])
 
 // 当前异步上下文绑定的事务连接
 const txStore = new AsyncLocalStorage<SqlConnection>()
@@ -465,15 +494,17 @@ export class JdbcRepository implements ProcessRepository {
 
   // ── 核心表分页（v1.5.0，对齐 Java pageDefines/pageInstances/pageTodoTasks/pageDoneTasks）──
 
-  async pageDefines(pageNum: number, pageSize: number): Promise<{ rows: DefineRow[]; total: number }> {
+  async pageDefines(pageNum: number, pageSize: number, conditions?: QueryCondition[]): Promise<{ rows: DefineRow[]; total: number }> {
+    const cond = this.buildWhere(conditions ?? [], DEFINE_WHITELIST)
+    const where = ' FROM wf_process_define t WHERE 1=1' + cond.sql
     const conn = await this.c()
     try {
-      const countRow = await conn.fetchOne(this.sql('SELECT COUNT(*) FROM wf_process_define t'), [])
+      const countRow = await conn.fetchOne(this.sql('SELECT COUNT(*) ' + where), cond.params)
       const total = Number(Object.values(countRow as Record<string, unknown>)[0] ?? 0)
       const rows = await conn.fetchAll(this.sql(
         'SELECT id, name, display_name, type, state, version, create_time, create_user, update_time, update_user' +
-        ' FROM wf_process_define t ORDER BY t.id DESC LIMIT ? OFFSET ?'),
-        [pageSize, (pageNum - 1) * pageSize])
+        where + ' ORDER BY t.id DESC LIMIT ? OFFSET ?'),
+        [...cond.params, pageSize, (pageNum - 1) * pageSize])
       return {
         rows: rows.map(r => ({
           id: Number(r.id), name: r.name, displayName: r.display_name, type: r.type,
@@ -488,43 +519,45 @@ export class JdbcRepository implements ProcessRepository {
     }
   }
 
-  async pageInstances(pageNum: number, pageSize: number, operator: string): Promise<{ rows: InstanceRow[]; total: number }> {
+  async pageInstances(pageNum: number, pageSize: number, operator: string, conditions?: QueryCondition[]): Promise<{ rows: InstanceRow[]; total: number }> {
+    const cond = this.buildWhere(conditions ?? [], INSTANCE_WHITELIST)
     const where = ' FROM wf_process_instance t' +
       ' LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id' +
-      ' WHERE t.operator = ?'
+      ' WHERE t.operator = ?' + cond.sql
     const conn = await this.c()
     try {
-      const countRow = await conn.fetchOne(this.sql('SELECT COUNT(*) ' + where), [operator])
+      const countRow = await conn.fetchOne(this.sql('SELECT COUNT(*) ' + where), [operator, ...cond.params])
       const total = Number(Object.values(countRow as Record<string, unknown>)[0] ?? 0)
       const cols = 't.id, t.parent_id, t.process_define_id, t.state, t.parent_node_name, t.business_no,' +
         ' t.operator, t.expire_time, t.variable, t.create_time, t.create_user, t.update_time, t.update_user,' +
         ' pd.name, pd.display_name, pd.version'
       const rows = await conn.fetchAll(this.sql(
         `SELECT ${cols}${where} ORDER BY t.id DESC LIMIT ? OFFSET ?`),
-        [operator, pageSize, (pageNum - 1) * pageSize])
+        [operator, ...cond.params, pageSize, (pageNum - 1) * pageSize])
       return { rows: rows.map(r => this.mapInstanceRow(r)), total }
     } finally {
       await this.done(conn)
     }
   }
 
-  async pageTodoTasks(pageNum: number, pageSize: number, actorId: string): Promise<{ rows: TaskRow[]; total: number }> {
-    return this.pageTasks(pageNum, pageSize, false, actorId)
+  async pageTodoTasks(pageNum: number, pageSize: number, actorId: string, conditions?: QueryCondition[]): Promise<{ rows: TaskRow[]; total: number }> {
+    return this.pageTasks(pageNum, pageSize, false, actorId, conditions)
   }
 
-  async pageDoneTasks(pageNum: number, pageSize: number, operator: string): Promise<{ rows: TaskRow[]; total: number }> {
-    return this.pageTasks(pageNum, pageSize, true, operator)
+  async pageDoneTasks(pageNum: number, pageSize: number, operator: string, conditions?: QueryCondition[]): Promise<{ rows: TaskRow[]; total: number }> {
+    return this.pageTasks(pageNum, pageSize, true, operator, conditions)
   }
 
-  private async pageTasks(pageNum: number, pageSize: number, done: boolean, filter: string): Promise<{ rows: TaskRow[]; total: number }> {
+  private async pageTasks(pageNum: number, pageSize: number, done: boolean, filter: string, conditions?: QueryCondition[]): Promise<{ rows: TaskRow[]; total: number }> {
+    const cond = this.buildWhere(conditions ?? [], TASK_WHITELIST)
     const where = ' FROM wf_process_task t' +
       ' LEFT JOIN wf_process_instance pi ON t.process_instance_id = pi.id' +
       ' LEFT JOIN wf_process_define pd ON pi.process_define_id = pd.id' +
       ' LEFT JOIN wf_process_task_actor pta ON t.id = pta.process_task_id' +
-      (done ? ' WHERE t.task_state <> 10 AND t.operator = ?' : ' WHERE t.task_state = 10 AND pta.actor_id = ?')
+      (done ? ' WHERE t.task_state <> 10 AND t.operator = ?' : ' WHERE t.task_state = 10 AND pta.actor_id = ?') + cond.sql
     const conn = await this.c()
     try {
-      const countRow = await conn.fetchOne(this.sql('SELECT COUNT(DISTINCT t.id) ' + where), [filter])
+      const countRow = await conn.fetchOne(this.sql('SELECT COUNT(DISTINCT t.id) ' + where), [filter, ...cond.params])
       const total = Number(Object.values(countRow as Record<string, unknown>)[0] ?? 0)
       const cols = 'DISTINCT t.id, t.process_instance_id, t.task_name, t.display_name, t.task_type, t.perform_type,' +
         ' t.task_state, t.operator, t.finish_time, t.expire_time, t.form_key, t.task_parent_id, t.variable,' +
@@ -533,7 +566,7 @@ export class JdbcRepository implements ProcessRepository {
         ' pi.variable AS instance_variable, pi.create_time AS instance_create_time'
       const rows = await conn.fetchAll(this.sql(
         `SELECT ${cols}${where} ORDER BY t.id DESC LIMIT ? OFFSET ?`),
-        [filter, pageSize, (pageNum - 1) * pageSize])
+        [filter, ...cond.params, pageSize, (pageNum - 1) * pageSize])
       return { rows: rows.map(r => this.mapTaskRow(r)), total }
     } finally {
       await this.done(conn)
@@ -557,6 +590,39 @@ export class JdbcRepository implements ProcessRepository {
     }
   }
 
+  // ═══ m_ 条件 WHERE 构建（issues/05-5，白名单 + 参数化，对齐 Java buildWhere） ═══
+
+  protected buildWhere(conditions: QueryCondition[], whitelist: Set<string>): { sql: string; params: any[] } {
+    let sql = ''
+    const params: any[] = []
+    for (const c of conditions) {
+      if (!whitelist.has(c.column)) continue // 不在白名单，丢弃
+      const val = c.value
+      if (val == null || val === '') continue
+      switch (c.operator.toUpperCase()) {
+        case 'EQ': sql += ` AND ${c.column} = ?`; params.push(val); break
+        case 'NE': sql += ` AND ${c.column} <> ?`; params.push(val); break
+        case 'LIKE': sql += ` AND ${c.column} LIKE ?`; params.push(`%${val}%`); break
+        case 'LLIKE': sql += ` AND ${c.column} LIKE ?`; params.push(`%${val}`); break
+        case 'RLIKE': sql += ` AND ${c.column} LIKE ?`; params.push(`${val}%`); break
+        case 'GT': sql += ` AND ${c.column} > ?`; params.push(val); break
+        case 'GE': sql += ` AND ${c.column} >= ?`; params.push(val); break
+        case 'LT': sql += ` AND ${c.column} < ?`; params.push(val); break
+        case 'LE': sql += ` AND ${c.column} <= ?`; params.push(val); break
+        case 'IN':
+        case 'NIN': {
+          if (Array.isArray(val) && val.length > 0) {
+            const marks = val.map(() => '?').join(',')
+            sql += ` AND ${c.column} ${c.operator.toUpperCase() === 'IN' ? 'IN' : 'NOT IN'} (${marks})`
+            params.push(...val)
+          }
+          break
+        }
+      }
+    }
+    return { sql, params }
+  }
+
   private mapTaskRow(r: Record<string, any>): TaskRow {
     let variables: Record<string, any> = {}
     if (r.variable) {
@@ -577,21 +643,22 @@ export class JdbcRepository implements ProcessRepository {
   }
 
   // pageCcInstances 我的抄送分页（v1.3.0）：cc 表 join 实例 + 定义，按抄送人过滤（对齐 Java pageCcInstances）
-  async pageCcInstances(pageNum: number, pageSize: number, actorId: string): Promise<{ rows: CcInstanceRow[]; total: number }> {
+  async pageCcInstances(pageNum: number, pageSize: number, actorId: string, conditions?: QueryCondition[]): Promise<{ rows: CcInstanceRow[]; total: number }> {
+    const cond = this.buildWhere(conditions ?? [], CC_WHITELIST)
     const where = ' FROM wf_process_instance t' +
       ' LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id' +
       ' LEFT JOIN wf_process_cc_instance cc ON t.id = cc.process_instance_id' +
-      ' WHERE cc.actor_id = ?'
+      ' WHERE cc.actor_id = ?' + cond.sql
     const cols = 't.id, t.parent_id, t.process_define_id, t.state, t.parent_node_name, t.business_no,' +
       ' t.operator, t.expire_time, t.variable, t.create_time, t.create_user, t.update_time, t.update_user,' +
       ' pd.name, pd.display_name, pd.version'
     const conn = await this.c()
     try {
-      const countRow = await conn.fetchOne(this.sql('SELECT COUNT(*) ' + where), [actorId])
+      const countRow = await conn.fetchOne(this.sql('SELECT COUNT(*) ' + where), [actorId, ...cond.params])
       const total = Number(Object.values(countRow as Record<string, unknown>)[0] ?? 0)
       const rows = await conn.fetchAll(this.sql(
         `SELECT ${cols}${where} ORDER BY t.id ASC LIMIT ? OFFSET ?`),
-        [actorId, pageSize, (pageNum - 1) * pageSize])
+        [actorId, ...cond.params, pageSize, (pageNum - 1) * pageSize])
       return {
         rows: rows.map(r => this.mapCcRow(r)),
         total,

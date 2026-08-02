@@ -1,5 +1,12 @@
 import type { CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessInstance, ProcessSurrogate, ProcessTask, UserInfo } from './model.js'
 
+// 查询条件（issues/05-5：m_ 前缀参数解析产物，对齐 Java PageQuery.Condition）
+export interface QueryCondition {
+  column: string
+  operator: string
+  value: any
+}
+
 export interface ProcessRepository {
   findDefineById(id: number): Promise<ProcessDefine | null>
   // findDefineByName 按流程编码查最新一条定义（v1.1.0，Facade deploy 版本管理用）
@@ -29,13 +36,13 @@ export interface ProcessRepository {
 
   // PageCcInstances 我的抄送分页（v1.3.0，对齐 Java pageCcInstances）：
   // 按抄送人 actorId 过滤实例列表，返回行数据（含关联定义名/版本）+ 总数
-  pageCcInstances(pageNum: number, pageSize: number, actorId: string): Promise<{ rows: CcInstanceRow[]; total: number }>
+  pageCcInstances(pageNum: number, pageSize: number, actorId: string, conditions?: QueryCondition[]): Promise<{ rows: CcInstanceRow[]; total: number }>
 
   // ── 核心表分页（v1.5.0，对齐 Java pageDefines/pageInstances/pageTodoTasks/pageDoneTasks）──
-  pageDefines(pageNum: number, pageSize: number): Promise<{ rows: DefineRow[]; total: number }>
-  pageInstances(pageNum: number, pageSize: number, operator: string): Promise<{ rows: InstanceRow[]; total: number }>
-  pageTodoTasks(pageNum: number, pageSize: number, actorId: string): Promise<{ rows: TaskRow[]; total: number }>
-  pageDoneTasks(pageNum: number, pageSize: number, operator: string): Promise<{ rows: TaskRow[]; total: number }>
+  pageDefines(pageNum: number, pageSize: number, conditions?: QueryCondition[]): Promise<{ rows: DefineRow[]; total: number }>
+  pageInstances(pageNum: number, pageSize: number, operator: string, conditions?: QueryCondition[]): Promise<{ rows: InstanceRow[]; total: number }>
+  pageTodoTasks(pageNum: number, pageSize: number, actorId: string, conditions?: QueryCondition[]): Promise<{ rows: TaskRow[]; total: number }>
+  pageDoneTasks(pageNum: number, pageSize: number, operator: string, conditions?: QueryCondition[]): Promise<{ rows: TaskRow[]; total: number }>
 }
 
 export interface UserProvider {
@@ -58,7 +65,7 @@ export interface ProcessExtRepository {
   saveDesign(d: ProcessDesign): Promise<void>
   updateDesign(d: ProcessDesign): Promise<void>
   removeDesign(id: number): Promise<void>
-  pageDesigns(pageNum?: number, pageSize?: number, filters?: Record<string, any>): Promise<[ProcessDesign[], number]>
+  pageDesigns(pageNum?: number, pageSize?: number, filters?: Record<string, any>, conditions?: QueryCondition[]): Promise<[ProcessDesign[], number]>
 
   // 设计历史（wf_process_design_his）
   saveDesignHis(his: ProcessDesignHis): Promise<void>
@@ -69,7 +76,7 @@ export interface ProcessExtRepository {
   saveSurrogate(s: ProcessSurrogate): Promise<void>
   updateSurrogate(s: ProcessSurrogate): Promise<void>
   removeSurrogate(id: number): Promise<void>
-  pageSurrogates(pageNum?: number, pageSize?: number, filters?: Record<string, any>): Promise<[ProcessSurrogate[], number]>
+  pageSurrogates(pageNum?: number, pageSize?: number, filters?: Record<string, any>, conditions?: QueryCondition[]): Promise<[ProcessSurrogate[], number]>
 
   // getSurrogate 查询指定时间生效中的委托（enabled=1 + 时间窗内；processName 精确优先，空值全流程兜底）
   getSurrogate(operator: string, processName: string, at?: Date): Promise<ProcessSurrogate | null>

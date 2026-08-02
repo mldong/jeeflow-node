@@ -533,6 +533,56 @@ describe('jeeflow compliance tests', () => {
     assert.match(String(crow.createTime), timeRe, '抄送行时间应为 yyyy-MM-dd HH:mm:ss')
   })
 
+  it('20 m_ 前缀查询参数（issues/05-5）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const c1 = readFileSync(flowDir + '01-simple.json', 'utf-8')   // name=simple
+    const c2 = readFileSync(flowDir + '02-multi-task.json', 'utf-8') // name=multi-task
+    await facade.flow('processDefine/deploy', { content: c1 })
+    await facade.flow('processDefine/deploy', { content: c2 })
+
+    // 无别名 → 默认主表别名 t（t.name / t.display_name）
+    const r1 = await facade.flow('processDefine/page', { m_LIKE_name: 'simple' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    assert.equal(r1.data.rows.length, 1, JSON.stringify(r1))
+    assert.equal(r1.data.rows[0].name, 'simple')
+
+    const r2 = await facade.flow('processDefine/page', { m_LIKE_displayName: '简单' })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    assert.equal(r2.data.rows.length, 1, JSON.stringify(r2))
+
+    const r3 = await facade.flow('processDefine/page', { m_LIKE_displayName: '流程' })
+    assert.equal(r3.code, 0, JSON.stringify(r3))
+    assert.equal(r3.data.rows.length, 2, '应匹配全部: ' + JSON.stringify(r3))
+
+    // 实例列表：m_pd_LIKE_displayName（别名 pd → pd.display_name）
+    const def = await repo.findDefineByName('simple')
+    await facade.flow('processInstance/startAndExecute', { processDefineId: def.id, operator: 'zhangsan' })
+    const r4 = await facade.flow('processInstance/page',
+      { operator: 'zhangsan', m_pd_LIKE_displayName: '简单' })
+    assert.equal(r4.code, 0, JSON.stringify(r4))
+    assert.equal(r4.data.rows.length, 1, JSON.stringify(r4))
+    const r5 = await facade.flow('processInstance/page',
+      { operator: 'zhangsan', m_pd_LIKE_displayName: 'zzz' })
+    assert.equal(r5.data.rows.length, 0, JSON.stringify(r5))
+
+    // 任务列表：m_t_LIKE_displayName（别名 t → t.display_name）
+    const r6 = await facade.flow('processTask/todoList',
+      { operator: 'leader', m_t_LIKE_displayName: '审批' })
+    assert.equal(r6.code, 0, JSON.stringify(r6))
+    assert.equal(r6.data.rows.length, 1, JSON.stringify(r6))
+    const r7 = await facade.flow('processTask/todoList',
+      { operator: 'leader', m_t_LIKE_displayName: 'zzz' })
+    assert.equal(r7.data.rows.length, 0, JSON.stringify(r7))
+
+    // 设计列表：无别名 m_LIKE_name（issues/05-5 process-design 页）
+    await facade.flow('processDesign/save',
+      { name: 'leave', displayName: '请假流程', content: c1, operator: 'zhangsan' })
+    const r8 = await facade.flow('processDesign/page', { m_LIKE_name: 'leave' })
+    assert.equal(r8.code, 0, JSON.stringify(r8))
+    assert.equal(r8.data.rows.length, 1, JSON.stringify(r8))
+  })
+
   it('16 门面错误路径：未知 action / 缺扩展仓储', async () => {
     const { engine, repo } = setup()
     const facade = new JeeflowFacade(engine, repo)

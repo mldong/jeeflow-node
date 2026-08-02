@@ -6,7 +6,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import {
   ProcessDesign, ProcessDesignHis, ProcessSurrogate,
 } from '../model.js'
-import type { IDGenerator, ProcessExtRepository } from '../spi.js'
+import type { IDGenerator, ProcessExtRepository, QueryCondition } from '../spi.js'
 import { TsIDGenerator, type SqlAdapter, type SqlConnection } from './shared.js'
 
 const txStore = new AsyncLocalStorage<SqlConnection>()
@@ -89,7 +89,7 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
     }
   }
 
-  async pageDesigns(pageNum = 1, pageSize = 10, filters?: Record<string, any>): Promise<[ProcessDesign[], number]> {
+  async pageDesigns(pageNum = 1, pageSize = 10, filters?: Record<string, any>, conditions?: QueryCondition[]): Promise<[ProcessDesign[], number]> {
     let sql = `SELECT ${JdbcProcessExtRepository.DESIGN_COLS} FROM wf_process_design t WHERE 1=1`
     let countSql = 'SELECT COUNT(*) FROM wf_process_design t WHERE 1=1'
     const args: any[] = []
@@ -102,6 +102,12 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
         args2.push(val)
       }
     }
+    // m_ 条件（issues/05-5）：LIKE/EQ 等走白名单
+    const cond = this.buildExtWhere(conditions ?? [], JdbcProcessExtRepository.DESIGN_WHITELIST)
+    sql += cond.sql
+    countSql += cond.sql
+    args.push(...cond.params)
+    args2.push(...cond.params)
     const conn = await this.c()
     try {
       const countRow = await conn.fetchOne(this.sql(countSql), args2)
@@ -114,6 +120,42 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
       await this.done(conn)
     }
   }
+
+  // m_ 条件 WHERE 构建（issues/05-5，白名单 + 参数化）
+  private buildExtWhere(conditions: QueryCondition[], whitelist: Set<string>): { sql: string; params: any[] } {
+    let sql = ''
+    const params: any[] = []
+    for (const c of conditions) {
+      if (!whitelist.has(c.column)) continue
+      const val = c.value
+      if (val == null || val === '') continue
+      switch (c.operator.toUpperCase()) {
+        case 'EQ': sql += ` AND ${c.column} = ?`; params.push(val); break
+        case 'LIKE': sql += ` AND ${c.column} LIKE ?`; params.push(`%${val}%`); break
+        case 'LLIKE': sql += ` AND ${c.column} LIKE ?`; params.push(`%${val}`); break
+        case 'RLIKE': sql += ` AND ${c.column} LIKE ?`; params.push(`${val}%`); break
+        case 'IN': {
+          if (Array.isArray(val) && val.length > 0) {
+            const marks = val.map(() => '?').join(',')
+            sql += ` AND ${c.column} IN (${marks})`
+            params.push(...val)
+          }
+          break
+        }
+      }
+    }
+    return { sql, params }
+  }
+
+  private static readonly DESIGN_WHITELIST = new Set([
+    't.id', 't.name', 't.display_name', 't.type', 't.is_deployed', 't.remark',
+    't.create_time', 't.update_time',
+  ])
+
+  private static readonly SURROGATE_WHITELIST = new Set([
+    't.id', 't.process_name', 't.operator', 't.surrogate', 't.enabled',
+    't.start_time', 't.end_time', 't.create_time', 't.update_time',
+  ])
 
   // ── 设计历史 ─────────────────────────────────────────────────────────────
 
@@ -202,7 +244,7 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
     }
   }
 
-  async pageSurrogates(pageNum = 1, pageSize = 10, filters?: Record<string, any>): Promise<[ProcessSurrogate[], number]> {
+  async pageSurrogates(pageNum = 1, pageSize = 10, filters?: Record<string, any>, conditions?: QueryCondition[]): Promise<[ProcessSurrogate[], number]> {
     let sql = `SELECT ${JdbcProcessExtRepository.SURROGATE_COLS} FROM wf_process_surrogate t WHERE 1=1`
     let countSql = 'SELECT COUNT(*) FROM wf_process_surrogate t WHERE 1=1'
     const args: any[] = []
@@ -215,6 +257,12 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
         args2.push(val)
       }
     }
+    // m_ 条件（issues/05-5）
+    const cond = this.buildExtWhere(conditions ?? [], JdbcProcessExtRepository.SURROGATE_WHITELIST)
+    sql += cond.sql
+    countSql += cond.sql
+    args.push(...cond.params)
+    args2.push(...cond.params)
     const conn = await this.c()
     try {
       const countRow = await conn.fetchOne(this.sql(countSql), args2)
