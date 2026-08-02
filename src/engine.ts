@@ -16,6 +16,11 @@ export const KeyDeptID       = 'u_deptId'
 export const KeyDeptName     = 'u_deptName'
 export const KeyPostID       = 'u_postId'
 export const KeyPostName     = 'u_postName'
+// v1.0.1：下一节点处理人（对齐 boot3 tf_nextNodeOperator）
+export const KeyNextNodeOperator = 'tf_nextNodeOperator'
+// v1.0.1：系统代执行 / 超级管理员（对齐 boot3 FlowConst）
+export const KeyAutoExecute = 'flow.auto'
+export const KeyAdminID     = 'flow.admin'
 
 export interface Engine {
   startProcessInstanceById(defineId: number, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
@@ -299,8 +304,8 @@ export class EngineImpl implements Engine {
     }
   }
 
-  private async createTask(node: FlowNode, inst: ProcessInstance, operator: string, _vars: Record<string, any>): Promise<void> {
-    const actors = await this.resolveActors(node, inst)
+  private async createTask(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>): Promise<void> {
+    const actors = await this.resolveActors(node, inst, vars)
     if (!actors.length) return
     const performType = parseInt(String(node.properties?.performType ?? '0'))
     const ct = node.properties?.countersignType as string | undefined
@@ -327,10 +332,13 @@ export class EngineImpl implements Engine {
           return
       }
     }
-    await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now))
+    // 普通任务：一个任务承载全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
+    const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now)
+    if (actors.length > 1) nt.actorIds = actors
+    await this.repo.saveTask(nt)
   }
 
-  private async resolveActors(node: FlowNode, inst: ProcessInstance): Promise<string[]> {
+  private async resolveActors(node: FlowNode, inst: ProcessInstance, vars: Record<string, any>): Promise<string[]> {
     // 1a. Registry 按名称解析（推荐）
     if (this.registry) {
       const handlerName = (node.properties?.assignmentHandler as string) ?? ''
@@ -345,22 +353,50 @@ export class EngineImpl implements Engine {
       const result = await this.ext.assignmentHandler(handlerName, node, inst)
       if (Array.isArray(result) && result.length > 0) return result
     }
-    // 2. 固定指派 assignee（boot2 约定："applicant" → 解析为流程发起人）
+    // 2. 动态指定下一节点处理人优先（v1.0.1：对齐 boot3 tf_nextNodeOperator）
+    const nextOp = vars[KeyNextNodeOperator]
+    if (nextOp != null) {
+      if (typeof nextOp === 'string') return nextOp.split(',').map(s => s.trim()).filter(Boolean)
+      if (Array.isArray(nextOp)) return nextOp.map(String)
+      return [String(nextOp)]
+    }
+    // 3. 固定指派 assignee——token 即变量 key，能替换就换，换不了就是字面量（v1.0.1 对齐 boot3 args.get(token, token)）
     const assignee = node.properties?.assignee as string | undefined
     if (assignee) {
-      const actors = assignee.split(',').map(s => s.trim()).filter(Boolean)
-      return actors.map(a => (a === 'applicant' ? inst.operator : a))
+      const actors: string[] = []
+      for (const raw of assignee.split(',')) {
+        let token = raw.trim()
+        if (!token) continue
+        // mldong 契约特殊值：applicant → 流程发起人
+        if (token.includes('applicant')) token = token.replace('applicant', inst.operator)
+        if (token in vars) {
+          const val = vars[token]
+          if (Array.isArray(val)) actors.push(...val.map(String))
+          else actors.push(String(val))
+        } else {
+          actors.push(token)
+        }
+      }
+      return actors
     }
     return []
   }
 
   private isAllowed(task: ProcessTask, operator: string): boolean {
+    // v1.0.1：系统代执行（flow.auto）/超级管理员（flow.admin）放行（对齐 boot3 isAllowed）
+    if (operator && (operator.toLowerCase() === KeyAutoExecute || operator.toLowerCase() === KeyAdminID)) {
+      return true
+    }
     // 子实体：actorIds 权限判断
     return task.isAllowed(operator)
   }
 
   private async addUserInfo(operator: string, vars: Record<string, any>) {
     if (!this.userProv) return
+    // v1.0.1：系统代执行（flow.auto）/超级管理员（flow.admin）非真实用户，跳过注入（对齐 boot3）
+    if (operator && (operator.toLowerCase() === KeyAutoExecute || operator.toLowerCase() === KeyAdminID)) {
+      return
+    }
     const u = await this.userProv.getUser(operator)
     if (!u) return
     vars[KeyUserID] = u.userId

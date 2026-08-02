@@ -224,4 +224,63 @@ describe('jeeflow compliance tests', () => {
     // start + apply自动完成 + task1 + finish
     assert.deepStrictEqual(events, ['start', 'taskDone', 'taskDone', 'finish'])
   })
+
+  it('11 assignee 变量解析（v1.0.1，集成反馈③）', async () => {
+    const { engine, repo } = setup()
+    let def = loadFlow(repo, '11-assignee-vars.json')
+
+    // ① deptLeader 变量命中 → 参与者 = 变量值
+    let inst = await engine.startProcessInstanceById(def.id, 'applicant', { deptLeader: 'L001' })
+    let doing = await repo.findDoingTasks(inst.id)
+    await repo.addTaskActor(doing[0].id, ['applicant'])
+    await engine.executeProcessTask(doing[0].id, 'applicant')
+    doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing[0].taskName, 'task1')
+    assert.deepStrictEqual(doing[0].actorIds, ['L001'], '变量命中应解析为变量值')
+
+    // ② 静态字面量 userA,userB（变量未命中）
+    await engine.executeProcessTask(doing[0].id, 'L001')
+    doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing[0].taskName, 'task2')
+    assert.deepStrictEqual(doing[0].actorIds, ['userA', 'userB'], '静态字面量参与者')
+
+    // ③ 变量未传入 → token 字面量回退（对齐 boot3 args.get(token, token)）
+    def = loadFlow(repo, '11-assignee-vars.json')
+    inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    doing = await repo.findDoingTasks(inst.id)
+    await repo.addTaskActor(doing[0].id, ['applicant'])
+    await engine.executeProcessTask(doing[0].id, 'applicant')
+    doing = await repo.findDoingTasks(inst.id)
+    assert.deepStrictEqual(doing[0].actorIds, ['deptLeader'], '未命中应回退字面量')
+
+    // ④ tf_nextNodeOperator 优先于 assignee
+    def = loadFlow(repo, '11-assignee-vars.json')
+    inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    doing = await repo.findDoingTasks(inst.id)
+    await repo.addTaskActor(doing[0].id, ['applicant'])
+    await engine.executeProcessTask(doing[0].id, 'applicant', { tf_nextNodeOperator: 'BOSS1,BOSS2' })
+    doing = await repo.findDoingTasks(inst.id)
+    assert.deepStrictEqual(doing[0].actorIds, ['BOSS1', 'BOSS2'], 'tf_nextNodeOperator 应优先')
+  })
+
+  it('12 系统代执行 flow.auto / flow.admin（v1.0.1，集成反馈④）', async () => {
+    const { engine, repo } = setup()
+    const def = loadFlow(repo, '11-assignee-vars.json')
+    let inst = await engine.startProcessInstanceById(def.id, 'applicant', { deptLeader: 'L001' })
+    let doing = await repo.findDoingTasks(inst.id)
+
+    // ① flow.auto 非参与者身份放行（startAndExecute 契约）
+    inst = await engine.executeProcessTask(doing[0].id, 'flow.auto')
+    doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing[0].taskName, 'task1', 'flow.auto 应放行执行')
+
+    // ② 跳过 UserProvider 注入：u_userId 不会被替换成 flow.auto
+    const reloaded = await repo.findInstanceById(inst.id)
+    assert.equal(reloaded?.variables.u_userId, 'applicant', 'flow.auto 应跳过用户注入')
+
+    // ③ flow.admin 放行
+    inst = await engine.executeProcessTask(doing[0].id, 'flow.admin')
+    doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing[0].taskName, 'task2', 'flow.admin 应放行执行')
+  })
 })
