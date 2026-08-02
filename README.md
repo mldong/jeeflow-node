@@ -2,6 +2,9 @@
 
 [jeeflow](https://jeeflow-doc.mldong.com) 引擎规范的 **TypeScript 实现**。仅依赖 `node:*` 标准库，零外部依赖（引擎核心）。
 
+> **v1.1.0**：新增管理扩展（流程设计/历史/委托 + `ProcessExtRepository`）与统一门面
+> `JeeflowFacade.flow(action, args)`；assignee 变量解析与 `flow.auto`/`flow.admin` 系统代执行对齐 boot2/boot3。
+
 ```bash
 npm install @mldong/jeeflow   # 等发布到 npm 后
 ```
