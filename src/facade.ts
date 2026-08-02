@@ -483,6 +483,7 @@ export class JeeflowFacade {
     if (inst) {
       const def = await this.repo.findDefineById(inst.defineId)
       if (def) {
+        vo.jsonObject = this.parseGraph(def.content) // issues/05
         try {
           const flow = JSON.parse(toStr(def.content))
           for (const n of flow.nodes ?? []) {
@@ -604,6 +605,7 @@ export class JeeflowFacade {
     return {
       id: def.id, name: def.name, displayName: def.displayName,
       type: def.type, state: def.state, version: def.version,
+      jsonObject: this.parseGraph(def.content), // issues/05
     }
   }
 
@@ -619,11 +621,13 @@ export class JeeflowFacade {
     const id = toId(args.id)
     const inst = await this.repo.findInstanceById(id)
     if (!inst) throw new Error('流程实例不存在')
+    const def0 = await this.repo.findDefineById(inst.defineId)
     return {
       id: inst.id, parentId: inst.parentId, processDefineId: inst.defineId,
       state: inst.state, parentNodeName: inst.parentNodeName,
       businessNo: inst.businessNo, operator: inst.operator,
       variables: inst.variables, createTime: inst.createTime, createUser: inst.createUser,
+      jsonObject: def0 ? this.parseGraph(def0.content) : undefined, // issues/05
       tasks: (inst.tasks ?? []).map(t => ({
         id: t.id, processInstanceId: t.processInstanceId, taskName: t.taskName,
         displayName: t.displayName, taskType: t.taskType, performType: t.performType,
@@ -653,6 +657,17 @@ export class JeeflowFacade {
     return { rows, recordCount: total }
   }
 
+  /** 定义 content 解析为 LogicFlow JSON（issues/05 jsonObject） */
+  private parseGraph(content: string | Uint8Array): Record<string, any> | undefined {
+    try {
+      const str = typeof content === 'string' ? content : new TextDecoder().decode(content)
+      const obj = JSON.parse(str)
+      return obj && typeof obj === 'object' ? obj : undefined
+    } catch {
+      return undefined
+    }
+  }
+
 }
 
 // ── 工具 ──────────────────────────────────────────────────────────────────────
@@ -680,4 +695,5 @@ function toInt(v: any): number {
   const n = Number(v)
   if (!Number.isFinite(n)) throw new Error('数值缺失或非法')
   return n
+
 }

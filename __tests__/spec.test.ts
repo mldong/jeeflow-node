@@ -138,6 +138,25 @@ describe('jeeflow compliance tests', () => {
     assert.ok(hl.historyNodeNames.includes('task3'), JSON.stringify(hl))
   })
 
+  it('05-1 三个 detail 返回 jsonObject', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, undefined)
+    const def = loadFlow(repo, '01-simple.json')
+    let r = await facade.flow('processDefine/detail', { id: def.id })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    assert.ok(r.data.jsonObject, 'defineDetail 缺 jsonObject')
+
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
+    r = await facade.flow('processInstance/detail', { id: inst.id })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    assert.ok(r.data.jsonObject, 'instanceDetail 缺 jsonObject')
+
+    const doing = await repo.findDoingTasks(inst.id)
+    r = await facade.flow('processTask/detail', { id: doing[0].id, operator: 'applicant' })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    assert.ok(r.data.jsonObject, 'taskDetail 缺 jsonObject')
+  })
+
   it('04 fork-join', async () => {
     const { engine, repo } = setup()
     const def = loadFlow(repo, '04-fork-join.json')
