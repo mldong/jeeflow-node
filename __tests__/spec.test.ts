@@ -3,6 +3,8 @@ import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { EngineImpl } from '../src/engine.js'
 import { MemoryRepository } from '../src/memory.js'
+import { MemoryExtRepository } from '../src/memory-ext.js'
+import { JeeflowFacade } from '../src/facade.js'
 import { InstanceState, type ProcessDefine, type ProcessInstance, type ProcessTask } from '../src/model.js'
 import type { ExpressionEvaluator, UserProvider } from '../src/spi.js'
 import { type FlowInterceptor, EventType, type EngineExtensions } from '../src/extensions.js'
@@ -261,6 +263,106 @@ describe('jeeflow compliance tests', () => {
     await engine.executeProcessTask(doing[0].id, 'applicant', { tf_nextNodeOperator: 'BOSS1,BOSS2' })
     doing = await repo.findDoingTasks(inst.id)
     assert.deepStrictEqual(doing[0].actorIds, ['BOSS1', 'BOSS2'], 'tf_nextNodeOperator 应优先')
+  })
+
+  it('13 门面路由（v1.1.0，spec §12 #15）：deploy 版本管理', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+
+    let r = await facade.flow('processDefine/deploy', { content })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    const defineId = r.data.processDefineId
+    const d1 = await repo.findDefineById(defineId)
+    assert.equal(d1?.version, 0, '首次部署 version=0')
+
+    r = await facade.flow('processDefine/deploy', { content })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    const latest = await repo.findDefineByName('simple')
+    assert.equal(latest?.version, 1, '二次部署 version=1')
+
+    r = await facade.flow('processDefine/upAndDown', { id: defineId, state: 0 })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    assert.equal((await repo.findDefineById(defineId))?.state, 0)
+
+    r = await facade.flow('processDefine/remove', { id: defineId })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    assert.equal(await repo.findDefineById(defineId), null)
+  })
+
+  it('14 门面路由：发起即提交 / 执行 / 撤回级联', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    const r0 = await facade.flow('processDefine/deploy', { content })
+    const defineId = r0.data.processDefineId
+
+    const r1 = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: defineId, operator: 'zhangsan', amount: '1000' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const instanceId = r1.data.processInstanceId
+
+    let doing = await repo.findDoingTasks(instanceId)
+    assert.equal(doing.length, 1)
+    assert.equal(doing[0].taskName, 'task1')
+    const r2 = await facade.flow('processTask/execute',
+      { processTaskId: doing[0].id, operator: 'leader', submitType: 1 })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    const inst = await repo.findInstanceById(instanceId)
+    assert.equal(inst?.state, InstanceState.Done, '实例应完成')
+
+    // withdraw 级联废弃 doing
+    const r3 = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: defineId, operator: 'zhangsan' })
+    const instanceId2 = r3.data.processInstanceId
+    const r4 = await facade.flow('processInstance/withdraw', { id: instanceId2, operator: 'zhangsan' })
+    assert.equal(r4.code, 0, JSON.stringify(r4))
+    doing = await repo.findDoingTasks(instanceId2)
+    assert.equal(doing.length, 0, '撤回应废弃 doing 任务')
+  })
+
+  it('15 门面路由：设计保存/详情/发布 + 委托增查删', async () => {
+    const { engine, repo } = setup()
+    const extRepo = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, extRepo)
+    const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+
+    const r1 = await facade.flow('processDesign/save',
+      { name: 'leave', displayName: '请假流程', content, operator: 'zhangsan' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const designId = r1.data.id
+
+    const r2 = await facade.flow('processDesign/detail', { id: designId })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    assert.ok(r2.data.jsonObject)
+    assert.equal(r2.data.his.length, 1)
+
+    const r3 = await facade.flow('processDesign/deploy', { id: designId, operator: 'zhangsan' })
+    assert.equal(r3.code, 0, JSON.stringify(r3))
+    assert.ok(r3.data.processDefineId > 0)
+    assert.equal((await extRepo.findDesignById(designId))?.isDeployed, 1)
+
+    const r4 = await facade.flow('processSurrogate/save',
+      { operator: 'zhangsan', surrogate: 'lisi', processName: 'leave' })
+    assert.equal(r4.code, 0, JSON.stringify(r4))
+    const hit = await extRepo.getSurrogate('zhangsan', 'leave')
+    assert.equal(hit?.surrogate, 'lisi')
+
+    const r5 = await facade.flow('processSurrogate/page', { operator: 'zhangsan' })
+    assert.equal(r5.code, 0, JSON.stringify(r5))
+    assert.equal(r5.data.recordCount, 1)
+
+    const r6 = await facade.flow('processSurrogate/remove', { id: r4.data.id })
+    assert.equal(r6.code, 0, JSON.stringify(r6))
+  })
+
+  it('16 门面错误路径：未知 action / 缺扩展仓储', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo)
+    const r1 = await facade.flow('foo/bar', {})
+    assert.equal(r1.code, 99999999, JSON.stringify(r1))
+    const r2 = await facade.flow('processDesign/page', {})
+    assert.equal(r2.code, 99999999, JSON.stringify(r2))
   })
 
   it('12 系统代执行 flow.auto / flow.admin（v1.0.1，集成反馈④）', async () => {

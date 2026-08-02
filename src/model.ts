@@ -51,6 +51,44 @@ export interface ProcessDefine {
   updateUser: string
 }
 
+// ─── 管理扩展（v1.1.0）──────────────────────────────────────────────────────
+
+export interface ProcessDesign {
+  id: number
+  name: string
+  displayName: string
+  type: string
+  icon?: string
+  isDeployed: number
+  remark?: string
+  createTime: Date
+  createUser: string
+  updateTime: Date
+  updateUser: string
+}
+
+export interface ProcessDesignHis {
+  id: number
+  processDesignId: number
+  content: Uint8Array | string
+  createTime: Date
+  createUser: string
+}
+
+export interface ProcessSurrogate {
+  id: number
+  processName?: string
+  operator: string
+  surrogate: string
+  startTime?: Date
+  endTime?: Date
+  enabled: number
+  createTime: Date
+  createUser: string
+  updateTime: Date
+  updateUser: string
+}
+
 export enum InstanceState {
   Doing  = 10,
   Done   = 20,

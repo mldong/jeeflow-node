@@ -12,6 +12,8 @@ import mysql from 'mysql2/promise'
 import pg from 'pg'
 import { EngineImpl } from '../src/engine.js'
 import { JdbcRepository, TsIDGenerator, convertPlaceholder } from '../src/jdbc/index.js'
+import { JdbcProcessExtRepository } from '../src/jdbc/ext.js'
+import { type ProcessDesign, type ProcessDesignHis, type ProcessSurrogate } from '../src/model.js'
 import { MysqlAdapter } from '../src/jdbc/mysql.js'
 import { PostgresAdapter } from '../src/jdbc/postgres.js'
 import { InstanceState, TaskState, ProcessInstance, type ProcessDefine } from '../src/model.js'
@@ -245,6 +247,61 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
       // 清理固定事务数据
       await q(pool, 'DELETE FROM wf_process_instance WHERE id = ?', [txId])
       await q(pool, 'DELETE FROM wf_process_cc_instance WHERE process_instance_id = ?', [txId])
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('扩展仓储（v1.1.0）：设计 CRUD + 委托生效', async () => {
+    await cleanup()
+    try {
+      await applySchema()
+      // 清理本测试标记数据（cleanup 不覆盖扩展表）
+      const c1 = isPg ? await pool.connect() : await pool.getConnection()
+      try {
+        await q(c1, 'DELETE FROM wf_process_design_his WHERE process_design_id IN (SELECT id FROM wf_process_design WHERE name = ?)', ['nodeext-design'])
+        await q(c1, 'DELETE FROM wf_process_design WHERE name = ?', ['nodeext-design'])
+        await q(c1, 'DELETE FROM wf_process_surrogate WHERE operator = ?', ['nodeext-op'])
+      } finally {
+        c1.release()
+      }
+      const ext = new JdbcProcessExtRepository(makeAdapter(pool), new TsIDGenerator())
+
+      // 设计 CRUD + 历史
+      const d: ProcessDesign = {
+        id: 0, name: 'nodeext-design', displayName: '扩展设计', type: 'approval', icon: '',
+        isDeployed: 0, remark: '', createTime: new Date(), createUser: 't',
+        updateTime: new Date(), updateUser: 't',
+      }
+      await ext.saveDesign(d)
+      assert.ok(d.id > 0, 'saveDesign 生成 ID')
+      await ext.saveDesignHis({ id: 0, processDesignId: d.id, content: '{"v":1}', createTime: new Date(), createUser: 't' } as ProcessDesignHis)
+      await ext.saveDesignHis({ id: 0, processDesignId: d.id, content: '{"v":2}', createTime: new Date(), createUser: 't' } as ProcessDesignHis)
+      const hisList = await ext.listDesignHis(d.id)
+      assert.equal(hisList.length, 2, '历史 2 条')
+      assert.equal(hisList[0].content, '{"v":2}', '倒序最新在前')
+
+      const [rows, total] = await ext.pageDesigns(1, 10, { name: 'nodeext-design' })
+      assert.equal(total, 1, '设计分页 total=1')
+      assert.equal(rows.length, 1)
+
+      await ext.removeDesign(d.id)
+      assert.equal(await ext.findDesignById(d.id), null, '设计已删除')
+      assert.equal((await ext.listDesignHis(d.id)).length, 0, '历史连带删除')
+
+      // 委托生效
+      const s: ProcessSurrogate = {
+        id: 0, operator: 'nodeext-op', surrogate: 'agent-all', enabled: 1,
+        createTime: new Date(), createUser: 't', updateTime: new Date(), updateUser: 't',
+      }
+      await ext.saveSurrogate(s)
+      const hit = await ext.getSurrogate('nodeext-op', 'leave')
+      assert.equal(hit?.surrogate, 'agent-all', '全流程委托兜底')
+      assert.equal(await ext.getSurrogate('nobody', 'leave'), null, '无委托')
+      const [srows, stotal] = await ext.pageSurrogates(1, 10, { operator: 'nodeext-op' })
+      assert.equal(stotal, 1, '委托分页 total=1')
+      await ext.removeSurrogate(s.id)
+      assert.equal(await ext.findSurrogateById(s.id), null, '委托已删除')
     } finally {
       await cleanup()
     }

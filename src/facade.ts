@@ -1,0 +1,328 @@
+// 统一门面（v1.1.0）——"接口即 POST + JSON body"风格的单入口
+//
+// 集成方只实现一个转发端点：把 body JSON 转成对象传入 flow()，所有流程能力按
+// action（boot2/boot3 端点短名）路由。返回统一结构 {code, msg, data}
+// （code=0 成功 / 99999999 失败）。操作人约定：args.operator 显式传入。
+
+import {
+  InstanceState, ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessSurrogate,
+  TaskState,
+} from './model.js'
+import type { ProcessExtRepository, ProcessRepository } from './spi.js'
+import type { EngineImpl } from './engine.js'
+
+// submitType 枚举（对齐 boot3）
+const SUBMIT_APPLY = 0
+const SUBMIT_AGREE = 1
+const SUBMIT_REJECT = 2
+const SUBMIT_ROLLBACK = 3
+const SUBMIT_JUMP = 4
+const SUBMIT_ROLLBACK_TO_OPERATOR = 6
+const SUBMIT_COUNTERSIGN_DISAGREE = 20
+
+export class JeeflowFacade {
+  constructor(
+    private readonly engine: EngineImpl,
+    private readonly repo: ProcessRepository,
+    private readonly extRepo?: ProcessExtRepository,
+  ) {}
+
+  async flow(action: string, args: Record<string, any> = {}): Promise<Record<string, any>> {
+    try {
+      const data = await this.dispatch(action, args)
+      return { code: 0, msg: '成功', data: data ?? null }
+    } catch (e: any) {
+      return { code: 99999999, msg: e?.message ?? String(e) }
+    }
+  }
+
+  private async dispatch(action: string, args: Record<string, any>): Promise<any> {
+    switch (action) {
+      case 'processDefine/startAndExecute':
+      case 'processInstance/startAndExecute':
+        return this.startAndExecute(args)
+      case 'processDefine/deploy':
+      case 'processDesign/deploy':
+        return this.deploy(args, action === 'processDesign/deploy')
+      case 'processDefine/redeploy':
+        return this.redeploy(args)
+      case 'processDefine/remove':
+        return this.repo.removeDefine(toId(args.id))
+      case 'processDefine/upAndDown':
+        return this.repo.updateDefineState(toId(args.id), toInt(args.state))
+      case 'processInstance/withdraw':
+        return this.withdraw(args)
+      case 'processTask/execute':
+        return this.execute(args)
+      case 'processDesign/page':
+        return this.designPage(args)
+      case 'processDesign/detail':
+        return this.designDetail(args)
+      case 'processDesign/save':
+        return this.designSave(args)
+      case 'processDesign/remove':
+        return this.ext().removeDesign(toId(args.id))
+      case 'processSurrogate/page':
+        return this.surrogatePage(args)
+      case 'processSurrogate/save':
+        return this.surrogateSave(args)
+      case 'processSurrogate/remove':
+        return this.ext().removeSurrogate(toId(args.id))
+      default:
+        throw new Error(`未知 action: ${action}`)
+    }
+  }
+
+  // ── 流程定义 / 实例 ──────────────────────────────────────────────────────
+
+  private async startAndExecute(args: Record<string, any>): Promise<Record<string, any>> {
+    const defineId = toId(args.processDefineId)
+    const operator = String(args.operator ?? 'user1')
+    const flowArgs: Record<string, any> = {}
+    for (const [k, v] of Object.entries(args)) {
+      if (k === 'processDefineId' || k === 'operator') continue
+      flowArgs[k] = v
+    }
+    const inst = await this.engine.startProcessInstanceById(defineId, operator, flowArgs)
+    // startAndExecute：自动完成申请节点（assignee="applicant" → 发起人）
+    const doing = await this.repo.findDoingTasks(inst.id)
+    for (const task of doing) {
+      await this.repo.addTaskActor(task.id, [operator])
+      flowArgs.submitType = SUBMIT_APPLY
+      await this.engine.executeProcessTask(task.id, operator, flowArgs)
+    }
+    return { processInstanceId: inst.id }
+  }
+
+  // deploy 版本管理（对齐 boot3）：按 name 查最新定义，存在 version+1 插新记录，否则从 0 起
+  private async deploy(args: Record<string, any>, fromDesign: boolean): Promise<Record<string, any>> {
+    let content: string
+    if (fromDesign) {
+      const designId = toId(args.id)
+      const ext = this.ext()
+      const design = await ext.findDesignById(designId)
+      if (!design) throw new Error('流程设计不存在')
+      const hisList = await ext.listDesignHis(designId)
+      if (hisList.length === 0) throw new Error('流程设计没有内容，无法发布')
+      content = toStr(hisList[0].content)
+      const defineId = await this.saveDeployedDefine(content, args)
+      design.isDeployed = 1
+      design.updateUser = String(args.operator ?? 'system')
+      await ext.updateDesign(design)
+      return { processDefineId: defineId }
+    }
+    content = toStr(args.content)
+    const defineId = await this.saveDeployedDefine(content, args)
+    return { processDefineId: defineId }
+  }
+
+  private async saveDeployedDefine(content: string, args: Record<string, any>): Promise<number> {
+    let flow: any
+    try {
+      flow = JSON.parse(content)
+    } catch {
+      throw new Error('流程定义 JSON 解析失败')
+    }
+    const name = flow?.name
+    if (!name) throw new Error('流程定义缺少 name')
+    let version = 0
+    const latest = await this.repo.findDefineByName(name)
+    if (latest) version = (latest.version ?? 0) + 1
+    const operator = String(args.operator ?? 'system')
+    const def: ProcessDefine = {
+      id: 0, name, displayName: flow.displayName ?? '', type: flow.type ?? 'approval',
+      state: 1, content, version, createTime: new Date(), createUser: operator,
+      updateTime: new Date(), updateUser: operator,
+    }
+    await this.repo.saveDefine(def)
+    return def.id
+  }
+
+  private async redeploy(args: Record<string, any>): Promise<void> {
+    const defineId = toId(args.processDefineId)
+    const content = toStr(args.content)
+    let flow: any
+    try {
+      flow = JSON.parse(content)
+    } catch {
+      throw new Error('流程定义 JSON 解析失败')
+    }
+    await this.repo.updateDefine({
+      id: defineId, name: flow?.name ?? '', displayName: flow?.displayName ?? '',
+      type: flow?.type ?? 'approval', state: 1, content, version: 0,
+      createTime: new Date(), createUser: '', updateTime: new Date(),
+      updateUser: String(args.operator ?? 'system'),
+    })
+  }
+
+  private async withdraw(args: Record<string, any>): Promise<void> {
+    const instanceId = toId(args.id)
+    const inst = await this.repo.findInstanceById(instanceId)
+    if (!inst) throw new Error('流程实例不存在')
+    // 撤回：废弃全部 doing 任务 + 实例状态（v1.0.1：updateInstance 级联落库）
+    const operator = String(args.operator ?? 'user1')
+    const now = new Date()
+    const abandoned = inst.abandonAllDoing(now)
+    inst.reject(now)
+    inst.updateUser = operator
+    for (const t of abandoned) await this.repo.updateTask(t)
+    await this.repo.updateInstance(inst)
+  }
+
+  // ── 流程任务 ─────────────────────────────────────────────────────────────
+
+  private async execute(args: Record<string, any>): Promise<void> {
+    const taskId = toId(args.processTaskId)
+    const operator = String(args.operator ?? 'user1')
+    const submitType = toInt(args.submitType ?? SUBMIT_AGREE)
+    const flowArgs: Record<string, any> = {}
+    for (const [k, v] of Object.entries(args)) {
+      if (k === 'processTaskId' || k === 'operator') continue
+      flowArgs[k] = v
+    }
+    flowArgs.submitType = submitType
+    // boot3 execute 分发（spec §11.2）
+    switch (submitType) {
+      case SUBMIT_REJECT:
+        await this.engine.executeAndJumpToEnd(taskId, operator, flowArgs)
+        break
+      case SUBMIT_ROLLBACK:
+        await this.engine.executeAndJumpTask(taskId, operator, flowArgs, '')
+        break
+      case SUBMIT_JUMP:
+        await this.engine.executeAndJumpTask(taskId, operator, flowArgs, String(args.taskName ?? ''))
+        break
+      case SUBMIT_ROLLBACK_TO_OPERATOR:
+        await this.engine.executeAndJumpToFirstTaskNode(taskId, operator, flowArgs)
+        break
+      case SUBMIT_COUNTERSIGN_DISAGREE:
+        flowArgs.countersignDisagreeFlag = 1
+        await this.engine.executeProcessTask(taskId, operator, flowArgs)
+        break
+      default: // 0 APPLY / 1 AGREE / 5 重新提交
+        await this.engine.executeProcessTask(taskId, operator, flowArgs)
+    }
+  }
+
+  // ── 流程设计（需扩展仓储） ───────────────────────────────────────────────
+
+  private async designPage(args: Record<string, any>): Promise<Record<string, any>> {
+    const [rows, total] = await this.ext().pageDesigns(toInt(args.pageNum ?? 1), toInt(args.pageSize ?? 10))
+    return { rows, recordCount: total }
+  }
+
+  private async designDetail(args: Record<string, any>): Promise<Record<string, any>> {
+    const ext = this.ext()
+    const design = await ext.findDesignById(toId(args.id))
+    if (!design) throw new Error('流程设计不存在')
+    const data: Record<string, any> = {
+      id: design.id, name: design.name, displayName: design.displayName,
+      type: design.type, icon: design.icon, isDeployed: design.isDeployed, remark: design.remark,
+    }
+    const hisList = await ext.listDesignHis(design.id)
+    if (hisList.length > 0) {
+      try {
+        data.jsonObject = JSON.parse(toStr(hisList[0].content))
+      } catch { /* ignore */ }
+    }
+    data.his = hisList
+    return data
+  }
+
+  private async designSave(args: Record<string, any>): Promise<Record<string, any>> {
+    const ext = this.ext()
+    const operator = String(args.operator ?? 'user1')
+    const designId = args.id != null ? toId(args.id) : 0
+    let design: ProcessDesign
+    if (!designId) {
+      design = {
+        id: 0, name: String(args.name ?? ''), displayName: String(args.displayName ?? ''),
+        type: String(args.type ?? 'approval'), icon: String(args.icon ?? ''),
+        isDeployed: 0, remark: String(args.remark ?? ''),
+        createTime: new Date(), createUser: operator,
+        updateTime: new Date(), updateUser: operator,
+      }
+      await ext.saveDesign(design)
+    } else {
+      const found = await ext.findDesignById(designId)
+      if (!found) throw new Error('流程设计不存在')
+      if (args.displayName != null) found.displayName = String(args.displayName)
+      if (args.type != null) found.type = String(args.type)
+      if (args.icon != null) found.icon = String(args.icon)
+      if (args.remark != null) found.remark = String(args.remark)
+      found.updateUser = operator
+      await ext.updateDesign(found)
+      design = found
+    }
+    // 内容快照（设计稿内容存历史表）
+    if (args.content != null) {
+      await ext.saveDesignHis({
+        id: 0, processDesignId: design.id, content: String(args.content),
+        createTime: new Date(), createUser: operator,
+      })
+    }
+    return { id: design.id }
+  }
+
+  // ── 委托代理（需扩展仓储） ───────────────────────────────────────────────
+
+  private async surrogatePage(args: Record<string, any>): Promise<Record<string, any>> {
+    const filters = args.operator != null ? { operator: String(args.operator) } : undefined
+    const [rows, total] = await this.ext().pageSurrogates(
+      toInt(args.pageNum ?? 1), toInt(args.pageSize ?? 10), filters)
+    return { rows, recordCount: total }
+  }
+
+  private async surrogateSave(args: Record<string, any>): Promise<Record<string, any>> {
+    const ext = this.ext()
+    const operator = String(args.operator ?? 'user1')
+    const surrogateId = args.id != null ? toId(args.id) : 0
+    let surrogate: ProcessSurrogate
+    if (!surrogateId) {
+      surrogate = {
+        id: 0, operator, // 授权人 = 操作人
+        surrogate: String(args.surrogate ?? ''), processName: String(args.processName ?? ''),
+        enabled: toInt(args.enabled ?? 1),
+        createTime: new Date(), createUser: operator,
+        updateTime: new Date(), updateUser: operator,
+      }
+      await ext.saveSurrogate(surrogate)
+    } else {
+      const found = await ext.findSurrogateById(surrogateId)
+      if (!found) throw new Error('委托记录不存在')
+      if (args.surrogate != null) found.surrogate = String(args.surrogate)
+      if (args.processName != null) found.processName = String(args.processName)
+      if (args.enabled != null) found.enabled = toInt(args.enabled)
+      found.updateUser = operator
+      await ext.updateSurrogate(found)
+      surrogate = found
+    }
+    return { id: surrogate.id }
+  }
+
+  private ext(): ProcessExtRepository {
+    if (!this.extRepo) throw new Error('未配置 ProcessExtRepository（扩展仓储）')
+    return this.extRepo
+  }
+}
+
+// ── 工具 ──────────────────────────────────────────────────────────────────────
+
+function toStr(v: any): string {
+  if (v == null) return ''
+  if (typeof v === 'string') return v
+  if (v instanceof Uint8Array || Buffer.isBuffer(v)) return Buffer.from(v).toString('utf8')
+  return String(v)
+}
+
+function toId(v: any): number {
+  const n = Number(v)
+  if (!Number.isFinite(n) || n <= 0) throw new Error('id 缺失或非法')
+  return n
+}
+
+function toInt(v: any): number {
+  const n = Number(v)
+  if (!Number.isFinite(n)) throw new Error('数值缺失或非法')
+  return n
+}

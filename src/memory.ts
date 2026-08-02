@@ -16,6 +16,15 @@ export class MemoryRepository implements ProcessRepository {
 
   async findDefineById(id: number) { return this.defines.get(id) ?? null }
 
+  // findDefineByName 按流程编码查最新一条定义（id 倒序取首条，v1.1.0）
+  async findDefineByName(name: string) {
+    let latest: ProcessDefine | null = null
+    for (const d of this.defines.values()) {
+      if (d.name === name && (!latest || d.id > latest.id)) latest = d
+    }
+    return latest
+  }
+
   // ── 定义写操作（v1.0.1，对齐 SPI）──
 
   async saveDefine(def: ProcessDefine) {
