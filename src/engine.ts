@@ -50,6 +50,12 @@ export class EngineImpl implements Engine {
       if (!(await ic.preHandle(node, inst))) return false
     return true
   }
+  /** 表达式求值（v1.5.0，门面 highLight 决策分支过滤用） */
+  async evalExpr(expr: string, vars: Record<string, any>): Promise<any> {
+    if (!this.exprEval) throw new Error('ExpressionEvaluator 未配置')
+    return this.exprEval.eval(expr, vars)
+  }
+
   private async firePost(node: FlowNode, inst: ProcessInstance) {
     if (!this.ext?.interceptors) return
     for (const ic of this.ext.interceptors) await ic.postHandle(node, inst)

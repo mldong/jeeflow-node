@@ -366,30 +366,55 @@ export class JeeflowFacade {
     for (const t of doing) if (!active.includes(t.taskName)) active.push(t.taskName)
     const his = await this.repo.findHistoryTasks(instanceId)
     for (const t of his) if (!active.includes(t.taskName) && !history.includes(t.taskName)) history.push(t.taskName)
-    // 路径补全：start 沿边递归（遇活跃节点停止）
+    // 路径补全：start 沿边递归（遇活跃节点停止）；决策分支按表达式求值过滤（issues/06）
     const def = await this.repo.findDefineById(inst.defineId)
     if (def) {
       try {
         const flow = JSON.parse(toStr(def.content))
-        this.collectPath(flow, 'start', '', active, history, edges, new Set())
+        await this.collectPath(flow, 'start', '', active, history, edges, new Set(), inst.variables ?? {}, his)
       } catch { /* ignore */ }
     }
     return { activeNodeNames: active, historyNodeNames: history, historyEdgeNames: edges }
   }
 
-  private collectPath(flow: any, nodeId: string, edgeName: string, active: string[],
-    history: string[], edges: string[], visited: Set<string>): void {
+  private async collectPath(flow: any, nodeId: string, edgeName: string, active: string[],
+    history: string[], edges: string[], visited: Set<string>,
+    vars: Record<string, any>, historyTasks: any[]): Promise<void> {
     if (visited.has(nodeId)) return
     visited.add(nodeId)
     if (edgeName && !edges.includes(edgeName)) edges.push(edgeName)
+    const src = (flow.nodes ?? []).find((n: any) => n.id === nodeId)
     for (const e of flow.edges ?? []) {
       if (e.sourceNodeId !== nodeId) continue
+      // 决策节点：输出边表达式求值过滤（对齐 boot3 recursionModel，issues/06）
+      if (src?.type === 'snaker:decision') {
+        const expr = e.properties?.expr
+        if (expr && !await this.evalDecisionExpr(flow, src, expr, vars, historyTasks)) continue
+      }
       const target = (flow.nodes ?? []).find((n: any) => n.id === e.targetNodeId)
       if (!target) continue
       const tid = target.id
       if (!active.includes(tid) && !history.includes(tid)) history.push(tid)
       if (active.includes(tid)) continue
-      this.collectPath(flow, tid, e.id, active, history, edges, visited)
+      await this.collectPath(flow, tid, e.id, active, history, edges, visited, vars, historyTasks)
+    }
+  }
+
+  /** 决策输出边表达式求值（args = 实例变量 + 决策节点前置任务变量） */
+  private async evalDecisionExpr(flow: any, decision: any, expr: string,
+    vars: Record<string, any>, historyTasks: any[]): Promise<boolean> {
+    const args: Record<string, any> = { ...(vars ?? {}) }
+    for (const e of flow.edges ?? []) {
+      if (e.targetNodeId === decision.id) {
+        const t = (historyTasks ?? []).find((x: any) => x.taskName === e.sourceNodeId)
+        if (t?.variables) Object.assign(args, t.variables)
+        break
+      }
+    }
+    try {
+      return Boolean(await this.engine.evalExpr(expr, args))
+    } catch {
+      return false
     }
   }
 

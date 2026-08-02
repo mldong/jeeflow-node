@@ -107,6 +107,37 @@ describe('jeeflow compliance tests', () => {
     assert.equal(doing[0].taskName, 'task2', 'amount>1000 → task2')
   })
 
+  it('03.5 highLight 决策分支表达式过滤（issues/06）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, undefined)
+    const def = loadFlow(repo, '03-decision-expr.json')
+    // amount=500 → 走「amount <= 1000」分支（task3），task2 分支未执行
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant', { amount: 500 })
+    let doing = await repo.findDoingTasks(inst.id)
+    for (const t of doing) {
+      if (t.taskName === 'task1') {
+        await repo.addTaskActor(t.id, ['leader'])
+        t.actorIds.push('leader')
+        await engine.executeProcessTask(t.id, 'leader')
+      }
+    }
+    doing = await repo.findDoingTasks(inst.id)
+    for (const t of doing) {
+      if (t.taskName === 'task3') {
+        await repo.addTaskActor(t.id, ['director'])
+        t.actorIds.push('director')
+        await engine.executeProcessTask(t.id, 'director')
+      }
+    }
+    const r = await facade.flow('processInstance/highLight', { id: inst.id })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    const hl = r.data
+    assert.ok(hl.historyEdgeNames.includes('e4') && hl.historyEdgeNames.includes('e6'), JSON.stringify(hl))
+    assert.ok(!hl.historyEdgeNames.includes('e3') && !hl.historyEdgeNames.includes('e5'), JSON.stringify(hl))
+    assert.ok(!hl.historyNodeNames.includes('task2'), JSON.stringify(hl))
+    assert.ok(hl.historyNodeNames.includes('task3'), JSON.stringify(hl))
+  })
+
   it('04 fork-join', async () => {
     const { engine, repo } = setup()
     const def = loadFlow(repo, '04-fork-join.json')
