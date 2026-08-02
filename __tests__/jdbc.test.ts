@@ -155,6 +155,22 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
       assert.deepEqual(doing.map(t => t.taskName), ['task1'], '产生 task1 待办')
       assert.deepEqual(doing[0].actorIds, ['leader'], 'task1 参与者为 leader')
 
+      // ②.5 addTaskActor 追加语义（issues/03）：加签不顶掉原参与者
+      await repo.addTaskActor(doing[0].id, ['admin'])
+      await repo.addTaskActor(doing[0].id, ['userB', 'admin'])
+      const actors = await repo.findTaskActors(doing[0].id)
+      assert.deepEqual(actors, ['leader', 'admin', 'userB'], '原参与者保留且不重复')
+
+      // ②.6 ccList 抄送分页（v1.3.0）
+      await repo.createCcInstance(inst.id, 'zhangsan', 'lisi', 'wangwu')
+      const ccPage = await repo.pageCcInstances(1, 10, 'lisi')
+      assert.equal(ccPage.total, 1, 'ccList total')
+      assert.equal(ccPage.rows.length, 1, 'ccList rows')
+      assert.equal(String(ccPage.rows[0].id), String(inst.id), 'ccList 命中实例')
+      assert.equal(ccPage.rows[0].defineName, 'node-simple', 'ccList 关联定义名')
+      const ccEmpty = await repo.pageCcInstances(1, 10, 'nobody')
+      assert.equal(ccEmpty.total, 0, '非抄送人空')
+
       // ③ 完成 task1 → end → 实例完成
       inst2 = await engine.executeProcessTask(doing[0].id, 'leader', { comment: 'ok' })
       assert.equal(inst2.state, InstanceState.Done, '流程实例完成')

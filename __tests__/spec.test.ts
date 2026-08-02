@@ -395,7 +395,7 @@ describe('jeeflow compliance tests', () => {
     assert.equal(r7.code, 0, JSON.stringify(r7))
     assert.equal(r7.data.taskName, 'task1')
 
-    // 抄送：创建 + 已读；ccList 未实现
+    // 抄送：创建 + 已读 + 列表（ccList v1.3.0 补齐）
     const r8 = await facade.flow('processInstance/createCCInstance',
       { processInstanceId: instanceId, operator: 'zhangsan', actorIds: ['lisi'] })
     assert.equal(r8.code, 0, JSON.stringify(r8))
@@ -403,7 +403,8 @@ describe('jeeflow compliance tests', () => {
       { processInstanceId: instanceId, operator: 'lisi' })
     assert.equal(r9.code, 0, JSON.stringify(r9))
     const r10 = await facade.flow('processInstance/ccList', { operator: 'lisi' })
-    assert.equal(r10.code, 99999999, JSON.stringify(r10))
+    assert.equal(r10.code, 0, JSON.stringify(r10))
+    assert.equal(r10.data.rows.length, 1, JSON.stringify(r10))
 
     // 加签/转交
     const r11 = await facade.flow('processTask/addCandidate',

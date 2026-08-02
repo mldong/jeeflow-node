@@ -284,3 +284,23 @@ export interface UserInfo {
   postId?: string
   postName?: string
 }
+
+// 抄送实例行数据（ccList 分页，v1.3.0，对齐 Java InstanceRow）
+export interface CcInstanceRow {
+  id: number
+  parentId?: number
+  defineId: number
+  state: InstanceState
+  parentNodeName: string
+  businessNo: string
+  operator: string
+  expireTime?: Date
+  variables: Record<string, any>
+  createTime: Date
+  createUser: string
+  updateTime: Date
+  updateUser: string
+  defineName: string
+  defineDisplayName: string
+  defineVersion: number
+}

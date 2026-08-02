@@ -1,4 +1,4 @@
-import type { ProcessDefine } from './model.js'
+import type { CcInstanceRow, ProcessDefine } from './model.js'
 import { cloneInstance, cloneTask, type ProcessInstance, type ProcessTask } from './model.js'
 import type { ProcessRepository } from './spi.js'
 
@@ -7,6 +7,7 @@ export class MemoryRepository implements ProcessRepository {
   private instances = new Map<number, ProcessInstance>()
   private tasks    = new Map<number, ProcessTask>()
   private actors   = new Map<number, string[]>()
+  private ccInstances = new Map<number, string[]>()
   private seq = 1
 
   addDefine(def: ProcessDefine) {
@@ -141,8 +142,36 @@ export class MemoryRepository implements ProcessRepository {
     const remove = new Set(actors)
     this.actors.set(taskId, (this.actors.get(taskId) ?? []).filter(a => !remove.has(a)))
   }
-  async createCcInstance(..._args: any[]) {}
-  async updateCcStatus(..._args: any[]) {}
+  async createCcInstance(instanceId: number, _creator: string, ...actorIds: string[]) {
+    const existing = this.ccInstances.get(instanceId) ?? []
+    const seen = new Set(existing)
+    for (const a of actorIds) { if (!seen.has(a)) { existing.push(a); seen.add(a) } }
+    this.ccInstances.set(instanceId, existing)
+  }
+  async updateCcStatus(_instanceId: number, _actorId: string) {}
+
+  // pageCcInstances 我的抄送分页（v1.3.0）：按抄送人 actorId 过滤，join 实例 + 定义
+  async pageCcInstances(pageNum = 1, pageSize = 10, actorId: string) {
+    const rows: CcInstanceRow[] = []
+    for (const [instId, actors] of this.ccInstances) {
+      if (actorId && !actors.includes(actorId)) continue
+      const inst = this.instances.get(instId)
+      if (!inst) continue
+      const def = this.defines.get(inst.defineId)
+      rows.push({
+        id: inst.id, parentId: inst.parentId, defineId: inst.defineId, state: inst.state,
+        parentNodeName: inst.parentNodeName, businessNo: inst.businessNo, operator: inst.operator,
+        expireTime: inst.expireTime, variables: { ...inst.variables },
+        createTime: inst.createTime, createUser: inst.createUser,
+        updateTime: inst.updateTime, updateUser: inst.updateUser,
+        defineName: def?.name ?? '', defineDisplayName: def?.displayName ?? '',
+        defineVersion: def?.version ?? 0,
+      })
+    }
+    const total = rows.length
+    const start = (pageNum - 1) * pageSize
+    return { rows: rows.slice(start, start + pageSize), total }
+  }
 
   allDefines() { return [...this.defines.values()] }
   allInstances() { return [...this.instances.values()] }

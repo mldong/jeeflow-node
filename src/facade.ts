@@ -91,7 +91,7 @@ export class JeeflowFacade {
       case 'processInstance/updateCCStatus':
         return this.updateCCStatus(args)
       case 'processInstance/ccList':
-        throw new Error('ccList 需要核心分页 SPI（pageCcInstances），当前语言 1.3.0 补齐')
+        return this.ccList(args)
       case 'processTask/detail':
         return this.taskDetail(args)
       case 'processTask/jumpAbleTaskNameList':
@@ -417,6 +417,15 @@ export class JeeflowFacade {
     const instanceId = toId(args.processInstanceId)
     const operator = String(args.operator ?? 'user1')
     await this.repo.updateCcStatus(instanceId, operator)
+  }
+
+  // ccList 我的抄送分页（v1.3.0）：operator 作为抄送人过滤
+  private async ccList(args: Record<string, any>): Promise<Record<string, any>> {
+    const pageNum = toInt(args.pageNum ?? 1)
+    const pageSize = toInt(args.pageSize ?? 10)
+    const actorId = String(args.operator ?? 'user1')
+    const { rows, total } = await this.repo.pageCcInstances(pageNum, pageSize, actorId)
+    return { rows, recordCount: total }
   }
 
   private async taskDetail(args: Record<string, any>): Promise<any> {

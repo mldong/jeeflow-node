@@ -1,4 +1,4 @@
-import type { ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessInstance, ProcessSurrogate, ProcessTask, UserInfo } from './model.js'
+import type { CcInstanceRow, ProcessDefine, ProcessDesign, ProcessDesignHis, ProcessInstance, ProcessSurrogate, ProcessTask, UserInfo } from './model.js'
 
 export interface ProcessRepository {
   findDefineById(id: number): Promise<ProcessDefine | null>
@@ -26,6 +26,10 @@ export interface ProcessRepository {
 
   createCcInstance(instanceId: number, creator: string, ...actorIds: string[]): Promise<void>
   updateCcStatus(instanceId: number, actorId: string): Promise<void>
+
+  // PageCcInstances 我的抄送分页（v1.3.0，对齐 Java pageCcInstances）：
+  // 按抄送人 actorId 过滤实例列表，返回行数据（含关联定义名/版本）+ 总数
+  pageCcInstances(pageNum: number, pageSize: number, actorId: string): Promise<{ rows: CcInstanceRow[]; total: number }>
 }
 
 export interface UserProvider {

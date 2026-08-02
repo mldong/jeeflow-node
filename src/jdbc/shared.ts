@@ -10,7 +10,7 @@
 // （execute/fetchOne/fetchAll/begin/commit/rollback）。参考 mysql.ts / postgres.ts。
 
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { ProcessInstance, ProcessTask, type ProcessDefine } from '../model.js'
+import { ProcessInstance, ProcessTask, type ProcessDefine, type CcInstanceRow } from '../model.js'
 import { InstanceState, TaskState } from '../model.js'
 import type { IDGenerator, ProcessRepository } from '../spi.js'
 
@@ -409,9 +409,15 @@ export class JdbcRepository implements ProcessRepository {
   }
 
   async addTaskActor(taskId: number, actors: string[]): Promise<void> {
+    if (actors.length === 0) return
+    // 追加语义（对齐 boot2/boot3，issues/03）：查已有参与者，去重后仅插入新增，不清空原参与者
+    const existing = await this.findTaskActors(taskId)
+    const seen = new Set(existing)
+    const toAdd = actors.filter(a => !seen.has(a))
+    if (toAdd.length === 0) return
     const conn = await this.c()
     try {
-      await this.insertTaskActors(conn, taskId, actors)
+      await this.insertTaskActors(conn, taskId, toAdd)
     } finally {
       await this.done(conn)
     }
@@ -454,6 +460,48 @@ export class JdbcRepository implements ProcessRepository {
         [new Date(), instanceId, actorId])
     } finally {
       await this.done(conn)
+    }
+  }
+
+  // pageCcInstances 我的抄送分页（v1.3.0）：cc 表 join 实例 + 定义，按抄送人过滤（对齐 Java pageCcInstances）
+  async pageCcInstances(pageNum: number, pageSize: number, actorId: string): Promise<{ rows: CcInstanceRow[]; total: number }> {
+    const where = ' FROM wf_process_instance t' +
+      ' LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id' +
+      ' LEFT JOIN wf_process_cc_instance cc ON t.id = cc.process_instance_id' +
+      ' WHERE cc.actor_id = ?'
+    const cols = 't.id, t.parent_id, t.process_define_id, t.state, t.parent_node_name, t.business_no,' +
+      ' t.operator, t.expire_time, t.variable, t.create_time, t.create_user, t.update_time, t.update_user,' +
+      ' pd.name, pd.display_name, pd.version'
+    const conn = await this.c()
+    try {
+      const countRow = await conn.fetchOne(this.sql('SELECT COUNT(*) ' + where), [actorId])
+      const total = Number(Object.values(countRow as Record<string, unknown>)[0] ?? 0)
+      const rows = await conn.fetchAll(this.sql(
+        `SELECT ${cols}${where} ORDER BY t.id ASC LIMIT ? OFFSET ?`),
+        [actorId, pageSize, (pageNum - 1) * pageSize])
+      return {
+        rows: rows.map(r => this.mapCcRow(r)),
+        total,
+      }
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  private mapCcRow(r: Record<string, any>): CcInstanceRow {
+    let variables: Record<string, any> = {}
+    if (r.variable) {
+      try { variables = JSON.parse(r.variable) } catch { /* 忽略坏 JSON */ }
+    }
+    return {
+      id: Number(r.id), parentId: r.parent_id != null ? Number(r.parent_id) : undefined,
+      defineId: Number(r.process_define_id), state: r.state as InstanceState,
+      parentNodeName: r.parent_node_name ?? '', businessNo: r.business_no ?? '', operator: r.operator ?? '',
+      expireTime: r.expire_time ?? undefined, variables,
+      createTime: r.create_time, createUser: r.create_user ?? '',
+      updateTime: r.update_time, updateUser: r.update_user ?? '',
+      defineName: r.name ?? '', defineDisplayName: r.display_name ?? '',
+      defineVersion: Number(r.version ?? 0),
     }
   }
 }
