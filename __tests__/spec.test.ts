@@ -593,6 +593,55 @@ describe('jeeflow compliance tests', () => {
     assert.equal(r8.data.rows.length, 1, JSON.stringify(r8))
   })
 
+  it('21 设计部署/重新部署/内容变更的 is_deployed 同步（issues/08）', async () => {
+    const { engine, repo } = setup()
+    const extRepo = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, extRepo)
+    const c1 = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    const c2 = readFileSync(flowDir + '02-multi-task.json', 'utf-8')
+
+    // 保存（含内容快照）→ 未部署
+    const r0 = await facade.flow('processDesign/save',
+      { name: 'leave08', displayName: '请假流程08', content: c1, operator: 'zhangsan' })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const designId = r0.data.id
+    assert.equal((await extRepo.findDesignById(designId))?.isDeployed, 0)
+
+    // 部署 → is_deployed=1
+    const r1 = await facade.flow('processDesign/deploy', { id: designId, operator: 'zhangsan' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const defineId = r1.data.processDefineId
+    assert.equal((await extRepo.findDesignById(designId))?.isDeployed, 1)
+
+    // 重新部署 → 同一 defineId + is_deployed=1
+    const r2 = await facade.flow('processDesign/redeploy', { id: designId, operator: 'zhangsan' })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    assert.equal(r2.data.processDefineId, defineId, JSON.stringify(r2))
+    assert.equal((await extRepo.findDesignById(designId))?.isDeployed, 1)
+
+    // 设计稿内容变更（updateDefine，不同 content）→ 新快照 + is_deployed=0 + name 同步
+    const r3 = await facade.flow('processDesign/updateDefine',
+      { processDesignId: designId, content: c2, operator: 'zhangsan' })
+    assert.equal(r3.code, 0, JSON.stringify(r3))
+    const design = await extRepo.findDesignById(designId)
+    assert.equal(design?.isDeployed, 0, JSON.stringify(design))
+    assert.equal(design?.name, 'multi-task', JSON.stringify(design))
+    assert.equal((await extRepo.listDesignHis(designId)).length, 2)
+
+    // 基本信息修改（update）→ is_deployed 不变
+    const r4 = await facade.flow('processDesign/update',
+      { id: designId, displayName: '改名08', operator: 'zhangsan' })
+    assert.equal(r4.code, 0, JSON.stringify(r4))
+    const design2 = await extRepo.findDesignById(designId)
+    assert.equal(design2?.displayName, '改名08')
+    assert.equal(design2?.isDeployed, 0)
+
+    // 部署 → 再置 1
+    const r5 = await facade.flow('processDesign/deploy', { id: designId, operator: 'zhangsan' })
+    assert.equal(r5.code, 0, JSON.stringify(r5))
+    assert.equal((await extRepo.findDesignById(designId))?.isDeployed, 1)
+  })
+
   it('16 门面错误路径：未知 action / 缺扩展仓储', async () => {
     const { engine, repo } = setup()
     const facade = new JeeflowFacade(engine, repo)

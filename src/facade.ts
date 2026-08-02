@@ -58,6 +58,8 @@ export class JeeflowFacade {
       case 'processDefine/deploy':
       case 'processDesign/deploy':
         return this.deploy(args, action === 'processDesign/deploy')
+      case 'processDesign/redeploy':
+        return this.designRedeploy(args)
       case 'processDefine/redeploy':
         return this.redeploy(args)
       case 'processDefine/remove':
@@ -82,6 +84,10 @@ export class JeeflowFacade {
         return this.designDetail(args)
       case 'processDesign/save':
         return this.designSave(args)
+      case 'processDesign/update':
+        return this.designUpdate(args)
+      case 'processDesign/updateDefine':
+        return this.designUpdateDefine(args)
       case 'processDesign/remove':
         return this.ext().removeDesign(toId(args.id))
       case 'processSurrogate/page':
@@ -258,6 +264,86 @@ export class JeeflowFacade {
     return { rows, recordCount: total }
   }
 
+  /** 修改流程设计基本信息（对齐 boot3 ProcessDesignController.update，不写设计稿快照） */
+  private async designUpdate(args: Record<string, any>): Promise<Record<string, any>> {
+    const ext = this.ext()
+    const design = await ext.findDesignById(toId(args.id))
+    if (!design) throw new Error('流程设计不存在')
+    if (args.name != null) design.name = String(args.name)
+    if (args.displayName != null) design.displayName = String(args.displayName)
+    if (args.type != null) design.type = String(args.type)
+    if (args.icon != null) design.icon = String(args.icon)
+    if (args.remark != null) design.remark = String(args.remark)
+    design.updateUser = String(args.operator ?? 'system')
+    await ext.updateDesign(design)
+    return {}
+  }
+
+  /** 更新流程设计定义（设计稿保存，issues/08）：content 快照入库 + 同步基本信息 + 置未部署 */
+  private async designUpdateDefine(args: Record<string, any>): Promise<Record<string, any>> {
+    const ext = this.ext()
+    const designId = toId(args.processDesignId)
+    const design = await ext.findDesignById(designId)
+    if (!design) throw new Error('流程设计不存在')
+    if (args.content == null) throw new Error('content 缺失')
+    const content = toStr(args.content)
+    // 与最新一条相同则不重复入库（对齐 boot3 updateDefine）
+    const hisList = await ext.listDesignHis(designId)
+    if (hisList.length === 0 || toStr(hisList[0].content) !== content) {
+      await ext.saveDesignHis({
+        id: 0, processDesignId: designId, content,
+        createTime: new Date(), createUser: String(args.operator ?? 'system'),
+      })
+    }
+    // 同步设计基本信息（jsonObject 里的 name/displayName/type）+ 内容变更 → 未部署
+    try {
+      const flow = JSON.parse(content)
+      if (flow?.name) design.name = flow.name
+      if (flow?.displayName) design.displayName = flow.displayName
+      if (flow?.type) design.type = flow.type
+    } catch { /* ignore */ }
+    design.isDeployed = 0
+    design.updateUser = String(args.operator ?? 'system')
+    await ext.updateDesign(design)
+    return {}
+  }
+
+  /** 重新部署流程定义（issues/08）：替换最新定义内容 + 置已部署（对齐 boot3 redeploy） */
+  private async designRedeploy(args: Record<string, any>): Promise<Record<string, any>> {
+    const ext = this.ext()
+    const designId = toId(args.id)
+    const design = await ext.findDesignById(designId)
+    if (!design) throw new Error('流程设计不存在')
+    const hisList = await ext.listDesignHis(designId)
+    if (hisList.length === 0) throw new Error('流程设计没有内容，无法发布')
+    const content = toStr(hisList[0].content)
+    let flow: any
+    try {
+      flow = JSON.parse(content)
+    } catch (e) {
+      throw new Error('流程定义 JSON 解析失败: ' + String(e))
+    }
+    if (!flow?.name) throw new Error('流程定义缺少 name')
+    // 按 name 取最新定义：有则替换内容（version 不变），无则新建（对齐 boot3 redeploy）
+    const last = await this.repo.findDefineByName(flow.name)
+    let defineId: number
+    if (!last) {
+      defineId = await this.saveDeployedDefine(content, args)
+    } else {
+      last.name = flow.name
+      last.displayName = flow.displayName ?? ''
+      last.type = flow.type ?? ''
+      last.content = content
+      last.updateUser = String(args.operator ?? 'system')
+      await this.repo.updateDefine(last)
+      defineId = last.id
+    }
+    design.isDeployed = 1
+    design.updateUser = String(args.operator ?? 'system')
+    await ext.updateDesign(design)
+    return { processDefineId: defineId }
+  }
+
   private async designDetail(args: Record<string, any>): Promise<Record<string, any>> {
     const ext = this.ext()
     const design = await ext.findDesignById(toId(args.id))
@@ -306,6 +392,8 @@ export class JeeflowFacade {
       if (args.icon != null) found.icon = String(args.icon)
       if (args.remark != null) found.remark = String(args.remark)
       found.updateUser = operator
+      // 内容快照变更 → 置为未部署（对齐 boot3 updateDefine 语义，issues/08）
+      if (args.content != null) found.isDeployed = 0
       await ext.updateDesign(found)
       design = found
     }
