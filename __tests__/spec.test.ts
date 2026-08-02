@@ -356,6 +356,71 @@ describe('jeeflow compliance tests', () => {
     assert.equal(r6.code, 0, JSON.stringify(r6))
   })
 
+  it('17 门面视图端点（v1.2.0，spec §12 #16-18）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    const r0 = await facade.flow('processDefine/deploy', { content })
+    const defineId = r0.data.processDefineId
+
+    // getLastByName
+    const r1 = await facade.flow('processDefine/getLastByName', { processDefineName: 'simple' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    assert.equal(r1.data.name, 'simple')
+
+    // startAndExecute → 视图端点
+    const r2 = await facade.flow('processInstance/startAndExecute', { processDefineId: defineId, operator: 'zhangsan' })
+    const instanceId = r2.data.processInstanceId
+
+    const r3 = await facade.flow('processInstance/approvalRecord', { id: instanceId })
+    assert.equal(r3.code, 0, JSON.stringify(r3))
+    assert.equal(r3.data.length, 2, 'apply + task1')
+
+    const r4 = await facade.flow('processInstance/highLight', { id: instanceId })
+    assert.equal(r4.code, 0, JSON.stringify(r4))
+    assert.ok(r4.data.activeNodeNames.includes('task1'), JSON.stringify(r4.data))
+    assert.ok(r4.data.historyNodeNames.includes('apply'), JSON.stringify(r4.data))
+
+    const r5 = await facade.flow('processInstance/getAssigneeTextData', { id: instanceId })
+    assert.equal(r5.code, 0, JSON.stringify(r5))
+    assert.equal(r5.data.length, 1, 'task1 → leader')
+
+    let doing = await repo.findDoingTasks(instanceId)
+    const r6 = await facade.flow('processTask/detail', { id: doing[0].id, operator: 'leader' })
+    assert.equal(r6.code, 0, JSON.stringify(r6))
+    assert.equal(r6.data.executable, true)
+    assert.ok(r6.data.taskModel)
+
+    const r7 = await facade.flow('processTask/latest', { processInstanceId: instanceId })
+    assert.equal(r7.code, 0, JSON.stringify(r7))
+    assert.equal(r7.data.taskName, 'task1')
+
+    // 抄送：创建 + 已读；ccList 未实现
+    const r8 = await facade.flow('processInstance/createCCInstance',
+      { processInstanceId: instanceId, operator: 'zhangsan', actorIds: ['lisi'] })
+    assert.equal(r8.code, 0, JSON.stringify(r8))
+    const r9 = await facade.flow('processInstance/updateCCStatus',
+      { processInstanceId: instanceId, operator: 'lisi' })
+    assert.equal(r9.code, 0, JSON.stringify(r9))
+    const r10 = await facade.flow('processInstance/ccList', { operator: 'lisi' })
+    assert.equal(r10.code, 99999999, JSON.stringify(r10))
+
+    // 加签/转交
+    const r11 = await facade.flow('processTask/addCandidate',
+      { processTaskId: doing[0].id, actorIds: ['zhaoliu'] })
+    assert.equal(r11.code, 0, JSON.stringify(r11))
+    const actors = await repo.findTaskActors(doing[0].id)
+    assert.ok(actors.includes('zhaoliu'))
+
+    // candidatePage：未配置钩子报错；配置后可用
+    const r12 = await facade.flow('processTask/candidatePage', { processTaskId: doing[0].id })
+    assert.equal(r12.code, 99999999, JSON.stringify(r12))
+    facade.setUserSearch(async () => [[{ userId: 'u1', realName: '用户1' }], 1])
+    const r13 = await facade.flow('processTask/candidatePage', { processTaskId: doing[0].id })
+    assert.equal(r13.code, 0, JSON.stringify(r13))
+    assert.equal(r13.data.recordCount, 1)
+  })
+
   it('16 门面错误路径：未知 action / 缺扩展仓储', async () => {
     const { engine, repo } = setup()
     const facade = new JeeflowFacade(engine, repo)

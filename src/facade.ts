@@ -20,12 +20,22 @@ const SUBMIT_JUMP = 4
 const SUBMIT_ROLLBACK_TO_OPERATOR = 6
 const SUBMIT_COUNTERSIGN_DISAGREE = 20
 
+export type UserSearch = (query: Record<string, any>) => Promise<[Record<string, any>[], number]> | [Record<string, any>[], number]
+
 export class JeeflowFacade {
+  private userSearch?: UserSearch
+
   constructor(
     private readonly engine: EngineImpl,
     private readonly repo: ProcessRepository,
     private readonly extRepo?: ProcessExtRepository,
   ) {}
+
+  // 注入用户搜索钩子（candidatePage 无模型候选时的用户分页搜索）
+  setUserSearch(fn: UserSearch): this {
+    this.userSearch = fn
+    return this
+  }
 
   async flow(action: string, args: Record<string, any> = {}): Promise<Record<string, any>> {
     try {
@@ -68,6 +78,31 @@ export class JeeflowFacade {
         return this.surrogateSave(args)
       case 'processSurrogate/remove':
         return this.ext().removeSurrogate(toId(args.id))
+      case 'processDefine/getLastByName':
+        return this.getLastByName(args)
+      case 'processInstance/highLight':
+        return this.highLight(args)
+      case 'processInstance/approvalRecord':
+        return this.approvalRecord(args)
+      case 'processInstance/getAssigneeTextData':
+        return this.getAssigneeTextData(args)
+      case 'processInstance/createCCInstance':
+        return this.createCCInstance(args)
+      case 'processInstance/updateCCStatus':
+        return this.updateCCStatus(args)
+      case 'processInstance/ccList':
+        throw new Error('ccList 需要核心分页 SPI（pageCcInstances），当前语言 1.3.0 补齐')
+      case 'processTask/detail':
+        return this.taskDetail(args)
+      case 'processTask/jumpAbleTaskNameList':
+        return this.jumpAbleTaskNameList(args)
+      case 'processTask/candidatePage':
+        return this.candidatePage(args)
+      case 'processTask/surrogate':
+      case 'processTask/addCandidate':
+        return this.taskAddActor(args)
+      case 'processTask/latest':
+        return this.taskLatest(args)
       default:
         throw new Error(`未知 action: ${action}`)
     }
@@ -300,6 +335,209 @@ export class JeeflowFacade {
     return { id: surrogate.id }
   }
 
+  // ── 视图端点（v1.2.0） ──────────────────────────────────────────────────
+
+  private async getLastByName(args: Record<string, any>): Promise<any> {
+    const def = await this.repo.findDefineByName(String(args.processDefineName ?? ''))
+    if (!def) throw new Error(`流程定义不存在: ${args.processDefineName}`)
+    return { id: def.id, name: def.name, displayName: def.displayName, type: def.type, state: def.state, version: def.version }
+  }
+
+  private async highLight(args: Record<string, any>): Promise<any> {
+    const instanceId = toId(args.id)
+    const inst = await this.repo.findInstanceById(instanceId)
+    if (!inst) throw new Error('流程实例不存在')
+    const active: string[] = []
+    const history: string[] = []
+    const edges: string[] = []
+    const doing = await this.repo.findDoingTasks(instanceId)
+    for (const t of doing) if (!active.includes(t.taskName)) active.push(t.taskName)
+    const his = await this.repo.findHistoryTasks(instanceId)
+    for (const t of his) if (!active.includes(t.taskName) && !history.includes(t.taskName)) history.push(t.taskName)
+    // 路径补全：start 沿边递归（遇活跃节点停止）
+    const def = await this.repo.findDefineById(inst.defineId)
+    if (def) {
+      try {
+        const flow = JSON.parse(toStr(def.content))
+        this.collectPath(flow, 'start', '', active, history, edges, new Set())
+      } catch { /* ignore */ }
+    }
+    return { activeNodeNames: active, historyNodeNames: history, historyEdgeNames: edges }
+  }
+
+  private collectPath(flow: any, nodeId: string, edgeName: string, active: string[],
+    history: string[], edges: string[], visited: Set<string>): void {
+    if (visited.has(nodeId)) return
+    visited.add(nodeId)
+    if (edgeName && !edges.includes(edgeName)) edges.push(edgeName)
+    for (const e of flow.edges ?? []) {
+      if (e.sourceNodeId !== nodeId) continue
+      const target = (flow.nodes ?? []).find((n: any) => n.id === e.targetNodeId)
+      if (!target) continue
+      const tid = target.id
+      if (!active.includes(tid) && !history.includes(tid)) history.push(tid)
+      if (active.includes(tid)) continue
+      this.collectPath(flow, tid, e.id, active, history, edges, visited)
+    }
+  }
+
+  private async approvalRecord(args: Record<string, any>): Promise<any> {
+    const instanceId = toId(args.id)
+    const his = await this.repo.findHistoryTasks(instanceId)
+    return his.map(t => ({
+      taskName: t.taskName, displayName: t.displayName, taskType: t.taskType ?? null,
+      performType: t.performType ?? null, taskState: t.taskState, operator: t.actorId ?? '',
+      finishTime: t.finishTime ?? null, variable: t.variables ?? {},
+    }))
+  }
+
+  private async getAssigneeTextData(args: Record<string, any>): Promise<any> {
+    const instanceId = toId(args.id)
+    const includeNodeName = args.includeNodeName !== false
+    const rows: Record<string, any>[] = []
+    const doing = await this.repo.findDoingTasks(instanceId)
+    for (const t of doing) {
+      const actors = await this.repo.findTaskActors(t.id)
+      for (const actor of actors) {
+        rows.push({ label: includeNodeName ? `${t.displayName}:${actor}` : actor, value: actor })
+      }
+    }
+    return rows
+  }
+
+  private async createCCInstance(args: Record<string, any>): Promise<void> {
+    const instanceId = toId(args.processInstanceId)
+    const operator = String(args.operator ?? 'user1')
+    const actors = toStringList2(args.actorIds)
+    if (actors.length === 0) throw new Error('actorIds 缺失')
+    await this.repo.createCcInstance(instanceId, operator, ...actors)
+  }
+
+  private async updateCCStatus(args: Record<string, any>): Promise<void> {
+    const instanceId = toId(args.processInstanceId)
+    const operator = String(args.operator ?? 'user1')
+    await this.repo.updateCcStatus(instanceId, operator)
+  }
+
+  private async taskDetail(args: Record<string, any>): Promise<any> {
+    const taskId = toId(args.id)
+    const operator = String(args.operator ?? 'user1')
+    const task = await this.repo.findTaskById(taskId)
+    if (!task) throw new Error('任务不存在')
+    const actors = await this.repo.findTaskActors(taskId)
+    const vo: Record<string, any> = {
+      id: task.id, processInstanceId: task.processInstanceId, taskName: task.taskName,
+      displayName: task.displayName, taskType: task.taskType ?? null,
+      performType: task.performType ?? null, taskState: task.taskState,
+      operator: task.actorId ?? '', formKey: task.formKey ?? '',
+      taskActorIdList: actors, executable: task.isAllowed(operator),
+    }
+    // taskModel：流程定义中对应节点
+    const inst = await this.repo.findInstanceById(task.processInstanceId)
+    if (inst) {
+      const def = await this.repo.findDefineById(inst.defineId)
+      if (def) {
+        try {
+          const flow = JSON.parse(toStr(def.content))
+          for (const n of flow.nodes ?? []) {
+            if (n.id === task.taskName) {
+              vo.taskModel = { name: n.id, displayName: n.text?.value ?? '', type: n.type }
+              break
+            }
+          }
+        } catch { /* ignore */ }
+      }
+    }
+    return vo
+  }
+
+  private async jumpAbleTaskNameList(args: Record<string, any>): Promise<any> {
+    const instanceId = toId(args.processInstanceId)
+    const done = await this.repo.findDoneTasks(instanceId)
+    const rows: Record<string, any>[] = []
+    const seen = new Set<string>()
+    for (const t of done) {
+      if ((t.performType ?? 0) === 1) continue // COUNTERSIGN
+      if (!seen.has(t.taskName)) {
+        seen.add(t.taskName)
+        rows.push({ label: t.displayName, value: t.taskName })
+      }
+    }
+    return rows
+  }
+
+  private async candidatePage(args: Record<string, any>): Promise<any> {
+    const taskId = toId(args.processTaskId ?? args.id)
+    const task = await this.repo.findTaskById(taskId)
+    if (!task) throw new Error('任务不存在')
+    const inst = await this.repo.findInstanceById(task.processInstanceId)
+    if (!inst) throw new Error('流程实例不存在')
+    // 模型候选解析：后继任务节点的 candidateUsers 配置
+    let candidates: string[] = []
+    const def = await this.repo.findDefineById(inst.defineId)
+    if (def) {
+      try {
+        const flow = JSON.parse(toStr(def.content))
+        candidates = this.nextTaskCandidates(flow, task.taskName)
+      } catch { /* ignore */ }
+    }
+    if (candidates.length > 0) {
+      const rows = candidates.map(c => ({ userId: c, realName: c }))
+      return { rows, recordCount: rows.length }
+    }
+    // 无模型候选 → 用户分页搜索（依赖 userSearch 钩子）
+    if (!this.userSearch) throw new Error('未配置 userSearch（用户搜索钩子）')
+    const [rows, total] = await this.userSearch(args)
+    return { rows, recordCount: total }
+  }
+
+  private nextTaskCandidates(flow: any, taskName: string): string[] {
+    const result: string[] = []
+    const visited = new Set<string>()
+    const collect = (node: any) => {
+      const v = node.properties?.candidateUsers
+      if (v) {
+        for (const s of String(v).split(',')) {
+          const t = s.trim()
+          if (t && !result.includes(t)) result.push(t)
+        }
+      }
+    }
+    const walk = (nodeId: string) => {
+      if (visited.has(nodeId)) return
+      visited.add(nodeId)
+      for (const e of flow.edges ?? []) {
+        if (e.sourceNodeId !== nodeId) continue
+        const target = (flow.nodes ?? []).find((n: any) => n.id === e.targetNodeId)
+        if (!target) continue
+        if (target.type === 'snaker:task' || target.type === 'snaker:custom') {
+          collect(target)
+          continue
+        }
+        if (['snaker:fork', 'snaker:join', 'snaker:decision'].includes(target.type)) {
+          walk(target.id)
+        }
+      }
+    }
+    walk(taskName)
+    return result
+  }
+
+  private async taskAddActor(args: Record<string, any>): Promise<void> {
+    const taskId = toId(args.processTaskId)
+    const actors = toStringList2(args.actorIds)
+    if (actors.length === 0) throw new Error('actorIds 缺失')
+    await this.repo.addTaskActor(taskId, actors)
+  }
+
+  private async taskLatest(args: Record<string, any>): Promise<any> {
+    const instanceId = toId(args.processInstanceId)
+    const doing = await this.repo.findDoingTasks(instanceId)
+    if (doing.length === 0) return null
+    const t = doing[0]
+    return { id: t.id, taskName: t.taskName, displayName: t.displayName, taskState: t.taskState, operator: t.actorId ?? '' }
+  }
+
   private ext(): ProcessExtRepository {
     if (!this.extRepo) throw new Error('未配置 ProcessExtRepository（扩展仓储）')
     return this.extRepo
@@ -319,6 +557,12 @@ function toId(v: any): number {
   const n = Number(v)
   if (!Number.isFinite(n) || n <= 0) throw new Error('id 缺失或非法')
   return n
+}
+
+function toStringList2(v: any): string[] {
+  if (Array.isArray(v)) return v.map(String)
+  if (typeof v === 'string') return v.split(',').map(s => s.trim()).filter(Boolean)
+  return []
 }
 
 function toInt(v: any): number {
