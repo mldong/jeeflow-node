@@ -642,6 +642,39 @@ describe('jeeflow compliance tests', () => {
     assert.equal((await extRepo.findDesignById(designId))?.isDeployed, 1)
   })
 
+  it('22 表单数据契约 formData/taskFormData/审批记录 ext（issues/15）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    const r0 = await facade.flow('processDefine/deploy', { content })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const r1 = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: r0.data.processDefineId, operator: 'zhangsan', f_reasonType: '休假', f_amount: 500 })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const instId = r1.data.processInstanceId
+
+    // 实例详情：formData（f_ 前缀 + 去前缀副本）+ name/displayName/version
+    const r2 = await facade.flow('processInstance/detail', { id: instId })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    assert.equal(r2.data.formData?.f_reasonType, '休假', JSON.stringify(r2))
+    assert.equal(r2.data.formData?.reasonType, '休假', JSON.stringify(r2))
+    assert.equal(r2.data.name, 'simple', JSON.stringify(r2))
+    assert.ok(r2.data.displayName && r2.data.version != null, JSON.stringify(r2))
+
+    // 执行任务（tf_ 前缀变量）→ doneList 行 taskFormData + approvalRecord ext
+    const r3 = await facade.flow('processTask/todoList', { operator: 'leader' })
+    const taskId = r3.data.rows[0].id
+    const r4 = await facade.flow('processTask/execute',
+      { processTaskId: taskId, operator: 'leader', tf_approvalComment: '同意' })
+    assert.equal(r4.code, 0, JSON.stringify(r4))
+    const r5 = await facade.flow('processTask/doneList', { operator: 'leader' })
+    assert.equal(r5.data.rows[0].taskFormData?.tf_approvalComment, '同意', JSON.stringify(r5))
+    assert.equal(r5.data.rows[0].taskFormData?.approvalComment, '同意', JSON.stringify(r5))
+    const r6 = await facade.flow('processInstance/approvalRecord', { id: instId })
+    assert.equal(r6.code, 0, JSON.stringify(r6))
+    assert.ok(r6.data.some((row: any) => row.ext != null), JSON.stringify(r6))
+  })
+
   it('16 门面错误路径：未知 action / 缺扩展仓储', async () => {
     const { engine, repo } = setup()
     const facade = new JeeflowFacade(engine, repo)

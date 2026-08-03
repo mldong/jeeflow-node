@@ -520,7 +520,8 @@ export class JeeflowFacade {
     return his.map(t => ({
       taskName: t.taskName, displayName: t.displayName, taskType: t.taskType ?? null,
       performType: t.performType ?? null, taskState: t.taskState, operator: t.actorId ?? '',
-      finishTime: t.finishTime ?? null, variable: t.variables ?? {},
+      finishTime: fmtTime(t.finishTime), variable: t.variables ?? {},
+      ext: t.variables ?? {}, // issues/15：前端读 ext.tf_approvalComment
     }))
   }
 
@@ -573,6 +574,7 @@ export class JeeflowFacade {
       performType: task.performType ?? null, taskState: task.taskState,
       operator: task.actorId ?? '', formKey: task.formKey ?? '',
       taskActorIdList: actors, executable: task.isAllowed(operator),
+      taskFormData: formDataOf(task.variables, 'tf_'), // issues/15
     }
     // taskModel：流程定义中对应节点
     const inst = await this.repo.findInstanceById(task.processInstanceId)
@@ -734,6 +736,7 @@ export class JeeflowFacade {
         createTime: t.createTime, createUser: t.createUser,
         updateTime: t.updateTime, updateUser: t.updateUser,
         taskActorIdList: t.actorIds ?? [],
+        taskFormData: formDataOf(t.variables, 'tf_'), // issues/15
       }
       const ext: Record<string, any> = { ...(t.variables ?? {}) }
       const doing = t.taskState === TaskState.Doing
@@ -742,15 +745,23 @@ export class JeeflowFacade {
       tasks.push(vo)
       if (doing) activeTaskList.push(vo)
     }
-    return {
+    const data: Record<string, any> = {
       id: inst.id, parentId: inst.parentId, processDefineId: inst.defineId,
       state: inst.state, parentNodeName: inst.parentNodeName,
       businessNo: inst.businessNo, operator: inst.operator,
-      variables: inst.variables, createTime: inst.createTime, createUser: inst.createUser,
+      variables: inst.variables,
+      formData: formDataOf(inst.variables, 'f_'), // issues/15
+      createTime: inst.createTime, createUser: inst.createUser,
       jsonObject: graph, // issues/05
       tasks,
       activeTaskList,
     }
+    if (def0) {
+      data.displayName = def0.displayName // issues/15
+      data.name = def0.name
+      data.version = def0.version
+    }
+    return data
   }
 
   /** 流程 JSON 中第一个任务节点 id（issues/05-4 isFirstTaskNode 用） */
@@ -791,6 +802,18 @@ export class JeeflowFacade {
 }
 
 // ── 行转 Map（issues/05-2 列表字段契约 + 05-3 时间格式）─────────────────────
+
+/** issues/15：取 vars 中 prefix 前缀字段，输出「带前缀 + 去前缀副本」（对齐 boot3 getFormData） */
+function formDataOf(vars: Record<string, any> | undefined, prefix: string): Record<string, any> {
+  const out: Record<string, any> = {}
+  for (const [k, v] of Object.entries(vars ?? {})) {
+    if (k.startsWith(prefix)) {
+      out[k] = v
+      out[k.slice(prefix.length)] = v
+    }
+  }
+  return out
+}
 
 /** Date → 'yyyy-MM-dd HH:mm:ss'（null/undefined → null） */
 function fmtTime(v: Date | undefined | null): string | null {
@@ -862,6 +885,7 @@ function taskRowToMap(r: TaskRow): Record<string, any> {
     processDefineName: r.processDefineName, processDefineDisplayName: r.processDefineDisplayName,
     instanceVariable: r.instanceVariable, instanceCreateTime: fmtTime(r.instanceCreateTime),
     ext, instanceExt, version: r.defineVersion,
+    taskFormData: formDataOf(r.variables, 'tf_'), // issues/15
   }
 }
 
