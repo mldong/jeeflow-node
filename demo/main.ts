@@ -193,7 +193,7 @@ async function startFlow(req: any, res: any) {
 // ─── 流程实例 ────────────────────────────────────────────────────────────────────
 
 app.post('/wf/processInstance/page', async (req, res) => {
-  const userId = String(req.body?.operator ?? req.body?.userId ?? 'user1')
+  const userId = String(req.body?.operator ?? 'user1')
   const rows: any[] = []
   for (const i of repo.allInstances()) {
     if (i.createUser !== userId) continue
@@ -246,7 +246,7 @@ app.post('/wf/processInstance/approvalRecord', async (req, res) => {
 // ─── 流程任务 ────────────────────────────────────────────────────────────────────
 
 app.post('/wf/processTask/todoList', async (req, res) => {
-  const userId = String(req.body?.userId ?? req.body?.operator ?? 'user1')
+  const userId = String(req.body?.operator ?? 'user1')
   const rows: any[] = []
   for (const t of repo.allTasks()) {
     if (t.taskState !== TaskState.Doing) continue
@@ -261,7 +261,7 @@ app.post('/wf/processTask/todoList', async (req, res) => {
 })
 
 app.post('/wf/processTask/doneList', async (req, res) => {
-  const userId = String(req.body?.userId ?? req.body?.operator ?? 'user1')
+  const userId = String(req.body?.operator ?? 'user1')
   const rows: any[] = []
   for (const t of repo.allTasks()) {
     if (t.taskState !== TaskState.Done) continue
