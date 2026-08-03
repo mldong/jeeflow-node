@@ -763,4 +763,34 @@ describe('jeeflow compliance tests', () => {
     // ⑤ 流程结束
     assert.equal(inst?.state, InstanceState.Done, `⑤ state: ${inst?.state}`)
   })
+
+  it('24 candidatePage 双源候选（issues/16 GlobalCandidateHandler 语义）', async () => {
+    const repo = new MemoryRepository()
+    const idGen = { nextId() { return Date.now() * 1000 + Math.floor(Math.random() * 1000) } }
+    const exprEval: ExpressionEvaluator = {
+      async eval() { return false },
+    }
+    const engine = new EngineImpl(repo, undefined, idGen, exprEval)
+    const facade = new JeeflowFacade(engine, repo, undefined)
+    facade.setOrgProvider({
+      async findDeptLeaders() { return [] },
+      async findDeptMainLeaders() { return [] },
+      async findByRole(roleCode: string) { return roleCode === 'finance' ? ['finA', 'finB'] : [] },
+    })
+
+    const r0 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '12-candidate-page.json', 'utf-8') })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const def = await repo.findDefineByName('candidate-flow')
+    assert.ok(def, 'define should exist')
+
+    // 直接启动（不自动完成 apply）→ apply 任务 → candidatePage 查 review 候选
+    const inst = await engine.startProcessInstanceById(def!.id, 'user1')
+    const doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing[0].taskName, 'apply')
+    const r = await facade.flow('processTask/candidatePage', { processTaskId: doing[0].id })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    const userIds = (r.data.rows as Array<{ userId: string }>).map(x => x.userId).sort()
+    assert.deepEqual(userIds, ['finA', 'finB', 'userA', 'userB'],
+      `候选应为 candidateUsers(userA/userB) + candidateGroups(finA/finB): ${userIds}`)
+  })
 })

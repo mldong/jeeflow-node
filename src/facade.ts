@@ -8,7 +8,7 @@ import {
   CcInstanceRow, DefineRow, InstanceRow, InstanceState, ProcessDefine, ProcessDesign,
   ProcessDesignHis, ProcessSurrogate, TaskRow, TaskState,
 } from './model.js'
-import type { ProcessExtRepository, ProcessRepository, QueryCondition } from './spi.js'
+import type { OrgUserProvider, ProcessExtRepository, ProcessRepository, QueryCondition } from './spi.js'
 import type { EngineImpl } from './engine.js'
 
 // submitType 枚举（对齐 boot3）
@@ -24,6 +24,7 @@ export type UserSearch = (query: Record<string, any>) => Promise<[Record<string,
 
 export class JeeflowFacade {
   private userSearch?: UserSearch
+  private orgProv?: OrgUserProvider
 
   constructor(
     private readonly engine: EngineImpl,
@@ -34,6 +35,12 @@ export class JeeflowFacade {
   // 注入用户搜索钩子（candidatePage 无模型候选时的用户分页搜索）
   setUserSearch(fn: UserSearch): this {
     this.userSearch = fn
+    return this
+  }
+
+  // 注入组织用户提供者（candidatePage candidateGroups 角色取人，v1.6.0）
+  setOrgProvider(orgProv: OrgUserProvider): this {
+    this.orgProv = orgProv
     return this
   }
 
@@ -617,13 +624,13 @@ export class JeeflowFacade {
     if (!task) throw new Error('任务不存在')
     const inst = await this.repo.findInstanceById(task.processInstanceId)
     if (!inst) throw new Error('流程实例不存在')
-    // 模型候选解析：后继任务节点的 candidateUsers 配置
+    // 模型候选解析：后继任务节点的 candidateUsers / candidateGroups 配置
     let candidates: string[] = []
     const def = await this.repo.findDefineById(inst.defineId)
     if (def) {
       try {
         const flow = JSON.parse(toStr(def.content))
-        candidates = this.nextTaskCandidates(flow, task.taskName)
+        candidates = await this.nextTaskCandidates(flow, task.taskName)
       } catch { /* ignore */ }
     }
     if (candidates.length > 0) {
@@ -636,10 +643,10 @@ export class JeeflowFacade {
     return { rows, recordCount: total }
   }
 
-  private nextTaskCandidates(flow: any, taskName: string): string[] {
+  private async nextTaskCandidates(flow: any, taskName: string): Promise<string[]> {
     const result: string[] = []
     const visited = new Set<string>()
-    const collect = (node: any) => {
+    const collect = async (node: any) => {
       const v = node.properties?.candidateUsers
       if (v) {
         for (const s of String(v).split(',')) {
@@ -647,8 +654,20 @@ export class JeeflowFacade {
           if (t && !result.includes(t)) result.push(t)
         }
       }
+      // candidateGroups：按角色取人（v1.6.0，对齐 boot4 GlobalCandidateHandler）
+      const g = node.properties?.candidateGroups
+      if (g && this.orgProv) {
+        for (const rc of String(g).split(',')) {
+          const role = rc.trim()
+          if (!role) continue
+          const ids = await this.orgProv.findByRole(role)
+          for (const uid of ids ?? []) {
+            if (uid && !result.includes(uid)) result.push(uid)
+          }
+        }
+      }
     }
-    const walk = (nodeId: string) => {
+    const walk = async (nodeId: string) => {
       if (visited.has(nodeId)) return
       visited.add(nodeId)
       for (const e of flow.edges ?? []) {
@@ -656,15 +675,15 @@ export class JeeflowFacade {
         const target = (flow.nodes ?? []).find((n: any) => n.id === e.targetNodeId)
         if (!target) continue
         if (target.type === 'snaker:task' || target.type === 'snaker:custom') {
-          collect(target)
+          await collect(target)
           continue
         }
         if (['snaker:fork', 'snaker:join', 'snaker:decision'].includes(target.type)) {
-          walk(target.id)
+          await walk(target.id)
         }
       }
     }
-    walk(taskName)
+    await walk(taskName)
     return result
   }
 
