@@ -10,6 +10,7 @@ import {
 } from './model.js'
 import type { OrgUserProvider, ProcessExtRepository, ProcessRepository, QueryCondition } from './spi.js'
 import type { EngineImpl } from './engine.js'
+import { KeyNextNodeOperator, KeyProcessStartNextNodeOperator } from './engine.js'
 
 // submitType 枚举（对齐 boot3）
 const SUBMIT_APPLY = 0
@@ -149,6 +150,11 @@ export class JeeflowFacade {
     for (const task of doing) {
       await this.repo.addTaskActor(task.id, [operator])
       flowArgs.submitType = SUBMIT_APPLY
+      // 对齐 boot3：f_nextNodeOperator（发起时预指派人）→ tf_nextNodeOperator（引擎执行参数）
+      const startNextOp = flowArgs[KeyProcessStartNextNodeOperator]
+      if (startNextOp != null && String(startNextOp) !== '') {
+        flowArgs[KeyNextNodeOperator] = startNextOp
+      }
       await this.engine.executeProcessTask(task.id, operator, flowArgs)
     }
     return { processInstanceId: inst.id }

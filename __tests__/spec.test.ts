@@ -793,4 +793,31 @@ describe('jeeflow compliance tests', () => {
     assert.deepEqual(userIds, ['finA', 'finB', 'userA', 'userB'],
       `候选应为 candidateUsers(userA/userB) + candidateGroups(finA/finB): ${userIds}`)
   })
+
+  it('25 startAndExecute 预指派人 f_nextNodeOperator（对齐 boot3）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, undefined)
+    const r0 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const def = await repo.findDefineByName('simple')
+    assert.ok(def)
+
+    // 预指派人：f_nextNodeOperator=userA → task1 参与者 = userA
+    const r1 = await facade.flow('processInstance/startAndExecute', {
+      processDefineId: def!.id, operator: 'user1', f_nextNodeOperator: 'userA',
+    })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const doing1 = await repo.findDoingTasks(r1.data.processInstanceId)
+    assert.equal(doing1[0].taskName, 'task1')
+    assert.deepEqual(doing1[0].actorIds, ['userA'], `预指派后 task1 参与者应为 userA: ${doing1[0].actorIds}`)
+
+    // 未指定 → task1 参与者 = leader
+    const r2 = await facade.flow('processInstance/startAndExecute', {
+      processDefineId: def!.id, operator: 'user1',
+    })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    const doing2 = await repo.findDoingTasks(r2.data.processInstanceId)
+    assert.equal(doing2[0].taskName, 'task1')
+    assert.deepEqual(doing2[0].actorIds, ['leader'], `未指定时 task1 参与者应为 leader: ${doing2[0].actorIds}`)
+  })
 })
