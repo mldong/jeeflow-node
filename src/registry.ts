@@ -2,7 +2,8 @@ import type { FlowNode, ProcessInstance } from './model.js'
 
 /** 参与者指派处理器接口——对标 Java AssignmentHandler */
 export interface IAssignmentHandler {
-  assign(node: FlowNode, inst: ProcessInstance): string[] | Promise<string[]>
+  /** 返回参与者列表（operator: 当前任务操作人，issues/16 对齐 Java Execution.getOperator） */
+  assign(node: FlowNode, inst: ProcessInstance, operator: string): string[] | Promise<string[]>
 }
 
 /** 决策处理器接口——对标 Java DecisionHandler */

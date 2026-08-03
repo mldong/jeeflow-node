@@ -2,6 +2,7 @@ import { describe, it } from 'node:test'
 import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { EngineImpl } from '../src/engine.js'
+import { HandlerRegistry, registerBuiltinAssignments } from '../src/index.js'
 import { MemoryRepository } from '../src/memory.js'
 import { MemoryExtRepository } from '../src/memory-ext.js'
 import { JeeflowFacade } from '../src/facade.js'
@@ -703,5 +704,63 @@ describe('jeeflow compliance tests', () => {
     inst = await engine.executeProcessTask(doing[0].id, 'flow.admin')
     doing = await repo.findDoingTasks(inst.id)
     assert.equal(doing[0].taskName, 'task2', 'flow.admin 应放行执行')
+  })
+
+  it('23 内置参与者 handler 全链路（issues/16）', async () => {
+    const repo = new MemoryRepository()
+    const userProv: UserProvider = {
+      async getUser(userId) { return { userId, realName: '用户' + userId, deptId: 'D01', deptName: '测试部门', postId: 'P01', postName: '测试岗位' } },
+    }
+    const orgProv = {
+      async findDeptLeaders(deptId: string) { return deptId === 'D01' ? ['leader1', 'leader2'] : [] },
+      async findDeptMainLeaders(deptId: string) { return deptId === 'D01' ? ['boss1'] : [] },
+      async findByRole(roleCode: string) { return roleCode === 'task4' ? ['roleA', 'roleB'] : [] },
+    }
+    const registry = new HandlerRegistry()
+    registerBuiltinAssignments(registry, userProv, orgProv)
+    const idGen = { nextId() { return Date.now() * 1000 + Math.floor(Math.random() * 1000) } }
+    const exprEval: ExpressionEvaluator = {
+      async eval(expr, vars) {
+        const amt = Number(vars.amount ?? 0)
+        if (expr === 'amount > 1000') return amt > 1000
+        if (expr === 'amount <= 1000') return amt <= 1000
+        return false
+      },
+    }
+    const engine = new EngineImpl(repo, userProv, idGen, exprEval)
+    engine.setRegistry(registry)
+    const def = loadFlow(repo, '11-assignment-handler.json')
+
+    // ① FormFieldAssigneeHandler：节点 task1 → args.task1 = userA,userB
+    let inst = await engine.startProcessInstanceById(def.id, 'user1', { task1: 'userA,userB' })
+    let doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing[0].taskName, 'task1')
+    assert.deepEqual([...doing[0].actorIds].sort(), ['userA', 'userB'], `① formField actors: ${doing[0].actorIds}`)
+    await repo.addTaskActor(doing[0].id, doing[0].actorIds)
+    await engine.executeProcessTask(doing[0].id, 'userA')
+
+    // ② OperatorAssignmentHandler：task2 → 发起人 user1
+    doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing[0].taskName, 'task2')
+    assert.deepEqual(doing[0].actorIds, ['user1'], `② operator actors: ${doing[0].actorIds}`)
+    await repo.addTaskActor(doing[0].id, doing[0].actorIds)
+    await engine.executeProcessTask(doing[0].id, 'user1')
+
+    // ③ DeptLeaderAssignmentHandler：task3 → user1 部门 D01 领导
+    doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing[0].taskName, 'task3')
+    assert.deepEqual([...doing[0].actorIds].sort(), ['leader1', 'leader2'], `③ deptLeader actors: ${doing[0].actorIds}`)
+    await repo.addTaskActor(doing[0].id, doing[0].actorIds)
+    await engine.executeProcessTask(doing[0].id, 'leader1')
+
+    // ④ TaskRoleAssigneeHandler：task4 → roleCode=task4 → roleA,roleB
+    doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing[0].taskName, 'task4')
+    assert.deepEqual([...doing[0].actorIds].sort(), ['roleA', 'roleB'], `④ taskRole actors: ${doing[0].actorIds}`)
+    await repo.addTaskActor(doing[0].id, doing[0].actorIds)
+    inst = await engine.executeProcessTask(doing[0].id, 'roleA')
+
+    // ⑤ 流程结束
+    assert.equal(inst?.state, InstanceState.Done, `⑤ state: ${inst?.state}`)
   })
 })

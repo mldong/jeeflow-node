@@ -49,6 +49,15 @@ export interface UserProvider {
   getUser(userId: string): Promise<UserInfo | null>
 }
 
+export interface OrgUserProvider {
+  /** 部门领导（deptId → 领导 userId 列表） */
+  findDeptLeaders(deptId: string): Promise<string[]>
+  /** 部门分管领导（deptId → 分管领导 userId 列表） */
+  findDeptMainLeaders(deptId: string): Promise<string[]>
+  /** 按角色取人（roleCode → userId 列表） */
+  findByRole(roleCode: string): Promise<string[]>
+}
+
 export interface IDGenerator {
   nextId(): number
 }

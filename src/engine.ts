@@ -311,7 +311,7 @@ export class EngineImpl implements Engine {
   }
 
   private async createTask(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>): Promise<void> {
-    const actors = await this.resolveActors(node, inst, vars)
+    const actors = await this.resolveActors(node, inst, operator, vars)
     if (!actors.length) return
     const performType = parseInt(String(node.properties?.performType ?? '0'))
     const ct = node.properties?.countersignType as string | undefined
@@ -344,13 +344,13 @@ export class EngineImpl implements Engine {
     await this.repo.saveTask(nt)
   }
 
-  private async resolveActors(node: FlowNode, inst: ProcessInstance, vars: Record<string, any>): Promise<string[]> {
+  private async resolveActors(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>): Promise<string[]> {
     // 1a. Registry 按名称解析（推荐）
     if (this.registry) {
       const handlerName = (node.properties?.assignmentHandler as string) ?? ''
       if (handlerName) {
         const h = this.registry.resolveAssignment(handlerName)
-        if (h) return await h.assign(node, inst)
+        if (h) return await h.assign(node, inst, operator)
       }
     }
     // 1b. Extensions 兼容
