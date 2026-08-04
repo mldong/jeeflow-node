@@ -42,9 +42,12 @@ describe('HandlerRegistry 清单（v1.4.0）', () => {
       { displayName: '老板审批', order: 1 })
 
     const list = r.listHandlers('AssignmentHandler')
-    assert.equal(list.length, 2)
-    assert.equal(list[0].name, 'com.example.BossHandler')
-    assert.equal(list[0].displayName, '老板审批')
+    // 内置 7 个通用 handler（v1.6.0 issues/16）+ 2 个自定义
+    assert.equal(list.length, 9)
+    assert.equal(list[0].name, 'com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler')
+    assert.equal(list[0].displayName, '流程发起人')
+    assert.equal(list[1].name, 'com.example.BossHandler')
+    assert.equal(list[1].displayName, '老板审批')
     // 未带元数据的注册也能列出（name 兜底）
     r.registerDecision('com.example.Decider', { decide: () => 'e1' })
     const decisions = r.listHandlers('DecisionHandler')
@@ -53,9 +56,9 @@ describe('HandlerRegistry 清单（v1.4.0）', () => {
     assert.deepEqual(r.listHandlersGroup('AssignmentHandler', 'pre'), [])
   })
 
-  it('空注册表', () => {
+  it('空注册表（构造即内置 7 个通用 handler）', () => {
     const r = new HandlerRegistry()
-    assert.deepEqual(r.listHandlers('AssignmentHandler'), [])
+    assert.equal(r.listHandlers('AssignmentHandler').length, 7)
     assert.deepEqual(r.listHandlerNames(), [])
   })
 })
