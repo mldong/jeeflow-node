@@ -97,6 +97,11 @@ export class EngineImpl implements Engine {
 
   async executeProcessTask(taskId: number, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
     const { task, inst } = await this.loadAndCheck(taskId, operator)
+    // issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）——
+    // 被拒值无法经流程变量落到下游节点写入，上游只读声明不可被绕过
+    const def = await this.repo.findDefineById(inst.defineId)
+    const flow: FlowModel = JSON.parse(typeof def!.content === 'string' ? def!.content : new TextDecoder().decode(def!.content as Uint8Array))
+    args = filterFieldByPerm(args, findNode(flow, task.taskName))
     const vars = { ...inst.variables, ...task.variables, ...args }
     await this.addUserInfo(operator, vars)
 
@@ -109,8 +114,6 @@ export class EngineImpl implements Engine {
     syncTaskToAggregate(inst, task)
     await this.fireEvent({ type: EventType.TaskComplete, instanceId: inst.id, taskId: task.id, nodeId: task.taskName, operator })
 
-    const def = await this.repo.findDefineById(inst.defineId)
-    const flow: FlowModel = JSON.parse(typeof def!.content === 'string' ? def!.content : new TextDecoder().decode(def!.content as Uint8Array))
     inst.variables = vars
     await this.repo.updateInstance(inst)
 
@@ -468,4 +471,27 @@ function isTruthy(v: any): boolean {
   if (typeof v === 'string') return v !== '' && v !== 'false'
   if (typeof v === 'number') return v !== 0
   return v != null
+}
+
+
+/** 办理提交的 f_ 字段按任务节点 field 权限过滤（issues/26）——
+ *  任务节点 properties.field 声明 PERMISSION_f_{全名}（前端约定，优先）或
+ *  PERMISSION_{去前缀名}（兼容）的字段，值非 EDIT(2)（只读 1/隐藏 3 等）→ 剔除不入变量。
+ *  键格式双兼容（issues/25），与 persist 拦截器 isEditable 同契约。 */
+function filterFieldByPerm(args: Record<string, any>, node: FlowNode | undefined): Record<string, any> {
+  if (Object.keys(args).length === 0 || !node || (node.type !== TypeTask && node.type !== TypeCustom)) return args
+  const field = node.properties?.field
+  if (!field || typeof field !== 'object' || Object.keys(field as object).length === 0) return args
+  const fieldPerm = field as Record<string, unknown>
+  const out: Record<string, any> = {}
+  for (const [k, v] of Object.entries(args)) {
+    if (k.startsWith('f_') && k.length > 2) {
+      const name = k.slice(2)
+      let perm = fieldPerm[`PERMISSION_f_${name}`]
+      if (perm == null) perm = fieldPerm[`PERMISSION_${name}`]
+      if (perm != null && Number(perm) !== 2) continue // 只读/隐藏：剔除（不入变量）
+    }
+    out[k] = v
+  }
+  return out
 }

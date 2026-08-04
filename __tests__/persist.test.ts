@@ -361,3 +361,60 @@ describe('1.8.0 SYNC 同步演进', () => {
     db.close()
   })
 })
+
+describe('1.8.2 issues/26 字段权限绕过', () => {
+  it('⑧ 办理提交被拒字段不入变量——下游无权限节点不可绕过上游只读', async () => {
+    const repo = new MemoryRepository()
+    const db = new DatabaseSync(':memory:')
+    db.exec(`CREATE TABLE biz_perm3 (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT, amount REAL,
+      apply INTEGER, approve1 INTEGER, approve2 INTEGER, finish INTEGER,
+      process_instance_id INTEGER,
+      create_user TEXT, is_deleted INTEGER
+    )`)
+    const writer = new SqliteDynamicTableWriter(db)
+    const { engine } = setupEngine(repo, writer)
+    const content = JSON.stringify({
+      name: 'perm3', displayName: '权限绕过验证', type: 'approval',
+      relTableName: 'biz_perm3', persistMode: 'SYNC',
+      nodes: [
+        { id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } },
+        { id: 'apply', type: 'snaker:task', properties: { assignee: 'applicant', taskType: 0, performType: 0 }, text: { value: '发起申请' } },
+        { id: 'approve1', type: 'snaker:task', properties: { assignee: 'leader1', taskType: 0, performType: 0, field: { PERMISSION_f_title: 1, PERMISSION_amount: 2 } }, text: { value: '审批一' } },
+        { id: 'approve2', type: 'snaker:task', properties: { assignee: 'leader2', taskType: 0, performType: 0 }, text: { value: '审批二' } },
+        { id: 'finish', type: 'snaker:end', properties: {}, text: { value: '结束' } },
+      ],
+      edges: [
+        { id: 'e0', sourceNodeId: 'start', targetNodeId: 'apply', properties: {} },
+        { id: 'e1', sourceNodeId: 'apply', targetNodeId: 'approve1', properties: {} },
+        { id: 'e2', sourceNodeId: 'approve1', targetNodeId: 'approve2', properties: {} },
+        { id: 'e3', sourceNodeId: 'approve2', targetNodeId: 'finish', properties: {} },
+      ],
+    })
+    const def: ProcessDefine = { id: 0, name: 'perm3', displayName: 'perm3', type: 'approval', state: 1, content, version: 1, createTime: new Date(), updateTime: new Date(), createUser: '', updateUser: '' }
+    repo.addDefine(def)
+
+    const inst = await engine.startProcessInstanceById(def.id, 'user1', { f_title: '原始标题', f_amount: 800, u_deptId: 'D01' })
+    const completeNamed = async (name: string, actor: string, args: Record<string, any>) => {
+      const doing = await repo.findDoingTasks(inst.id)
+      const d = doing.find(x => x.taskName === name)
+      assert.ok(d, `task ${name} not found`)
+      await repo.addTaskActor(d.id, [actor])
+      await engine.executeProcessTask(d.id, actor, args)
+    }
+    await completeNamed('apply', 'user1', { [KeySubmitType]: 0 })
+    // approve1 只读 title，提交 TRY_HACK → 引擎入口过滤 → 不入变量 → 不落库
+    await completeNamed('approve1', 'leader1', { [KeySubmitType]: 1, f_title: 'TRY_HACK' })
+    // approve2 无权限声明——变量无 TRY_HACK，title 保持原值
+    await completeNamed('approve2', 'leader2', { [KeySubmitType]: 1, f_amount: 999 })
+
+    const row = db.prepare('SELECT title, amount, approve1, approve2, finish FROM biz_perm3').get() as any
+    assert.equal(row.title, '原始标题')          // 只读被拒值不应落库（下游不可绕过）
+    assert.equal(row.amount, 999)
+    assert.equal(row.approve1, 10)
+    assert.equal(row.approve2, 10)
+    assert.equal(row.finish, 20)
+    db.close()
+  })
+})
