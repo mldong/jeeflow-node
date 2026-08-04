@@ -363,9 +363,15 @@ export class PersistPostInterceptor implements FlowInterceptor {
   }
 
   /** 字段可编辑判定：无声明或 EDIT(2) 可更新；READ_ONLY(1)/HIDDEN(3) 不更新 */
+  /** 字段可编辑判定：无声明或 EDIT(2) 可更新；READ_ONLY(1)/HIDDEN(3) 不更新。
+   *  键格式兼容两种（issues/25）：
+   *  - PERMISSION_f_{表单字段全名}——前端 vben5-wf 设计器约定（优先）
+   *  - PERMISSION_{去前缀名}——后端 1.8.0 首版格式（兼容） */
   private isEditable(fieldPerm: Record<string, unknown> | null, fieldName: string): boolean {
     if (!fieldPerm) return true
-    const perm = fieldPerm[`PERMISSION_${fieldName}`]
+    const prefix = this.fieldPrefix || 'f_'
+    let perm = fieldPerm[`PERMISSION_${prefix}${fieldName}`]
+    if (perm == null) perm = fieldPerm[`PERMISSION_${fieldName}`]
     if (perm == null) return true
     return Number(perm) === PermEdit
   }

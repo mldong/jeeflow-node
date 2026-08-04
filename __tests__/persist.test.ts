@@ -303,7 +303,7 @@ describe('1.8.0 SYNC 同步演进', () => {
   function loadSyncFlow(repo: MemoryRepository): ProcessDefine {
     let content = readFileSync(flowDir + '01-simple.json', 'utf-8')
     content = content.replace('"type": "approval"', '"type": "approval", "relTableName": "biz_sync", "persistMode": "SYNC"')
-    content = content.replace('"assignee": "leader"', '"assignee": "leader", "field": {"PERMISSION_title": 1, "PERMISSION_amount": 2}')
+    content = content.replace('"assignee": "leader"', '"assignee": "leader", "field": {"PERMISSION_f_title": 1, "PERMISSION_amount": 2}')
     content = content.replaceAll('"id": "end"', '"id": "finish"')
     content = content.replaceAll('"targetNodeId": "end"', '"targetNodeId": "finish"')
     const def: ProcessDefine = { id: 0, name: 'simple', displayName: '01-simple.json', type: 'approval', state: 1, content, version: 1, createTime: new Date(), updateTime: new Date(), createUser: '', updateUser: '' }
