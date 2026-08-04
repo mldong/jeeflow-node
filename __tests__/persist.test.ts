@@ -418,3 +418,101 @@ describe('1.8.2 issues/26 字段权限绕过', () => {
     db.close()
   })
 })
+
+describe('1.8.4 issues/34 定义级拦截器 + 30/31 facade', () => {
+  it('⑨ 定义级拦截器：postInterceptors 声明按名解析，未声明流程不触发', async () => {
+    const repo = new MemoryRepository()
+    const db = new DatabaseSync(':memory:')
+    db.exec(`CREATE TABLE biz_decl (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT,
+      process_instance_id INTEGER, is_deleted INTEGER
+    )`)
+    const writer = new SqliteDynamicTableWriter(db)
+    const ic = new PersistPostInterceptor(writer, async id => repo.findDefineById(id))
+    const userProv: UserProvider = { async getUser(userId) { return { userId, realName: '用户' + userId, deptId: 'D01' } } }
+    const engine = new EngineImpl(repo, userProv, { nextId() { return Date.now() } }, { async eval() { return false } })
+    // 注册表挂载（定义级）
+    engine.setExtensions({ interceptors: [], interceptorRegistry: { persist: ic } })
+
+    const loadFlow = (name: string, table: string, declared: string): ProcessDefine => ({
+      id: 0, name, displayName: name, type: 'approval', state: 1, version: 1,
+      content: JSON.stringify({
+        name, displayName: name, type: 'approval', relTableName: table, persistMode: 'SYNC',
+        postInterceptors: declared,
+        nodes: [
+          { id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } },
+          { id: 'finish', type: 'snaker:end', properties: {}, text: { value: '结束' } },
+        ],
+        edges: [{ id: 'e0', sourceNodeId: 'start', targetNodeId: 'finish', properties: {} }],
+      }),
+      createTime: new Date(), updateTime: new Date(), createUser: '', updateUser: '',
+    })
+    const d1 = loadFlow('decl1', 'biz_decl', 'persist')
+    repo.addDefine(d1)
+    await engine.startProcessInstanceById(d1.id, 'user1', { f_title: '声明流程' })
+    const n1 = (db.prepare('SELECT COUNT(1) AS c FROM biz_decl').get() as any).c
+    assert.equal(n1, 1)
+    const d2 = loadFlow('decl2', 'biz_decl', '')
+    repo.addDefine(d2)
+    await engine.startProcessInstanceById(d2.id, 'user2', { f_title: '未声明流程' })
+    const n2 = (db.prepare('SELECT COUNT(1) AS c FROM biz_decl').get() as any).c
+    assert.equal(n2, 1, '未声明拦截器的流程不应落库')
+    db.close()
+  })
+
+  it('⑩ facade 顶层 JSON 保存 + listByType + bizData', async () => {
+    const { JeeflowFacade } = await import('../src/index.js')
+    const repo = new MemoryRepository()
+    // 内存扩展仓储（mock，避免测试依赖真实数据库 adapter）
+    const designs = new Map<number, any>()
+    const hisMap = new Map<number, any[]>()
+    let dseq = 1
+    const ext: any = {
+      async findDesignById(id) { return designs.get(id) ?? null },
+      async saveDesign(d) { if (!d.id) d.id = dseq++; designs.set(d.id, d) },
+      async updateDesign(d) { designs.set(d.id, d) },
+      async removeDesign(id) { designs.delete(id); hisMap.delete(id) },
+      async pageDesigns() { return [[...designs.values()], designs.size] },
+      async saveDesignHis(h) { hisMap.set(h.processDesignId, [h, ...(hisMap.get(h.processDesignId) ?? [])]) },
+      async listDesignHis(id) { return hisMap.get(id) ?? [] },
+      async findSurrogateById() { return null }, async saveSurrogate() {}, async updateSurrogate() {},
+      async removeSurrogate() {}, async pageSurrogates() { return [[], 0] }, async getSurrogate() { return null },
+    }
+    const userProv: UserProvider = { async getUser(userId) { return { userId, realName: '用户' + userId, deptId: 'D01' } } }
+    const engine = new EngineImpl(repo, userProv, { nextId() { return Date.now() } }, { async eval() { return false } })
+    const facade = new JeeflowFacade(engine, repo, ext)
+    ext.saveDesign({ id: 1, name: 'old', displayName: '旧名', type: 'approval', icon: '', isDeployed: 0, remark: '', createTime: new Date(), createUser: '', updateTime: new Date(), updateUser: '' })
+
+    // 顶层 JSON 保存（无 content）——issue 31
+    const r = await facade.flow('processDesign/updateDefine', {
+      processDesignId: 1, operator: 'user1',
+      name: 'topjson', displayName: '顶层JSON', type: 'approval',
+      relTableName: 'biz_top', nodes: [], edges: [],
+    })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    const his = await ext.listDesignHis(1)
+    assert.ok(his.length > 0 && his[0].content.includes('"nodes"'))
+
+    // listByType——issue 30
+    const lt = await facade.flow('processDesign/listByType', {})
+    assert.equal(lt.code, 0, JSON.stringify(lt))
+    assert.ok(lt.data.approval?.some((x: any) => x.name === 'topjson'))
+
+    // bizData 未注册 → 报错；注册后回显
+    const saveFlow = await facade.flow('processDesign/updateDefine', {
+      processDesignId: 1, operator: 'user1',
+      content: readFileSync(flowDir + '01-simple.json', 'utf-8').replace('"type": "approval"', '"type": "approval", "relTableName": "biz_top"'),
+    })
+    assert.equal(saveFlow.code, 0, JSON.stringify(saveFlow))
+    const dep = await facade.flow('processDesign/deploy', { id: 1, operator: 'user1' })
+    assert.equal(dep.code, 0, JSON.stringify(dep))
+    const sr = await facade.flow('processInstance/startAndExecute', { processDefineId: dep.data.processDefineId, operator: 'user1', f_title: 'x' })
+    assert.equal(sr.code, 0, JSON.stringify(sr))
+    const bd = await facade.flow('processInstance/bizData', { processInstanceId: sr.data.processInstanceId })
+    assert.ok(bd.code !== 0 && String(bd.msg).includes('setMetaReader'))
+    facade.setMetaReader({ readByProcessInstance(t: string, pid: unknown) { return { tableName: t, title: '业务数据' } } })
+    const bd2 = await facade.flow('processInstance/bizData', { processInstanceId: sr.data.processInstanceId })
+    assert.equal(bd2.code, 0, JSON.stringify(bd2))
+    assert.equal(bd2.data.tableName, 'biz_top')
+  })
+})

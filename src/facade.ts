@@ -27,11 +27,19 @@ export class JeeflowFacade {
   private userSearch?: UserSearch
   private orgProv?: OrgUserProvider
 
+  private metaReader?: { readByProcessInstance(tableName: string, processInstanceId: unknown): unknown }
+
   constructor(
     private readonly engine: EngineImpl,
     private readonly repo: ProcessRepository,
     private readonly extRepo?: ProcessExtRepository,
   ) {}
+
+  /** 注入业务数据读取器（issue 30）：需有 readByProcessInstance(tableName, processInstanceId) */
+  setMetaReader(reader: { readByProcessInstance(tableName: string, processInstanceId: unknown): unknown }): this {
+    this.metaReader = reader
+    return this
+  }
 
   // 注入用户搜索钩子（candidatePage 无模型候选时的用户分页搜索）
   setUserSearch(fn: UserSearch): this {
@@ -71,9 +79,9 @@ export class JeeflowFacade {
       case 'processDefine/redeploy':
         return this.redeploy(args)
       case 'processDefine/remove':
-        return this.repo.removeDefine(toId(args.id))
+        return this.defineRemove(args)
       case 'processDefine/upAndDown':
-        return this.repo.updateDefineState(toId(args.id), toInt(args.state))
+        return this.defineUpAndDown(args)
       case 'processInstance/page':
         return this.instancePage(args)
       case 'processInstance/detail':
@@ -97,7 +105,11 @@ export class JeeflowFacade {
       case 'processDesign/updateDefine':
         return this.designUpdateDefine(args)
       case 'processDesign/remove':
-        return this.ext().removeDesign(toId(args.id))
+        return this.designRemove(args)
+      case 'processDesign/listByType':
+        return this.designListByType(args)
+      case 'processInstance/bizData':
+        return this.bizData(args)
       case 'processSurrogate/page':
         return this.surrogatePage(args)
       case 'processSurrogate/save':
@@ -298,8 +310,17 @@ export class JeeflowFacade {
     const designId = toId(args.processDesignId)
     const design = await ext.findDesignById(designId)
     if (!design) throw new Error('流程设计不存在')
-    if (args.content == null) throw new Error('content 缺失')
-    const content = toStr(args.content)
+    // issues/31：兼容 boot3 顶层 JSON（无 content 字段）——非保留字段序列化为内容快照
+    let content = args.content
+    if (content == null) {
+      const copy: Record<string, any> = {}
+      for (const [k, v] of Object.entries(args)) {
+        if (k !== 'processDesignId' && k !== 'operator') copy[k] = v
+      }
+      if (Object.keys(copy).length === 0) throw new Error('content 缺失')
+      content = JSON.stringify(copy)
+    }
+    content = toStr(content)
     // 与最新一条相同则不重复入库（对齐 boot3 updateDefine）
     const hisList = await ext.listDesignHis(designId)
     if (hisList.length === 0 || toStr(hisList[0].content) !== content) {
@@ -319,6 +340,86 @@ export class JeeflowFacade {
     design.updateUser = String(args.operator ?? 'system')
     await ext.updateDesign(design)
     return {}
+  }
+
+  /** 删除设计稿（issues/28：兼容 {ids} 批量与单 {id}） */
+  private async designRemove(args: Record<string, any>): Promise<Record<string, any>> {
+    const ext = this.ext()
+    if (Array.isArray(args.ids)) {
+      for (const id of args.ids) await ext.removeDesign(toId(id))
+    } else {
+      await ext.removeDesign(toId(args.id))
+    }
+    return {}
+  }
+
+  /** 删除定义（issues/28：兼容 {ids} 批量与单 {id}） */
+  private async defineRemove(args: Record<string, any>): Promise<Record<string, any>> {
+    if (Array.isArray(args.ids)) {
+      for (const id of args.ids) await this.repo.removeDefine(toId(id))
+    } else {
+      await this.repo.removeDefine(toId(args.id))
+    }
+    return {}
+  }
+
+  /** 启用/停用（issues/28：兼容 {ids, opType} 批量；opType/state 二选一） */
+  private async defineUpAndDown(args: Record<string, any>): Promise<Record<string, any>> {
+    const state = toInt(args.opType ?? args.state)
+    if (Array.isArray(args.ids)) {
+      for (const id of args.ids) await this.repo.updateDefineState(toId(id), state)
+    } else {
+      await this.repo.updateDefineState(toId(args.id), state)
+    }
+    return {}
+  }
+
+  /** 按类型分组列出流程设计（issue 30，对齐 Java issues/28）：不依赖框架字典 */
+  private async designListByType(args: Record<string, any>): Promise<Record<string, any>> {
+    const ext = this.ext()
+    const pageNum = args.pageNum != null ? toInt(args.pageNum) : 1
+    const pageSize = args.pageSize != null ? toInt(args.pageSize) : 10000
+    const [rows] = await ext.pageDesigns(pageNum, pageSize, [])
+    // 每 name 最新 define（version 最大）
+    const { rows: defRows } = await this.repo.pageDefines(1, 10000, [])
+    const latestByName = new Map<string, any>()
+    for (const r of defRows) {
+      const prev = latestByName.get(r.name)
+      if (!prev || r.version > prev.version) latestByName.set(r.name, r)
+    }
+    const groups: Record<string, any[]> = {}
+    for (const d of rows) {
+      const key = d.type || ''
+      ;(groups[key] ??= []).push({
+        processDesignId: d.id,
+        name: d.name,
+        displayName: d.displayName,
+        icon: d.icon,
+        remark: d.remark,
+        processDefineId: latestByName.get(d.name)?.id ?? null,
+        processDefineState: latestByName.get(d.name)?.state ?? null,
+        jsonObject: this.parseGraph((await ext.listDesignHis(d.id))[0]?.content ?? ''),
+      })
+    }
+    return groups
+  }
+
+  /** 按流程实例回显业务数据（issue 30，对齐 Java issues/28）：metaReader 注入式，未注入清晰报错 */
+  private async bizData(args: Record<string, any>): Promise<Record<string, any>> {
+    const instanceId = toId(args.processInstanceId ?? args.id)
+    const inst = await this.repo.findInstanceById(instanceId)
+    if (!inst) throw new Error('流程实例不存在')
+    const def = await this.repo.findDefineById(inst.defineId)
+    if (!def) throw new Error('流程定义不存在')
+    const content = typeof def.content === 'string' ? def.content : new TextDecoder().decode(def.content as Uint8Array)
+    let tableName: string | null = null
+    try {
+      const meta = JSON.parse(content)
+      tableName = String(meta.relTableName ?? '').trim() || String(meta.name ?? '').trim() || null
+    } catch { /* ignore */ }
+    if (!tableName) throw new Error('流程定义未配置 relTableName')
+    if (!this.metaReader) throw new Error('业务数据读取器未注册（facade.setMetaReader(MetaTableReader(...))，需引入 jeeflow.meta）')
+    return this.metaReader.readByProcessInstance(tableName, instanceId) as Record<string, any>
   }
 
   /** 重新部署流程定义（issues/08）：替换最新定义内容 + 置已部署（对齐 boot3 redeploy） */

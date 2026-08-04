@@ -13,7 +13,8 @@
     "./memory": "./dist/memory.js",
     "./jdbc": "./dist/jdbc/index.js",
     "./mysql": "./dist/jdbc/mysql.js",
-    "./postgres": "./dist/jdbc/postgres.js"
+    "./postgres": "./dist/jdbc/postgres.js",
+    "./jdbc/ext": "./dist/jdbc/ext.js"
   },
   "scripts": {
     "build": "tsc",

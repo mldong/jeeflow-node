@@ -41,6 +41,8 @@ export type ProcessEventListener = (event: ProcessEvent) => void | Promise<void>
 
 export interface EngineExtensions {
   interceptors?: FlowInterceptor[]
+  /** 定义级拦截器注册表（issue 34）：名字 → 实例；流程定义顶层 postInterceptors 按名解析 */
+  interceptorRegistry?: Record<string, FlowInterceptor>
   assignmentHandler?: AssignmentHandler
   decisionHandler?: DecisionHandler
   listeners?: ProcessEventListener[]

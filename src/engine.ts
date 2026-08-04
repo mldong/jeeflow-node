@@ -43,12 +43,47 @@ export class EngineImpl implements Engine {
     private exprEval?: ExpressionEvaluator,
   ) {}
 
-  setExtensions(ext: EngineExtensions) { this.ext = ext }
+  setExtensions(ext: EngineExtensions) {
+    this.ext = ext
+    this.interceptorCache = new Map()
+  }
   setRegistry(reg: HandlerRegistry) { this.registry = reg }
 
+  private interceptorCache = new Map<number, FlowInterceptor[]>()
+
+  /** 定义级拦截器解析（issue 34，对齐 Java 模型级 postInterceptors）：
+   *  流程定义顶层 postInterceptors 声明 → 按名从 interceptorRegistry 取（未声明该流程不触发）；
+   *  未声明 → 回落引擎级列表（向后兼容）。结果按 defineId 缓存。 */
+  private async resolveInterceptors(inst: ProcessInstance): Promise<FlowInterceptor[]> {
+    if (!this.ext) return []
+    const defineId = inst.defineId
+    if (defineId == null) return this.ext.interceptors ?? []
+    const cached = this.interceptorCache.get(defineId)
+    if (cached) return cached
+    let list = this.ext.interceptors ?? []
+    try {
+      const def = await this.repo.findDefineById(defineId)
+      if (def) {
+        const content = typeof def.content === 'string' ? def.content : new TextDecoder().decode(def.content as Uint8Array)
+        const meta = JSON.parse(content)
+        const declared = String(meta.postInterceptors ?? '').trim()
+        if (declared) {
+          list = []
+          for (const name of declared.split(',').map(n => n.trim())) {
+            const ic = this.ext.interceptorRegistry?.[name]
+            if (name && ic) list.push(ic)
+          }
+        }
+      }
+    } catch { /* 解析失败回落引擎级 */ }
+    this.interceptorCache.set(defineId, list)
+    return list
+  }
+
   private async firePre(node: FlowNode, inst: ProcessInstance): Promise<boolean> {
-    if (!this.ext?.interceptors) return true
-    for (const ic of this.ext.interceptors.sort((a, b) => a.order - b.order))
+    if (!this.ext?.interceptors && !this.ext?.interceptorRegistry) return true
+    const list = await this.resolveInterceptors(inst)
+    for (const ic of [...list].sort((a, b) => a.order - b.order))
       if (!(await ic.preHandle(node, inst))) return false
     return true
   }
@@ -59,8 +94,8 @@ export class EngineImpl implements Engine {
   }
 
   private async firePost(node: FlowNode, inst: ProcessInstance) {
-    if (!this.ext?.interceptors) return
-    for (const ic of this.ext.interceptors) await ic.postHandle(node, inst)
+    if (!this.ext?.interceptors && !this.ext?.interceptorRegistry) return
+    for (const ic of await this.resolveInterceptors(inst)) await ic.postHandle(node, inst)
   }
   private async fireEvent(evt: ProcessEvent) {
     if (!this.ext?.listeners) return

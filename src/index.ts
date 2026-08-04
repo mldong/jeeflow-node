@@ -27,3 +27,9 @@ export {
   HANDLER_APPLICANT_DEPT_MAIN_LEADER,
   HANDLER_TASK_ROLE_ASSIGNEE,
 } from './builtin.js'
+
+// issues/35：包导出面补齐——门面/扩展类型/扩展仓储（集成方组装完整引擎链）
+export { JeeflowFacade } from './facade.js'
+export type { EngineExtensions, FlowInterceptor, ProcessEventListener, ProcessEvent,
+  AssignmentHandler, DecisionHandler } from './extensions.js'
+export { JdbcProcessExtRepository } from './jdbc/ext.js'
