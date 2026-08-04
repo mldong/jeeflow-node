@@ -5,6 +5,12 @@ export { enumDict, enumDictKeys, type DictItem } from './metadata.js'
 export * from './model.js'
 export type { ProcessRepository, UserProvider, OrgUserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
 export {
+  SqliteDynamicTableWriter,
+  PersistPostInterceptor,
+  type DynamicTableWriter,
+  type DefineLoader,
+} from './persist.js'
+export {
   registerBuiltinAssignments,
   OperatorAssignmentHandler,
   FormFieldAssigneeHandler,

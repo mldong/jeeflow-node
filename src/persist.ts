@@ -1,0 +1,197 @@
+import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
+import { KeySubmitType, KeyDeptID } from './engine.js'
+import { TypeEnd, InstanceState, SubmitType, type ProcessInstance, type ProcessDefine, type FlowNode } from './model.js'
+import type { FlowInterceptor } from './extensions.js'
+
+// ═══ 动态表写入组件（引擎无关）— issues/18 ═══════════════════════════════════
+
+/**
+ * 动态表写入组件接口——引擎无关，四语言契约一致（Java/Go/Python/Node）
+ *
+ * 用法：给「表名 + 字段 Map」安全写入任意业务表（列过滤 / 参数化 INSERT /
+ * 幂等 / 系统字段）。不依赖工作流引擎。
+ */
+export interface DynamicTableWriter {
+  /** 按目标表过滤列（表结构探测），返回表内实际存在的列 */
+  filterColumns(tableName: string, columns: string[]): string[] | Promise<string[]>
+  /** 参数化 INSERT（按列过滤结果落库），返回生成主键 */
+  insert(tableName: string, data: Record<string, unknown>): unknown | Promise<unknown>
+  /** 幂等检查：指定业务键（如 process_instance_id）是否已存在 */
+  exists(tableName: string, bizKey: string, bizKeyValue: unknown): boolean | Promise<boolean>
+  /** 按配置列名填充系统字段（未配置的列跳过） */
+  fillSystemFields(data: Record<string, unknown>, isInsert: boolean): void
+}
+
+// ─── 默认实现：node:sqlite（内置零依赖） ──────────────────────────────────────
+
+const TABLE_NAME_RE = /^[A-Za-z0-9_]+$/
+
+function nowText(): string {
+  const d = new Date()
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+/** 表名安全校验：非空、合法字符、拒绝 sys_ 前缀 */
+function checkTableName(tableName: string): void {
+  if (!tableName) throw new Error('persist: table name is empty')
+  if (tableName.startsWith('sys_')) throw new Error(`persist: table ${tableName} with sys_ prefix is not allowed`)
+  if (!TABLE_NAME_RE.test(tableName)) throw new Error(`persist: table ${tableName} contains illegal characters`)
+}
+
+/**
+ * 动态表写入器默认实现（node:sqlite DatabaseSync）。
+ *
+ * 注意：node:sqlite 是实验特性（Node 22.5+，无需外部依赖）。
+ * MySQL/PG 集成方可自行实现 DynamicTableWriter 接口（契约见上）。
+ */
+export class SqliteDynamicTableWriter implements DynamicTableWriter {
+  private cache = new Map<string, string[]>()
+
+  /** 系统字段列名（null/undefined 禁用） */
+  createTimeColumn?: string | null = 'create_time'
+  createUserColumn?: string | null = 'create_user'
+  updateTimeColumn?: string | null = 'update_time'
+  updateUserColumn?: string | null = 'update_user'
+  isDeletedColumn?: string | null = 'is_deleted'
+
+  constructor(private db: DatabaseSync) {}
+
+  private tableColumns(tableName: string): string[] {
+    const cached = this.cache.get(tableName)
+    if (cached) return cached
+    // PRAGMA 不支持占位符——表名已过安全校验
+    const rows = this.db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>
+    if (rows.length === 0) throw new Error(`persist: table ${tableName} not found`)
+    const cols = rows.map(r => r.name.toUpperCase())
+    this.cache.set(tableName, cols)
+    return cols
+  }
+
+  filterColumns(tableName: string, columns: string[]): string[] {
+    checkTableName(tableName)
+    const set = new Set(this.tableColumns(tableName))
+    return columns.filter(c => set.has(c.toUpperCase()))
+  }
+
+  insert(tableName: string, data: Record<string, unknown>): unknown {
+    checkTableName(tableName)
+    const cols = this.tableColumns(tableName)
+    const names: string[] = []
+    const values: SQLInputValue[] = []
+    // 保持插入顺序稳定（对象键无序，按表列顺序取）
+    for (const col of cols) {
+      if (Object.prototype.hasOwnProperty.call(data, col)) {
+        names.push(col); values.push(data[col] as SQLInputValue)
+      } else {
+        const key = Object.keys(data).find(k => k.toUpperCase() === col)
+        if (key !== undefined) { names.push(col); values.push(data[key] as SQLInputValue) }
+      }
+    }
+    if (names.length === 0) throw new Error(`persist: no matching columns for ${tableName}`)
+    const placeholders = names.map(() => '?').join(',')
+    const stmt = this.db.prepare(`INSERT INTO ${tableName} (${names.join(',')}) VALUES (${placeholders})`)
+    const res = stmt.run(...values)
+    return res.lastInsertRowid
+  }
+
+  exists(tableName: string, bizKey: string, bizKeyValue: unknown): boolean {
+    checkTableName(tableName)
+    this.tableColumns(tableName) // 表不存在提前报错
+    const row = this.db.prepare(`SELECT COUNT(1) AS c FROM ${tableName} WHERE ${bizKey} = ?`).get(bizKeyValue as SQLInputValue) as { c: number }
+    return Number(row?.c ?? 0) > 0
+  }
+
+  fillSystemFields(data: Record<string, unknown>, isInsert: boolean): void {
+    const now = nowText()
+    if (isInsert) {
+      if (this.createTimeColumn) data[this.createTimeColumn] ??= now
+      if (this.createUserColumn) data[this.createUserColumn] ??= 'system'
+      if (this.updateTimeColumn) data[this.updateTimeColumn] ??= now
+      if (this.updateUserColumn) data[this.updateUserColumn] ??= 'system'
+      if (this.isDeletedColumn) data[this.isDeletedColumn] ??= 0
+    } else {
+      if (this.updateTimeColumn) data[this.updateTimeColumn] = now
+      if (this.updateUserColumn) data[this.updateUserColumn] ??= 'system'
+    }
+  }
+}
+
+// ═══ 工作流入库适配拦截器 ════════════════════════════════════════════════════
+
+/** 流程定义加载器（用于解析 relTableName / 流程 name），通常透传仓库 findDefineById */
+export type DefineLoader = (defineId: number) => Promise<ProcessDefine | null>
+
+/**
+ * 工作流业务数据入库适配拦截器——流程结束同意后，f_ 表单数据写入业务表。
+ *
+ * 语义（spec 契约，四语言一致）：
+ * - 时机：结束节点执行后 + 实例 Done + submitType=AGREE（不同意/退回不入库）
+ * - 字段：实例 Variables 中 f_ 前缀字段，去前缀
+ * - 表名：流程定义 content 顶层 relTableName，缺省回落流程 name
+ * - 系统字段：writer 通用字段 + 流程上下文（process_instance_id / apply_user_id /
+ *   apply_dept_id，蛇形列名约定）
+ * - 幂等：bizKey = process_instance_id（先查后插，跨请求有效）
+ * - 静默跳过：非结束节点 / 非同意 / 未配置表名 / writer 未注入
+ * - 表不存在 = 配置错误 → 显性抛错（快速失败）
+ */
+export class PersistPostInterceptor implements FlowInterceptor {
+  order = 0
+  fieldPrefix = 'f_'
+
+  constructor(
+    private writer: DynamicTableWriter | null,
+    private loader: DefineLoader | null,
+  ) {}
+
+  async preHandle(_node: FlowNode, _inst: ProcessInstance): Promise<boolean> {
+    return true
+  }
+
+  async postHandle(node: FlowNode, inst: ProcessInstance): Promise<void> {
+    if (!this.writer || !this.loader) return // 未注入：静默跳过
+    // 时机：仅结束节点 + 流程正常完成（Done）+ 同意
+    if (!node || node.type !== TypeEnd) return
+    if (!inst || inst.state !== InstanceState.Done) return
+    const submitType = Number(inst.variables[KeySubmitType])
+    if (submitType !== SubmitType.Agree) return
+
+    // 表名：流程定义顶层 relTableName，缺省回落流程 name
+    const tableName = await this.resolveTableName(inst)
+    if (!tableName) return // 未配置：静默跳过
+
+    // 幂等：以 process_instance_id 为键，先查后插
+    if (await this.writer.exists(tableName, 'process_instance_id', inst.id)) return
+
+    // 提取 f_ 前缀字段（去前缀）
+    const prefix = this.fieldPrefix || 'f_'
+    const data: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(inst.variables)) {
+      if (k.startsWith(prefix) && k.length > prefix.length) data[k.slice(prefix.length)] = v
+    }
+
+    // 流程上下文字段（蛇形列名约定，与 writer 系统字段一致）
+    data['process_instance_id'] ??= inst.id
+    data['apply_user_id'] ??= inst.operator
+    data['apply_dept_id'] ??= inst.variables[KeyDeptID] ?? null
+
+    // 通用系统字段（writer 按配置列填充）
+    this.writer.fillSystemFields(data, true)
+
+    await this.writer.insert(tableName, data)
+  }
+
+  private async resolveTableName(inst: ProcessInstance): Promise<string> {
+    const define = await this.loader!(inst.defineId)
+    if (!define) return ''
+    const content = typeof define.content === 'string' ? define.content : new TextDecoder().decode(define.content)
+    let meta: { relTableName?: string; name?: string }
+    try {
+      meta = JSON.parse(content)
+    } catch {
+      return ''
+    }
+    const tableName = (meta.relTableName ?? '').trim()
+    return tableName || (meta.name ?? '').trim() // 缺省回落流程 name
+  }
+}

@@ -141,15 +141,9 @@ export class EngineImpl implements Engine {
         if (doing.length > 0) return (await this.repo.findInstanceById(inst.id))!
       }
       for (const node of followEdges(flow, curNode.id)) {
-        if (node.type === TypeEnd) {
-          // 聚合根：流程完成
-          inst.finish(new Date())
-          inst.variables = vars
-          await this.repo.updateInstance(inst)
-          await this.fireEvent({ type: EventType.ProcessFinish, instanceId: inst.id, operator })
-        } else {
-          await this.executeNode(flow, inst, node, operator, vars)
-        }
+        // 统一走 executeNode：结束节点也经节点执行链（拦截器/事件完整触发），
+        // executeNode 内部 TypeEnd 分支完成聚合根 finish + 事件发布
+        await this.executeNode(flow, inst, node, operator, vars)
       }
     }
     return (await this.repo.findInstanceById(inst.id))!
