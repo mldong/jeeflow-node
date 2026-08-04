@@ -26,6 +26,11 @@ export interface DynamicTableWriter {
 
 const TABLE_NAME_RE = /^[A-Za-z0-9_]+$/
 
+/** 列名归一（issues/20）：转小写 + 去下划线（companyName / company_name / COMPANY_NAME 等价） */
+function normalizeColumn(name: string): string {
+  return name.toLowerCase().replace(/_/g, '')
+}
+
 function nowText(): string {
   const d = new Date()
   const p = (n: number) => String(n).padStart(2, '0')
@@ -57,6 +62,9 @@ export class SqliteDynamicTableWriter implements DynamicTableWriter {
   /** 用户列默认值（issues/19）：优先取 data 中已注入的 apply_user_id=流程 operator，
    *  否则用此配置值，缺省 "system"——多数框架业务表 create_user/update_user 为 BIGINT 存 userId */
   defaultUserValue: unknown = 'system'
+  /** 列匹配（issues/20）：默认宽松——驼峰↔下划线归一匹配（表单字段 companyName ↔ 表列 company_name）；
+   *  需要精确控制列名的集成方显式开启严格模式（忽略大小写精确匹配） */
+  strictColumnMatch = false
 
   constructor(private db: DatabaseSync) {}
 
@@ -73,8 +81,8 @@ export class SqliteDynamicTableWriter implements DynamicTableWriter {
 
   filterColumns(tableName: string, columns: string[]): string[] {
     checkTableName(tableName)
-    const set = new Set(this.tableColumns(tableName))
-    return columns.filter(c => set.has(c.toUpperCase()))
+    const cols = this.tableColumns(tableName)
+    return columns.filter(c => this.findColumn(cols, c) !== '')
   }
 
   insert(tableName: string, data: Record<string, unknown>): unknown {
@@ -82,20 +90,38 @@ export class SqliteDynamicTableWriter implements DynamicTableWriter {
     const cols = this.tableColumns(tableName)
     const names: string[] = []
     const values: SQLInputValue[] = []
-    // 保持插入顺序稳定（对象键无序，按表列顺序取）
+    // 保持插入顺序稳定（对象键无序，按表列顺序取）；写入用表列原名（issues/20）
     for (const col of cols) {
-      if (Object.prototype.hasOwnProperty.call(data, col)) {
-        names.push(col); values.push(data[col] as SQLInputValue)
-      } else {
-        const key = Object.keys(data).find(k => k.toUpperCase() === col)
-        if (key !== undefined) { names.push(col); values.push(data[key] as SQLInputValue) }
-      }
+      const key = this.findDataKey(data, col)
+      if (key === '') continue
+      names.push(col)
+      values.push(data[key] as SQLInputValue)
     }
     if (names.length === 0) throw new Error(`persist: no matching columns for ${tableName}`)
     const placeholders = names.map(() => '?').join(',')
     const stmt = this.db.prepare(`INSERT INTO ${tableName} (${names.join(',')}) VALUES (${placeholders})`)
     const res = stmt.run(...values)
     return res.lastInsertRowid
+  }
+
+  /** 列匹配（issues/20）：严格=忽略大小写精确；宽松（默认）=驼峰↔下划线归一匹配 */
+  private findColumn(cols: string[], key: string): string {
+    for (const col of cols) {
+      if (this.strictColumnMatch) {
+        if (col.toUpperCase() === key.toUpperCase()) return col
+      } else if (normalizeColumn(col) === normalizeColumn(key)) {
+        return col
+      }
+    }
+    return ''
+  }
+
+  /** 在 data 中找匹配指定表列的 key（宽松模式驼峰 key 匹配下划线列） */
+  private findDataKey(data: Record<string, unknown>, col: string): string {
+    for (const k of Object.keys(data)) {
+      if (this.findColumn([col], k) !== '') return k
+    }
+    return ''
   }
 
   exists(tableName: string, bizKey: string, bizKeyValue: unknown): boolean {

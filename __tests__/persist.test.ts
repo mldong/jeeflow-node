@@ -224,4 +224,27 @@ describe('persist 动态表写入 + 流程入库拦截器', () => {
     assert.equal(data2['create_user'], 0)
     db.close()
   })
+
+  it('⑫ 宽松列匹配（issues/20）：驼峰表单字段 ↔ 下划线表列', () => {
+    const { db, writer } = setupDb()
+    db.exec('ALTER TABLE biz_leave ADD COLUMN start_time TEXT')
+    writer.insert('biz_leave', { startTime: '09:00:00', processInstanceId: 55, title: 'camel' })
+    const row = db.prepare('SELECT start_time, process_instance_id FROM biz_leave').get() as any
+    assert.equal(row.start_time, '09:00:00')
+    assert.equal(row.process_instance_id, 55)
+    const kept = writer.filterColumns('biz_leave', ['startTime', 'processInstanceId', 'no_such'])
+    assert.equal(kept.length, 2)
+    db.close()
+  })
+
+  it('⑬ 严格列匹配（issues/20）：显式开启后驼峰不再匹配', () => {
+    const { db, writer } = setupDb()
+    db.exec('ALTER TABLE biz_leave ADD COLUMN start_time TEXT')
+    writer.strictColumnMatch = true
+    writer.insert('biz_leave', { startTime: '09:00:00', title: 'strict' })
+    const row = db.prepare('SELECT title, start_time FROM biz_leave').get() as any
+    assert.equal(row.title, 'strict')
+    assert.equal(row.start_time, null)
+    db.close()
+  })
 })
