@@ -2,7 +2,7 @@ import {
   type FlowModel, type FlowNode,
   TypeStart, TypeEnd, TypeTask, TypeDecision, TypeFork, TypeJoin, TypeCustom,
   ProcessInstance, type ProcessTask, type ProcessDefine,
-  InstanceState, TaskState,
+  InstanceState, TaskState, SubmitType,
 } from './model.js'
 import type { ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
 import { type EngineExtensions, type FlowInterceptor, type AssignmentHandler, type DecisionHandler, type ProcessEventListener, EventType, type ProcessEvent } from './extensions.js'
@@ -116,6 +116,9 @@ export class EngineImpl implements Engine {
 
     const curNode = findNode(flow, task.taskName)
     if (curNode) {
+      // 1.8.0：任务完成节点自身的后置拦截器（SYNC 同步演进——任务节点推进更新状态/字段）。
+      // createTask 不再触发（引擎语义修正），此处为完成任务节点的唯一触发点
+      await this.firePost(curNode, inst)
       const ct = curNode.properties?.countersignType as string | undefined
       if (ct === 'SEQUENTIAL') {
         const doing = await this.repo.findDoingTasks(inst.id)
@@ -228,11 +231,15 @@ export class EngineImpl implements Engine {
   }
 
   private async executeNode(flow: FlowModel, inst: ProcessInstance, node: FlowNode, operator: string, vars: Record<string, any>): Promise<void> {
+    // 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
+    // 任务完成的拦截器由 executeProcessTask 显式触发，1.8.0 SYNC 同步演进）
+    if (node.type === TypeTask || node.type === TypeCustom) {
+      await this.createTask(node, inst, operator, vars)
+      return
+    }
     if (!(await this.firePre(node, inst))) return
     try {
     switch (node.type) {
-      case TypeTask: case TypeCustom:
-        return this.createTask(node, inst, operator, vars)
       case TypeDecision:
         return this.evaluateDecision(flow, inst, node, operator, vars)
       case TypeFork:
@@ -244,12 +251,19 @@ export class EngineImpl implements Engine {
           for (const n of followEdges(flow, node.id)) await this.executeNode(flow, inst, n, operator, vars)
         return
       }
-      case TypeEnd:
-        inst.finish(new Date())
+      case TypeEnd: {
+        // 对齐 Java EndProcessHandler：submitType=REJECT → reject，否则 finish
+        const submitType = inst.variables[KeySubmitType]
+        if (submitType != null && Number(submitType) === SubmitType.Reject) {
+          inst.reject(new Date())
+        } else {
+          inst.finish(new Date())
+        }
         inst.variables = vars
         await this.repo.updateInstance(inst)
         await this.fireEvent({ type: EventType.ProcessFinish, instanceId: inst.id, operator })
         return
+      }
     }
     } finally { await this.firePost(node, inst) }
   }

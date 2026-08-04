@@ -138,11 +138,39 @@ export class MetaTableWriter implements DynamicTableWriter {
     this.base.fillSystemFields(row, true)
     let pk = this.base.insert(tableName, row) // 主表插入（自增/生成器返回主键）
     if (pk === undefined || pk === null) pk = findRowValue(row, pkOf(meta))
-    // 子表递归插入（外键=主表主键）
+    // 子表递归插入（外键=主表主键；继承主表 apply_user_id，issues/24）
     for (const [name, v] of subData) {
-      this.insertSubTable(meta, findField(meta, name)!, v, pk)
+      this.insertSubTable(meta, findField(meta, name)!, v, pk, data)
     }
     return pk
+  }
+
+  /** 按元数据 storageType 组装 SET 列（SYNC 同步演进，issues/24）——
+   *  NORMAL/JSON/EXPAND 参与更新；ONE2ONE/ONE2MANY 子表不参与中途更新
+   *  （任务推进只更新主表行状态，子表数据变动走重新提交）；未消费字段直通。 */
+  update(tableName: string, data: Record<string, unknown>, whereColumn: string, whereValue: unknown): number | Promise<number> {
+    const meta = this.provider.loadTableMeta(tableName)
+    if (!meta) return this.base.update(tableName, data, whereColumn, whereValue) // 无元数据：回落基础 writer
+    const row: Record<string, unknown> = {}
+    for (const f of meta.fields) {
+      const v = data[f.name]
+      if (v === undefined || v === null) continue
+      const st = f.storageType ?? StorageType.Normal
+      if (st === StorageType.Json) {
+        row[columnOf(f)] = JSON.stringify(v)
+      } else if (st === StorageType.Expand) {
+        this.expandInto(f, v, row)
+      } else if (st === StorageType.One2One || st === StorageType.One2Many) {
+        continue // 子表不参与中途更新
+      } else {
+        row[columnOf(f)] = v
+      }
+    }
+    // 未消费字段（流程上下文/状态字段等）直通基础 writer
+    for (const [k, v] of Object.entries(data)) {
+      if (!findField(meta, k)) row[k] ??= v
+    }
+    return this.base.update(tableName, row, whereColumn, whereValue)
   }
 
   exists(tableName: string, bizKey: string, bizKeyValue: unknown): boolean | Promise<boolean> {
@@ -161,25 +189,33 @@ export class MetaTableWriter implements DynamicTableWriter {
     }
   }
 
-  private insertSubTable(parentMeta: TableMeta, f: FieldMeta, v: unknown, parentPk: unknown): void {
+  private insertSubTable(parentMeta: TableMeta, f: FieldMeta, v: unknown, parentPk: unknown,
+                         parentData: Record<string, unknown>): void {
     if (parentPk === undefined || parentPk === null) {
       throw new Error(`persist: parent primary key missing, cannot insert sub table ${f.name}`)
     }
     const fk = f.foreignKey || pkOf(parentMeta)
     const st = f.storageType ?? StorageType.Normal
     if (st === StorageType.One2One && typeof v === 'object' && v !== null) {
-      this.insertSubRow(f, v as Record<string, unknown>, fk, parentPk)
+      this.insertSubRow(f, v as Record<string, unknown>, fk, parentPk, parentData)
     } else if (st === StorageType.One2Many && Array.isArray(v)) {
       for (const item of v) {
         if (typeof item === 'object' && item !== null) {
-          this.insertSubRow(f, item as Record<string, unknown>, fk, parentPk)
+          this.insertSubRow(f, item as Record<string, unknown>, fk, parentPk, parentData)
         }
       }
     }
   }
 
-  private insertSubRow(f: FieldMeta, subData: Record<string, unknown>, fk: string, parentPk: unknown): void {
+  /** 子表单行插入（issues/24）：继承主表 apply_user_id（拦截器场景=流程 operator），
+   *  子表单显式同名字段优先（??=）——fillSystemFields 的用户列默认值可解析到 operator，
+   *  避免 BIGINT create_user/update_user 列回落 "system" 严格模式报错 */
+  private insertSubRow(f: FieldMeta, subData: Record<string, unknown>, fk: string,
+                       parentPk: unknown, parentData: Record<string, unknown>): void {
     const row = { ...subData, [fk]: parentPk }
+    if (parentData['apply_user_id'] !== undefined) {
+      row['apply_user_id'] ??= parentData['apply_user_id']
+    }
     this.insert(f.targetTable!, row) // 递归走子表自身元数据
   }
 }
@@ -235,9 +271,10 @@ export class MetaTableReader {
         result[f.name] = v
       }
     }
-    // 未在元数据中的列带出（key 统一小写）
+    // 未在元数据中的列带出（key 统一小写）；
+    // EXPAND 展开列（挂在某字段 expandFields 映射里，对象形式已带出）不重复平铺（issues/24）
     for (const [k, v] of Object.entries(row)) {
-      if (!findFieldByColumn(meta, k)) result[k.toLowerCase()] ??= v
+      if (!findFieldByColumn(meta, k) && !isExpandColumn(meta, k)) result[k.toLowerCase()] ??= v
     }
     return result
   }
@@ -274,4 +311,15 @@ export function findRowValue(row: Record<string, unknown>, columnName: string): 
     if (k.toLowerCase() === columnName.toLowerCase()) return v
   }
   return undefined
+}
+
+
+/** 列是否为某字段的 EXPAND 展开列（issues/24：已消费，不重复平铺带出） */
+function isExpandColumn(meta: TableMeta, column: string): boolean {
+  for (const f of meta.fields) {
+    for (const col of Object.values(f.expandFields ?? {})) {
+      if (col.toLowerCase() === (column ?? '').toLowerCase()) return true
+    }
+  }
+  return false
 }

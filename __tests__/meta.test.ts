@@ -105,4 +105,63 @@ describe('persist 元数据驱动读写（issues/23）', () => {
     assert.equal(result.title, '回落')
     db.close()
   })
+
+  it('issues/24 子表继承 apply_user_id + EXPAND 去冗余 + Update 组装', () => {
+    const db = new DatabaseSync(':memory:')
+    db.exec(`CREATE TABLE biz_parent (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT, apply_user_id INTEGER, create_user INTEGER, finish INTEGER,
+      process_instance_id INTEGER, province TEXT, city TEXT, is_deleted INTEGER
+    )`)
+    db.exec(`CREATE TABLE biz_child (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, parent_id INTEGER,
+      item_name TEXT, create_user INTEGER, update_user INTEGER, is_deleted INTEGER
+    )`)
+    const provider: IDynamicMetaProvider = {
+      loadTableMeta(t: string): TableMeta | null {
+        if (t === 'biz_parent') {
+          return {
+            tableName: 'biz_parent', primaryKey: 'id', fields: [
+              { name: 'title' },
+              { name: 'address', storageType: StorageType.Expand, expandFields: { province: 'province', city: 'city' } },
+              { name: 'items', storageType: StorageType.One2Many, targetTable: 'biz_child', foreignKey: 'parent_id' },
+            ] as FieldMeta[],
+          }
+        }
+        if (t === 'biz_child') {
+          return { tableName: 'biz_child', primaryKey: 'id', fields: [{ name: 'itemName' }] as FieldMeta[] }
+        }
+        return null
+      },
+    }
+    const base = new SqliteDynamicTableWriter(db)
+    const writer = new MetaTableWriter(base, provider)
+    const reader = new MetaTableReader(new JdbcTableReader(db), provider)
+
+    const operator = 987654321
+    const pk = writer.insert('biz_parent', {
+      title: '传播测试', apply_user_id: operator,
+      address: { province: '广东省', city: '深圳市' },
+      items: [{ itemName: '测试项目A' }],
+      process_instance_id: 999,
+    }) as number
+    assert.ok(pk)
+    // 子表 create_user = operator（不回落 "system"）
+    const childUser = (db.prepare('SELECT create_user FROM biz_child WHERE parent_id = ?').get(pk) as any).create_user
+    assert.equal(childUser, operator)
+    // 主表 create_user 同 operator
+    const parentUser = (db.prepare('SELECT create_user FROM biz_parent WHERE id = ?').get(pk) as any).create_user
+    assert.equal(parentUser, operator)
+    // Update：EXPAND 展开列 + 状态字段直通（子表不参与中途更新）
+    writer.update('biz_parent', { address: { province: '北京市', city: '海淀区' }, finish: 20 }, 'process_instance_id', 999)
+    const row = db.prepare('SELECT province, city, finish FROM biz_parent WHERE id = ?').get(pk) as any
+    assert.equal(row.province, '北京市')
+    assert.equal(row.city, '海淀区')
+    assert.equal(row.finish, 20)
+    // 读侧：EXPAND 展开列不重复平铺带出（对象形式已消费）
+    const result = reader.readByProcessInstance('biz_parent', 999)!
+    assert.equal(result.province, undefined)
+    assert.equal((result.address as any).city, '海淀区')
+    db.close()
+  })
 })

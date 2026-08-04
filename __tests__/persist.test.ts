@@ -275,3 +275,89 @@ describe('persist 主键生成（issues/21）', () => {
     db.close()
   })
 })
+
+describe('1.8.0 SYNC 同步演进', () => {
+  function setupSync() {
+    const db = new DatabaseSync(':memory:')
+    db.exec(`CREATE TABLE biz_sync (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT,
+      amount REAL,
+      opinion TEXT,
+      apply INTEGER,
+      task1 INTEGER,
+      finish INTEGER,
+      process_instance_id INTEGER,
+      apply_user_id TEXT,
+      apply_dept_id TEXT,
+      create_time TEXT,
+      create_user TEXT,
+      update_time TEXT,
+      update_user TEXT,
+      is_deleted INTEGER
+    )`)
+    const writer = new SqliteDynamicTableWriter(db)
+    return { db, writer }
+  }
+
+  function loadSyncFlow(repo: MemoryRepository): ProcessDefine {
+    let content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    content = content.replace('"type": "approval"', '"type": "approval", "relTableName": "biz_sync", "persistMode": "SYNC"')
+    content = content.replace('"assignee": "leader"', '"assignee": "leader", "field": {"PERMISSION_title": 1, "PERMISSION_amount": 2}')
+    content = content.replaceAll('"id": "end"', '"id": "finish"')
+    content = content.replaceAll('"targetNodeId": "end"', '"targetNodeId": "finish"')
+    const def: ProcessDefine = { id: 0, name: 'simple', displayName: '01-simple.json', type: 'approval', state: 1, content, version: 1, createTime: new Date(), updateTime: new Date(), createUser: '', updateUser: '' }
+    repo.addDefine(def)
+    return def
+  }
+
+  it('⑥ SYNC 全链路：发起 INSERT → apply 推进 → task1（权限过滤 + tf_ + 状态）→ 结束定稿', async () => {
+    const repo = new MemoryRepository()
+    const { db, writer } = setupSync()
+    const { engine } = setupEngine(repo, writer)
+    const def = loadSyncFlow(repo)
+
+    // ① 发起 → INSERT（title/amount）
+    const inst = await engine.startProcessInstanceById(def.id, 'user1', { f_title: '年假申请', f_amount: 800, u_deptId: 'D01' })
+    // ② apply 完成 → UPDATE（apply 状态=10）
+    let doing = await repo.findDoingTasks(inst.id)
+    await repo.addTaskActor(doing[0].id, ['user1'])
+    await engine.executeProcessTask(doing[0].id, 'user1', { [KeySubmitType]: 0 })
+    assert.equal((db.prepare('SELECT apply FROM biz_sync').get() as any).apply, 10)
+    // ③ task1（leader）→ UPDATE：title 只读不更新 / amount 可编辑更新 / opinion(tf_) / task1=10 / finish=20
+    doing = await repo.findDoingTasks(inst.id)
+    await repo.addTaskActor(doing[0].id, ['leader'])
+    await engine.executeProcessTask(doing[0].id, 'leader',
+      { [KeySubmitType]: 1, tf_opinion: '同意', f_title: '修改标题', f_amount: 999 })
+    const row = db.prepare('SELECT title, amount, opinion, task1, finish FROM biz_sync').get() as any
+    assert.equal(row.title, '年假申请')          // 只读字段不更新
+    assert.equal(row.amount, 999)                // 可编辑字段更新
+    assert.equal(row.opinion, '同意')            // tf_ 冗余
+    assert.equal(row.task1, 10)                  // 任务节点状态 DOING
+    assert.equal(row.finish, 20)                 // 结束定稿 FINISHED
+    const n = (db.prepare('SELECT COUNT(1) AS c FROM biz_sync').get() as any).c
+    assert.equal(n, 1)                           // 先插后更仅 1 条
+    db.close()
+  })
+
+  it('⑦ SYNC 驳回：结束定稿最终状态 REJECT=45，数据不丢', async () => {
+    const repo = new MemoryRepository()
+    const { db, writer } = setupSync()
+    const { engine } = setupEngine(repo, writer)
+    const def = loadSyncFlow(repo)
+
+    const inst = await engine.startProcessInstanceById(def.id, 'user1', { f_title: '驳回单', u_deptId: 'D01' })
+    let doing = await repo.findDoingTasks(inst.id)
+    await repo.addTaskActor(doing[0].id, ['user1'])
+    await engine.executeProcessTask(doing[0].id, 'user1', { [KeySubmitType]: 0 })
+    doing = await repo.findDoingTasks(inst.id)
+    await repo.addTaskActor(doing[0].id, ['leader'])
+    await engine.executeProcessTask(doing[0].id, 'leader', { [KeySubmitType]: 2 })
+
+    const row = db.prepare('SELECT title, finish, create_user FROM biz_sync').get() as any
+    assert.equal(row.title, '驳回单')
+    assert.equal(row.finish, 45)                 // 驳回最终状态 REJECT
+    assert.equal(row.create_user, 'user1')
+    db.close()
+  })
+})

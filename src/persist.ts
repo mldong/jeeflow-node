@@ -1,6 +1,6 @@
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { KeySubmitType, KeyDeptID } from './engine.js'
-import { TypeEnd, InstanceState, SubmitType, type ProcessInstance, type ProcessDefine, type FlowNode } from './model.js'
+import { TypeEnd, TypeTask, TypeCustom, InstanceState, SubmitType, type ProcessInstance, type ProcessDefine, type FlowNode } from './model.js'
 import type { FlowInterceptor } from './extensions.js'
 
 // ═══ 动态表写入组件（引擎无关）— issues/18 ═══════════════════════════════════
@@ -16,6 +16,9 @@ export interface DynamicTableWriter {
   filterColumns(tableName: string, columns: string[]): string[] | Promise<string[]>
   /** 参数化 INSERT（按列过滤结果落库），返回生成主键 */
   insert(tableName: string, data: Record<string, unknown>): unknown | Promise<unknown>
+  /** 参数化 UPDATE（按列过滤结果组装 SET；条件列排除，防注入），返回受影响行数
+   * （SYNC 同步演进，issues/24） */
+  update(tableName: string, data: Record<string, unknown>, whereColumn: string, whereValue: unknown): number | Promise<number>
   /** 幂等检查：指定业务键（如 process_instance_id）是否已存在 */
   exists(tableName: string, bizKey: string, bizKeyValue: unknown): boolean | Promise<boolean>
   /** 按配置列名填充系统字段（未配置的列跳过） */
@@ -158,6 +161,28 @@ export class SqliteDynamicTableWriter implements DynamicTableWriter {
     return Number(row?.c ?? 0) > 0
   }
 
+  /** 参数化 UPDATE（SYNC 同步演进，issues/24）：列过滤（宽松匹配）+ 条件列排除 +
+   *  参数化 SET，返回受影响行数。对齐 Java JdbcDynamicTableWriter.update。 */
+  update(tableName: string, data: Record<string, unknown>, whereColumn: string, whereValue: unknown): number {
+    checkTableName(tableName)
+    if (!whereColumn) throw new Error(`persist: update ${tableName} requires where column`)
+    const cols = this.tableColumns(tableName)
+    const sets: string[] = []
+    const values: SQLInputValue[] = []
+    for (const m of cols) {
+      if (normalizeColumn(m.name) === normalizeColumn(whereColumn)) continue // 条件列不参与 SET
+      const key = this.findDataKey(data, m.name)
+      if (key) {
+        sets.push(`${m.name} = ?`)
+        values.push(data[key] as SQLInputValue)
+      }
+    }
+    if (sets.length === 0) return 0 // 无更新列（如结束节点仅状态探测未命中）
+    values.push(whereValue as SQLInputValue)
+    const res = this.db.prepare(`UPDATE ${tableName} SET ${sets.join(',')} WHERE ${whereColumn} = ?`).run(...values)
+    return Number(res.changes ?? 0)
+  }
+
   fillSystemFields(data: Record<string, unknown>, isInsert: boolean): void {
     const now = nowText()
     if (isInsert) {
@@ -181,25 +206,32 @@ export class SqliteDynamicTableWriter implements DynamicTableWriter {
 
 // ═══ 工作流入库适配拦截器 ════════════════════════════════════════════════════
 
-/** 流程定义加载器（用于解析 relTableName / 流程 name），通常透传仓库 findDefineById */
+/** 流程定义加载器（用于解析 relTableName / persistMode / 流程 name），通常透传仓库 findDefineById */
 export type DefineLoader = (defineId: number) => Promise<ProcessDefine | null>
 
+/** 持久化模式（流程定义顶层 persistMode，缺省 ARCHIVE） */
+export const PersistModeArchive = 'ARCHIVE' // 结束归档（现状）：流程结束同意后落库
+export const PersistModeSync = 'SYNC'       // 同步演进：发起 INSERT → 任务节点 UPDATE → 结束定稿
+
+/** 字段权限值（任务节点 properties.field 的 PERMISSION_{字段名}，vben5-wf 机制） */
+export const PermReadOnly = 1 // 只读：不更新
+export const PermEdit = 2     // 可编辑：更新
+export const PermHidden = 3   // 隐藏：不更新
+
 /**
- * 工作流业务数据入库适配拦截器——流程结束同意后，f_ 表单数据写入业务表。
+ * 工作流业务数据入库适配拦截器——按流程定义顶层 persistMode 分派：
  *
- * 语义（spec 契约，四语言一致）：
- * - 时机：结束节点执行后 + 实例 Done + submitType=AGREE（不同意/退回不入库）
- * - 字段：实例 Variables 中 f_ 前缀字段，去前缀
- * - 表名：流程定义 content 顶层 relTableName，缺省回落流程 name
- * - 系统字段：writer 通用字段 + 流程上下文（process_instance_id / apply_user_id /
- *   apply_dept_id，蛇形列名约定）
- * - 幂等：bizKey = process_instance_id（先查后插，跨请求有效）
- * - 静默跳过：非结束节点 / 非同意 / 未配置表名 / writer 未注入
- * - 表不存在 = 配置错误 → 显性抛错（快速失败）
+ * - ARCHIVE（缺省）：流程结束同意后，f_ 表单数据写入业务表（一次落库）
+ * - SYNC（1.8.0，issues/24 同步演进）：提交申请即入库（start 节点 INSERT 全量），
+ *   任务节点推进 UPDATE（f_ 按节点字段权限过滤 + tf_ 冗余 + 状态字段=DOING），
+ *   结束节点定稿 UPDATE（最终状态 FINISHED/REJECT）——不管成功失败都入库
+ *
+ * 对标 Java PersistPostInterceptor（1.8.0）。
  */
 export class PersistPostInterceptor implements FlowInterceptor {
   order = 0
   fieldPrefix = 'f_'
+  taskFieldPrefix = 'tf_'
 
   constructor(
     private writer: DynamicTableWriter | null,
@@ -212,56 +244,144 @@ export class PersistPostInterceptor implements FlowInterceptor {
 
   async postHandle(node: FlowNode, inst: ProcessInstance): Promise<void> {
     if (!this.writer || !this.loader) return // 未注入：静默跳过
-    // 时机：仅结束节点 + 流程正常完成（Done）+ 同意
-    if (!node || node.type !== TypeEnd) return
-    if (!inst || inst.state !== InstanceState.Done) return
-    const submitType = Number(inst.variables[KeySubmitType])
-    if (submitType !== SubmitType.Agree) return
-
-    // 同链重复触发防护（issues/19）：最后任务节点与结束节点都会触发后置拦截器，
-    // 同一执行链（共享 inst.variables）只插一次。标记写入时实例已完成持久化
-    // （引擎 executeNode 先 updateInstance 后触发拦截器，repo 存副本）不会落库；
-    // exists 保留作为跨请求/重启的幂等兜底（先查后插语义不变）。
-    const chainKey = `__persist_executed_${inst.id}`
-    if (inst.variables[chainKey] === true) return
-    inst.variables[chainKey] = true
-
-    // 表名：流程定义顶层 relTableName，缺省回落流程 name
-    const tableName = await this.resolveTableName(inst)
+    if (!node || !inst) return
+    const { tableName, persistMode } = await this.resolveDefine(inst)
     if (!tableName) return // 未配置：静默跳过
-
-    // 幂等：以 process_instance_id 为键，先查后插
-    if (await this.writer.exists(tableName, 'process_instance_id', inst.id)) return
-
-    // 提取 f_ 前缀字段（去前缀）
-    const prefix = this.fieldPrefix || 'f_'
-    const data: Record<string, unknown> = {}
-    for (const [k, v] of Object.entries(inst.variables)) {
-      if (k.startsWith(prefix) && k.length > prefix.length) data[k.slice(prefix.length)] = v
+    if (persistMode.toUpperCase() === PersistModeSync) {
+      await this.handleSync(node, inst, tableName)
+      return
     }
-
-    // 流程上下文字段（蛇形列名约定，与 writer 系统字段一致）
-    data['process_instance_id'] ??= inst.id
-    data['apply_user_id'] ??= inst.operator
-    data['apply_dept_id'] ??= inst.variables[KeyDeptID] ?? null
-
-    // 通用系统字段（writer 按配置列填充）
-    this.writer.fillSystemFields(data, true)
-
-    await this.writer.insert(tableName, data)
+    await this.handleArchive(node, inst, tableName)
   }
 
-  private async resolveTableName(inst: ProcessInstance): Promise<string> {
+  // ─── ARCHIVE（现状：结束同意归档） ──────────────────────────────────────────
+
+  private async handleArchive(node: FlowNode, inst: ProcessInstance, tableName: string): Promise<void> {
+    const writer = this.writer
+    if (!writer) return
+    // 时机：仅结束节点 + 流程正常完成（Done）+ 同意
+    if (node.type !== TypeEnd) return
+    if (inst.state !== InstanceState.Done) return
+    const submitType = Number(inst.variables[KeySubmitType])
+    if (submitType !== SubmitType.Agree) return
+    if (!this.markChain(node, inst)) return
+    // 幂等：以 process_instance_id 为键，先查后插。
+    // 表不存在等探测失败是配置错误，必须显性暴露（与 Java/Python 抛异常一致）
+    if (await writer.exists(tableName, 'process_instance_id', inst.id)) return
+
+    const data = this.extractFields(inst, null, false, true) // 只 f_ 全量
+    this.fillContext(data, inst)
+    writer.fillSystemFields(data, true)
+    await writer.insert(tableName, data)
+  }
+
+  // ─── SYNC（1.8.0 同步演进：发起入库 → 节点推进 → 结束定稿） ──────────────────
+
+  private async handleSync(node: FlowNode, inst: ProcessInstance, tableName: string): Promise<void> {
+    const writer = this.writer
+    if (!writer) return
+    if (!this.markChain(node, inst)) return // 同链同节点不重复（节点级，issues/19 演进）
+    const exists = await writer.exists(tableName, 'process_instance_id', inst.id)
+
+    // 任务节点（TypeTask/TypeCustom）才更新业务字段：f_ 按节点字段权限过滤；
+    // 结束/网关等非任务节点只定稿状态，避免全量覆盖任务节点的只读/隐藏限制
+    const isTask = node.type === TypeTask || node.type === TypeCustom
+    const fieldPerm = isTask ? this.resolveFieldPermission(node) : null
+    const data = this.extractFields(inst, fieldPerm, !exists || isTask, !exists || isTask)
+
+    // 状态字段：优先 {节点ID}_{状态码} 列，无则 {节点ID} 列。
+    // 任务节点写 DOING(10)——任务推进状态；结束节点写实例最终状态（FINISHED/REJECT）
+    let stateCode = Number(inst.state)
+    if (isTask) stateCode = InstanceState.Doing
+    this.putStateField(writer, tableName, data, node.id, stateCode)
+
+    this.fillContext(data, inst)
+    if (!exists) {
+      writer.fillSystemFields(data, true)
+      await writer.insert(tableName, data)
+      return
+    }
+    writer.fillSystemFields(data, false) // 只填 update 组
+    await writer.update(tableName, data, 'process_instance_id', inst.id)
+  }
+
+  // ─── 公共 ───────────────────────────────────────────────────────────────────
+
+  private async resolveDefine(inst: ProcessInstance): Promise<{ tableName: string; persistMode: string }> {
     const define = await this.loader!(inst.defineId)
-    if (!define) return ''
+    if (!define) return { tableName: '', persistMode: '' }
     const content = typeof define.content === 'string' ? define.content : new TextDecoder().decode(define.content)
-    let meta: { relTableName?: string; name?: string }
+    let meta: { relTableName?: string; name?: string; persistMode?: string }
     try {
       meta = JSON.parse(content)
     } catch {
-      return ''
+      return { tableName: '', persistMode: '' }
     }
     const tableName = (meta.relTableName ?? '').trim()
-    return tableName || (meta.name ?? '').trim() // 缺省回落流程 name
+    return {
+      tableName: tableName || (meta.name ?? '').trim(), // 缺省回落流程 name
+      persistMode: (meta.persistMode ?? '').trim(),
+    }
+  }
+
+  /** 同链重复触发防护（issues/19，1.8.0 节点级）：同一执行链中**每个节点**触发一次
+   * （任务推进更新 + 结束定稿是不同节点，都要生效），同节点不重复；exists 兜底跨请求。 */
+  private markChain(node: FlowNode, inst: ProcessInstance): boolean {
+    const chainKey = `__persist_executed_${inst.id}_${node.id}`
+    if (inst.variables[chainKey] === true) return false
+    inst.variables[chainKey] = true
+    return true
+  }
+
+  /** 提取字段：f_ 去前缀（SYNC 下按字段权限过滤——只读/隐藏不更新；
+   *  includeFormFields=false 时不带出，用于非任务节点定稿避免覆盖只读限制）；
+   *  tf_ 去前缀冗余（有列则写，列过滤由 writer 做） */
+  private extractFields(inst: ProcessInstance, fieldPerm: Record<string, unknown> | null,
+                        includeTaskFields: boolean, includeFormFields: boolean): Record<string, unknown> {
+    const prefix = this.fieldPrefix || 'f_'
+    const taskPrefix = this.taskFieldPrefix || 'tf_'
+    const data: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(inst.variables)) {
+      if (includeFormFields && k.startsWith(prefix) && k.length > prefix.length) {
+        const name = k.slice(prefix.length)
+        if (!this.isEditable(fieldPerm, name)) continue
+        data[name] = v
+      } else if (includeTaskFields && k.startsWith(taskPrefix) && k.length > taskPrefix.length) {
+        data[k.slice(taskPrefix.length)] = v
+      }
+    }
+    return data
+  }
+
+  /** 任务节点字段权限（node.properties.field 的 PERMISSION_x；缺省 null=全部可编辑） */
+  private resolveFieldPermission(node: FlowNode): Record<string, unknown> | null {
+    const field = node.properties?.field
+    if (field && typeof field === 'object' && Object.keys(field as object).length > 0) {
+      return field as Record<string, unknown>
+    }
+    return null
+  }
+
+  /** 字段可编辑判定：无声明或 EDIT(2) 可更新；READ_ONLY(1)/HIDDEN(3) 不更新 */
+  private isEditable(fieldPerm: Record<string, unknown> | null, fieldName: string): boolean {
+    if (!fieldPerm) return true
+    const perm = fieldPerm[`PERMISSION_${fieldName}`]
+    if (perm == null) return true
+    return Number(perm) === PermEdit
+  }
+
+  /** 状态字段写入：优先 {节点ID}_{状态码} 列，无则 {节点ID} 列（列探测过滤） */
+  private putStateField(writer: DynamicTableWriter, tableName: string, data: Record<string, unknown>,
+                        nodeId: string, stateCode: number): void {
+    if (!nodeId) return
+    const kept = writer.filterColumns(tableName, [`${nodeId}_${stateCode}`, nodeId])
+    if (Array.isArray(kept) && kept.length > 0) data[kept[0]] = stateCode
+  }
+
+  /** 流程上下文字段（蛇形列名约定，与 writer 系统字段一致） */
+  private fillContext(data: Record<string, unknown>, inst: ProcessInstance): void {
+    data['process_instance_id'] ??= inst.id
+    data['apply_user_id'] ??= inst.operator
+    data['apply_dept_id'] ??= inst.variables[KeyDeptID] ?? null
   }
 }
