@@ -248,3 +248,30 @@ describe('persist 动态表写入 + 流程入库拦截器', () => {
     db.close()
   })
 })
+
+// 追加：⑭ 非自增主键生成 / ⑮ 未配置生成器报错（issues/21）
+describe('persist 主键生成（issues/21）', () => {
+  it('⑭ 非自增主键（TEXT 雪花）配生成器后插入成功', () => {
+    const db = new DatabaseSync(':memory:')
+    db.exec('CREATE TABLE biz_snow (id TEXT PRIMARY KEY, title TEXT)')
+    const writer = new SqliteDynamicTableWriter(db)
+    writer.primaryKeyGenerator = () => 'snow-888'
+    writer.insert('biz_snow', { title: 'snow' })
+    const row = db.prepare('SELECT id, title FROM biz_snow').get() as any
+    assert.equal(row.id, 'snow-888')
+    assert.equal(row.title, 'snow')
+    // data 已含主键值 → 用之
+    writer.insert('biz_snow', { id: 'manual-1', title: 'm' })
+    const n = (db.prepare("SELECT COUNT(1) AS c FROM biz_snow WHERE id='manual-1'").get() as any).c
+    assert.equal(n, 1)
+    db.close()
+  })
+
+  it('⑮ 非自增主键未配生成器 → 清晰报错', () => {
+    const db = new DatabaseSync(':memory:')
+    db.exec('CREATE TABLE biz_snow (id TEXT PRIMARY KEY, title TEXT)')
+    const writer = new SqliteDynamicTableWriter(db) // 未配置生成器
+    assert.throws(() => writer.insert('biz_snow', { title: 'x' }), /primary key generator/)
+    db.close()
+  })
+})

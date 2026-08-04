@@ -26,6 +26,13 @@ export interface DynamicTableWriter {
 
 const TABLE_NAME_RE = /^[A-Za-z0-9_]+$/
 
+/** 表列元数据（issues/21：主键/自增用于主键生成决策） */
+interface ColumnMeta {
+  name: string          // 表列原名（UPPER）
+  primaryKey: boolean
+  autoIncrement: boolean
+}
+
 /** 列名归一（issues/20）：转小写 + 去下划线（companyName / company_name / COMPANY_NAME 等价） */
 function normalizeColumn(name: string): string {
   return name.toLowerCase().replace(/_/g, '')
@@ -51,7 +58,7 @@ function checkTableName(tableName: string): void {
  * MySQL/PG 集成方可自行实现 DynamicTableWriter 接口（契约见上）。
  */
 export class SqliteDynamicTableWriter implements DynamicTableWriter {
-  private cache = new Map<string, string[]>()
+  private cache = new Map<string, ColumnMeta[]>()
 
   /** 系统字段列名（null/undefined 禁用） */
   createTimeColumn?: string | null = 'create_time'
@@ -65,16 +72,22 @@ export class SqliteDynamicTableWriter implements DynamicTableWriter {
   /** 列匹配（issues/20）：默认宽松——驼峰↔下划线归一匹配（表单字段 companyName ↔ 表列 company_name）；
    *  需要精确控制列名的集成方显式开启严格模式（忽略大小写精确匹配） */
   strictColumnMatch = false
+  /** 主键生成器（issues/21）：非自增主键表（雪花/应用生成）插入时生成主键值，入参表名 */
+  primaryKeyGenerator?: (tableName: string) => unknown
 
   constructor(private db: DatabaseSync) {}
 
-  private tableColumns(tableName: string): string[] {
+  private tableColumns(tableName: string): ColumnMeta[] {
     const cached = this.cache.get(tableName)
     if (cached) return cached
-    // PRAGMA 不支持占位符——表名已过安全校验
-    const rows = this.db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>
+    // PRAGMA 不支持占位符——表名已过安全校验；INTEGER PRIMARY KEY 为 rowid 别名（自增）
+    const rows = this.db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string; type: string; pk: number }>
     if (rows.length === 0) throw new Error(`persist: table ${tableName} not found`)
-    const cols = rows.map(r => r.name.toUpperCase())
+    const cols = rows.map(r => ({
+      name: r.name.toUpperCase(),
+      primaryKey: r.pk === 1,
+      autoIncrement: r.pk === 1 && r.type.trim().toUpperCase() === 'INTEGER',
+    }))
     this.cache.set(tableName, cols)
     return cols
   }
@@ -91,11 +104,21 @@ export class SqliteDynamicTableWriter implements DynamicTableWriter {
     const names: string[] = []
     const values: SQLInputValue[] = []
     // 保持插入顺序稳定（对象键无序，按表列顺序取）；写入用表列原名（issues/20）
-    for (const col of cols) {
-      const key = this.findDataKey(data, col)
-      if (key === '') continue
-      names.push(col)
-      values.push(data[key] as SQLInputValue)
+    for (const m of cols) {
+      const key = this.findDataKey(data, m.name)
+      if (key !== '') {
+        names.push(m.name)
+        values.push(data[key] as SQLInputValue)
+        continue
+      }
+      // 主键生成（issues/21）：非自增主键表且 data 无主键值 → 调生成器；未配置 → 清晰报错
+      if (m.primaryKey && !m.autoIncrement) {
+        if (!this.primaryKeyGenerator) {
+          throw new Error(`persist: table ${tableName} primary key ${m.name} is not auto-increment and no primary key generator configured (set primaryKeyGenerator, e.g. snowflake)`)
+        }
+        names.push(m.name)
+        values.push(this.primaryKeyGenerator(tableName) as SQLInputValue)
+      }
     }
     if (names.length === 0) throw new Error(`persist: no matching columns for ${tableName}`)
     const placeholders = names.map(() => '?').join(',')
@@ -105,12 +128,12 @@ export class SqliteDynamicTableWriter implements DynamicTableWriter {
   }
 
   /** 列匹配（issues/20）：严格=忽略大小写精确；宽松（默认）=驼峰↔下划线归一匹配 */
-  private findColumn(cols: string[], key: string): string {
-    for (const col of cols) {
+  private findColumn(cols: ColumnMeta[], key: string): string {
+    for (const m of cols) {
       if (this.strictColumnMatch) {
-        if (col.toUpperCase() === key.toUpperCase()) return col
-      } else if (normalizeColumn(col) === normalizeColumn(key)) {
-        return col
+        if (m.name.toUpperCase() === key.toUpperCase()) return m.name
+      } else if (normalizeColumn(m.name) === normalizeColumn(key)) {
+        return m.name
       }
     }
     return ''
@@ -119,7 +142,11 @@ export class SqliteDynamicTableWriter implements DynamicTableWriter {
   /** 在 data 中找匹配指定表列的 key（宽松模式驼峰 key 匹配下划线列） */
   private findDataKey(data: Record<string, unknown>, col: string): string {
     for (const k of Object.keys(data)) {
-      if (this.findColumn([col], k) !== '') return k
+      if (this.strictColumnMatch) {
+        if (col.toUpperCase() === k.toUpperCase()) return k
+      } else if (normalizeColumn(col) === normalizeColumn(k)) {
+        return k
+      }
     }
     return ''
   }
