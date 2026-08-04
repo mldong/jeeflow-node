@@ -94,7 +94,7 @@ describe('persist 动态表写入 + 流程入库拦截器', () => {
     assert.equal(row.process_instance_id, inst.id)
     assert.equal(row.apply_user_id, 'user1')
     assert.equal(row.apply_dept_id, 'D01')
-    assert.equal(row.create_user, 'system')
+    assert.equal(row.create_user, 'user1') // issues/19: 用户列默认值优先 operator
     assert.equal(row.is_deleted, 0)
     assert.equal(countRows(db), 1)
     db.close()
@@ -150,7 +150,7 @@ describe('persist 动态表写入 + 流程入库拦截器', () => {
     const row = db.prepare('SELECT title, process_instance_id, create_user, is_deleted FROM biz_leave').get() as any
     assert.equal(row.title, '年假申请')
     assert.equal(row.process_instance_id, 1)
-    assert.equal(row.create_user, 'system')
+    assert.equal(row.create_user, 'user1') // issues/19: 用户列默认值优先 operator
     assert.equal(row.is_deleted, 0)
     db.close()
   })
@@ -177,6 +177,51 @@ describe('persist 动态表写入 + 流程入库拦截器', () => {
     writer.insert('biz_leave', { title: 't', process_instance_id: 99 })
     assert.equal(writer.exists('biz_leave', 'process_instance_id', 99), true)
     assert.equal(writer.exists('biz_leave', 'process_instance_id', 100), false)
+    db.close()
+  })
+
+  it('⑩ BIGINT 用户列（issues/19）：create_user 为 BIGINT 存 userId', async () => {
+    const db = new DatabaseSync(':memory:')
+    db.exec(`CREATE TABLE biz_settle (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      title TEXT,
+      process_instance_id INTEGER,
+      apply_user_id INTEGER,
+      create_user INTEGER,
+      update_user INTEGER,
+      is_deleted INTEGER
+    )`)
+    const writer = new SqliteDynamicTableWriter(db)
+    const repo = new MemoryRepository()
+    const { engine } = setupEngine(repo, writer)
+    let content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    content = content.replace('"type": "approval"', '"type": "approval", "relTableName": "biz_settle"')
+    const def: ProcessDefine = { id: 0, name: 'simple', displayName: '01-simple.json', type: 'approval', state: 1, content, version: 1, createTime: new Date(), updateTime: new Date(), createUser: '', updateUser: '' }
+    repo.addDefine(def)
+
+    const inst = await engine.startProcessInstanceById(def.id, '123', { f_title: '结算单', u_deptId: 'D01' })
+    let doing = await repo.findDoingTasks(inst.id)
+    await repo.addTaskActor(doing[0].id, ['123'])
+    await engine.executeProcessTask(doing[0].id, '123', { [KeySubmitType]: 0 })
+    doing = await repo.findDoingTasks(inst.id)
+    await repo.addTaskActor(doing[0].id, ['leader'])
+    await engine.executeProcessTask(doing[0].id, 'leader', { [KeySubmitType]: 1 })
+
+    const row = db.prepare('SELECT create_user, apply_user_id FROM biz_settle').get() as any
+    assert.equal(row.create_user, 123)
+    assert.equal(row.apply_user_id, 123)
+    db.close()
+  })
+
+  it('⑪ writer 用户列默认值：优先 apply_user_id，否则配置值回落', () => {
+    const { db, writer } = setupDb()
+    const data: Record<string, unknown> = { title: 't', apply_user_id: 'abc' }
+    writer.fillSystemFields(data, true)
+    assert.equal(data['create_user'], 'abc')
+    writer.defaultUserValue = 0
+    const data2: Record<string, unknown> = { title: 't' }
+    writer.fillSystemFields(data2, true)
+    assert.equal(data2['create_user'], 0)
     db.close()
   })
 })

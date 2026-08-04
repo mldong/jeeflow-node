@@ -54,6 +54,9 @@ export class SqliteDynamicTableWriter implements DynamicTableWriter {
   updateTimeColumn?: string | null = 'update_time'
   updateUserColumn?: string | null = 'update_user'
   isDeletedColumn?: string | null = 'is_deleted'
+  /** 用户列默认值（issues/19）：优先取 data 中已注入的 apply_user_id=流程 operator，
+   *  否则用此配置值，缺省 "system"——多数框架业务表 create_user/update_user 为 BIGINT 存 userId */
+  defaultUserValue: unknown = 'system'
 
   constructor(private db: DatabaseSync) {}
 
@@ -106,14 +109,20 @@ export class SqliteDynamicTableWriter implements DynamicTableWriter {
     const now = nowText()
     if (isInsert) {
       if (this.createTimeColumn) data[this.createTimeColumn] ??= now
-      if (this.createUserColumn) data[this.createUserColumn] ??= 'system'
+      if (this.createUserColumn) data[this.createUserColumn] ??= this.resolveDefaultUser(data)
       if (this.updateTimeColumn) data[this.updateTimeColumn] ??= now
-      if (this.updateUserColumn) data[this.updateUserColumn] ??= 'system'
+      if (this.updateUserColumn) data[this.updateUserColumn] ??= this.resolveDefaultUser(data)
       if (this.isDeletedColumn) data[this.isDeletedColumn] ??= 0
     } else {
       if (this.updateTimeColumn) data[this.updateTimeColumn] = now
-      if (this.updateUserColumn) data[this.updateUserColumn] ??= 'system'
+      if (this.updateUserColumn) data[this.updateUserColumn] ??= this.resolveDefaultUser(data)
     }
+  }
+
+  /** 默认用户值（issues/19）：优先取 data 中已注入的 apply_user_id
+   * （拦截器场景 = 流程 operator，BIGINT 用户列表开箱即用），否则回落配置默认值 */
+  private resolveDefaultUser(data: Record<string, unknown>): unknown {
+    return data['apply_user_id'] ?? this.defaultUserValue
   }
 }
 
@@ -155,6 +164,14 @@ export class PersistPostInterceptor implements FlowInterceptor {
     if (!inst || inst.state !== InstanceState.Done) return
     const submitType = Number(inst.variables[KeySubmitType])
     if (submitType !== SubmitType.Agree) return
+
+    // 同链重复触发防护（issues/19）：最后任务节点与结束节点都会触发后置拦截器，
+    // 同一执行链（共享 inst.variables）只插一次。标记写入时实例已完成持久化
+    // （引擎 executeNode 先 updateInstance 后触发拦截器，repo 存副本）不会落库；
+    // exists 保留作为跨请求/重启的幂等兜底（先查后插语义不变）。
+    const chainKey = `__persist_executed_${inst.id}`
+    if (inst.variables[chainKey] === true) return
+    inst.variables[chainKey] = true
 
     // 表名：流程定义顶层 relTableName，缺省回落流程 name
     const tableName = await this.resolveTableName(inst)
