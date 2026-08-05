@@ -1,6 +1,6 @@
 {
   "name": "@mldong/jeeflow",
-  "version": "1.8.8",
+  "version": "1.8.9",
   "description": "jeeflow workflow engine — Node.js / TypeScript implementation",
   "type": "module",
   "main": "./dist/index.js",
