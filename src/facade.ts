@@ -629,17 +629,20 @@ export class JeeflowFacade {
     return progress
   }
 
-  /** 成员姓名解析（issue 41 补强）：UserProvider SPI 批量解析 realName，查不到缺省空串 */
+  /** 成员姓名解析（issue 43/E15）：UserProvider SPI 并行批量解析 realName，查不到缺省空串 */
   private async resolveMemberNames(ids: string[]): Promise<Record<string, any>[]> {
     const userProv = this.engine.getUserProvider()
     const nameMap: Record<string, string> = {}
     if (userProv) {
-      for (const id of ids) {
+      const results = await Promise.all(ids.map(async id => {
         try {
           const u = await userProv.getUser(id)
-          if (u?.realName) nameMap[id] = u.realName
-        } catch { /* 单用户失败不影响其余 */ }
-      }
+          return [id, u?.realName ?? ''] as const
+        } catch {
+          return [id, ''] as const // 单用户失败不影响其余
+        }
+      }))
+      for (const [id, name] of results) if (name) nameMap[id] = name
     }
     return ids.map(id => ({ id, name: nameMap[id] ?? '' }))
   }
