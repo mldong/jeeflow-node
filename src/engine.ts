@@ -460,6 +460,11 @@ export class EngineImpl implements Engine {
     if (u.postName) vars[KeyPostName] = u.postName
   }
 
+  /** 用户提供者访问（issue 41 补强：nodeProgress 姓名解析用） */
+  getUserProvider(): UserProvider | undefined {
+    return this.userProv
+  }
+
   private nextId(): string {
     if (this.idGen) return this.idGen.nextId()
     return String(Date.now() * 1000 + Math.floor(Math.random() * 1000))

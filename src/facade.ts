@@ -582,7 +582,7 @@ export class JeeflowFacade {
     if (def) {
       try {
         const flow = JSON.parse(toStr(def.content))
-        nodeProgress = this.buildNodeProgress(flow, his)
+        nodeProgress = await this.buildNodeProgress(flow, his)
         await this.collectPath(flow, 'start', '', active, history, edges, new Set(), inst.variables ?? {}, his)
       } catch { /* ignore */ }
     }
@@ -591,8 +591,9 @@ export class JeeflowFacade {
 
   /** 节点成员进度（issue 41，对齐 boot3 highLight）：按任务状态 + 会签变量组装
    *  nodeProgress——会签节点带 type（PARALLEL/SEQUENTIAL），成员 done/active 标记；
-   *  动态参与人节点（无静态 actorIds）不返回；name 缺省（引擎不持有宿主用户体系，前端降级显示 id） */
-  private buildNodeProgress(flow: Record<string, any>, his: ProcessTask[]): Record<string, any> {
+   *  动态参与人节点（无静态 actorIds）不返回；name 走引擎 UserProvider SPI 解析
+   *  realName（未注入/查不到时缺省空串，前端降级显示 id） */
+  private async buildNodeProgress(flow: Record<string, any>, his: ProcessTask[]): Promise<Record<string, any>> {
     const progress: Record<string, any> = {}
     const names = [...new Set(his.map(t => t.taskName))]
     for (const name of names) {
@@ -613,20 +614,34 @@ export class JeeflowFacade {
       // 会签判定：定义节点属性（引擎创建任务时 performType 未落任务表，取模型为准）
       const nodeProps = node?.properties ?? {}
       const isCs = isCountersign(nodeProps.performType) || nodeProps.countersignType != null
-      const item: Record<string, any> = {
-        members: members.map((id: string) => {
-          const m: Record<string, any> = { id, name: '' }
-          if (doneSet.has(id)) m.done = true
-          else if (id === activeActor) m.active = true
-          return m
-        }),
+      // 姓名走 UserProvider SPI 解析（未注入/查不到缺省空串），done/active 按任务状态标记
+      const memberList = await this.resolveMemberNames(members)
+      for (const m of memberList) {
+        if (doneSet.has(m.id)) m.done = true
+        else if (m.id === activeActor) m.active = true
       }
+      const item: Record<string, any> = { members: memberList }
       if (isCs && nodeProps.countersignType) {
         item.type = nodeProps.countersignType
       }
       progress[name] = item
     }
     return progress
+  }
+
+  /** 成员姓名解析（issue 41 补强）：UserProvider SPI 批量解析 realName，查不到缺省空串 */
+  private async resolveMemberNames(ids: string[]): Promise<Record<string, any>[]> {
+    const userProv = this.engine.getUserProvider()
+    const nameMap: Record<string, string> = {}
+    if (userProv) {
+      for (const id of ids) {
+        try {
+          const u = await userProv.getUser(id)
+          if (u?.realName) nameMap[id] = u.realName
+        } catch { /* 单用户失败不影响其余 */ }
+      }
+    }
+    return ids.map(id => ({ id, name: nameMap[id] ?? '' }))
   }
 
   private async collectPath(flow: any, nodeId: string, edgeName: string, active: string[],

@@ -873,6 +873,8 @@ describe('jeeflow compliance tests', () => {
     assert.equal(np.task1.type, 'SEQUENTIAL')
     assert.equal(np.task1.members[0].id, 'userA')
     assert.equal(np.task1.members[0].active, true)
+    // 姓名走 UserProvider SPI 解析（setup userProv realName = '用户' + id）
+    assert.equal(np.task1.members[0].name, '用户userA', `name 应经 SPI 解析: ${np.task1.members[0].name}`)
     assert.equal(np.task1.members[1].id, 'userB')
     assert.equal(np.task1.members[1].done, undefined)
     assert.equal(np.task1.members[1].active, undefined)
