@@ -6,7 +6,7 @@
 
 import {
   CcInstanceRow, DefineRow, InstanceRow, InstanceState, ProcessDefine, ProcessDesign,
-  ProcessDesignHis, ProcessSurrogate, TaskRow, TaskState,
+  ProcessDesignHis, ProcessSurrogate, ProcessTask, TaskRow, TaskState,
 } from './model.js'
 import type { OrgUserProvider, ProcessExtRepository, ProcessRepository, QueryCondition } from './spi.js'
 import type { EngineImpl } from './engine.js'
@@ -578,13 +578,55 @@ export class JeeflowFacade {
     for (const t of his) if (!active.includes(t.taskName) && !history.includes(t.taskName)) history.push(t.taskName)
     // 路径补全：start 沿边递归（遇活跃节点停止）；决策分支按表达式求值过滤（issues/06）
     const def = await this.repo.findDefineById(inst.defineId)
+    let nodeProgress: Record<string, any> = {}
     if (def) {
       try {
         const flow = JSON.parse(toStr(def.content))
+        nodeProgress = this.buildNodeProgress(flow, his)
         await this.collectPath(flow, 'start', '', active, history, edges, new Set(), inst.variables ?? {}, his)
       } catch { /* ignore */ }
     }
-    return { activeNodeNames: active, historyNodeNames: history, historyEdgeNames: edges }
+    return { activeNodeNames: active, historyNodeNames: history, historyEdgeNames: edges, nodeProgress }
+  }
+
+  /** 节点成员进度（issue 41，对齐 boot3 highLight）：按任务状态 + 会签变量组装
+   *  nodeProgress——会签节点带 type（PARALLEL/SEQUENTIAL），成员 done/active 标记；
+   *  动态参与人节点（无静态 actorIds）不返回；name 缺省（引擎不持有宿主用户体系，前端降级显示 id） */
+  private buildNodeProgress(flow: Record<string, any>, his: ProcessTask[]): Record<string, any> {
+    const progress: Record<string, any> = {}
+    const names = [...new Set(his.map(t => t.taskName))]
+    for (const name of names) {
+      const tasks = his.filter(t => t.taskName === name)
+      const vars: Record<string, any> = tasks[0]?.variables ?? {}
+      // 完整办理人列表：会签变量 operatorList_{node} 优先（顺序会签全量），否则任务 actorIds 并集
+      let members = Array.isArray(vars[`operatorList_${name}`]) ? vars[`operatorList_${name}`] : null
+      if (!members || members.length === 0) {
+        members = [...new Set(tasks.flatMap(t => t.actorIds ?? []))]
+      }
+      if (!members || members.length === 0) continue // 动态参与人：无静态成员，不返回
+      const doneSet = new Set<string>()
+      for (const t of tasks) {
+        if (t.taskState === TaskState.Done) for (const a of t.actorIds ?? []) doneSet.add(a)
+      }
+      const activeActor = tasks.find(t => t.taskState === TaskState.Doing)?.actorIds?.[0]
+      const node = (flow.nodes ?? []).find((n: any) => n.id === name)
+      // 会签判定：定义节点属性（引擎创建任务时 performType 未落任务表，取模型为准）
+      const nodeProps = node?.properties ?? {}
+      const isCountersign = nodeProps.performType === 1 || nodeProps.countersignType != null
+      const item: Record<string, any> = {
+        members: members.map((id: string) => {
+          const m: Record<string, any> = { id, name: '' }
+          if (doneSet.has(id)) m.done = true
+          else if (id === activeActor) m.active = true
+          return m
+        }),
+      }
+      if (isCountersign && nodeProps.countersignType) {
+        item.type = nodeProps.countersignType
+      }
+      progress[name] = item
+    }
+    return progress
   }
 
   private async collectPath(flow: any, nodeId: string, edgeName: string, active: string[],

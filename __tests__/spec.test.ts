@@ -855,3 +855,42 @@ describe('jeeflow compliance tests', () => {
     assert.equal(typeof r.data.processInstanceId, 'string', JSON.stringify(r))
   })
 })
+  it('27 highLight nodeProgress 成员进度回显（issue 41）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    // 顺序会签流程：apply(applicant) → task1(userA,userB SEQUENTIAL) → end
+    const r0 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '06-countersign-sequential.json', 'utf-8') })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const r1 = await facade.flow('processInstance/startAndExecute', { processDefineId: r0.data.processDefineId, operator: 'user1' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const hl = await facade.flow('processInstance/highLight', { id: r1.data.processInstanceId })
+    assert.equal(hl.code, 0, JSON.stringify(hl))
+    const np = hl.data.nodeProgress as Record<string, any>
+    // 历史节点 apply：发起人 done
+    assert.equal(np.apply.members[0].id, 'user1')
+    assert.equal(np.apply.members[0].done, true)
+    // 顺序会签进行中：type=SEQUENTIAL、第一位 active、第二位未标记
+    assert.equal(np.task1.type, 'SEQUENTIAL')
+    assert.equal(np.task1.members[0].id, 'userA')
+    assert.equal(np.task1.members[0].active, true)
+    assert.equal(np.task1.members[1].id, 'userB')
+    assert.equal(np.task1.members[1].done, undefined)
+    assert.equal(np.task1.members[1].active, undefined)
+    // 推进会签：完成 userA → userB active
+    const doing1 = await repo.findDoingTasks(r1.data.processInstanceId)
+    await repo.addTaskActor(doing1[0].id, ['userA'])
+    await engine.executeProcessTask(doing1[0].id, 'userA')
+    const hl2 = await facade.flow('processInstance/highLight', { id: r1.data.processInstanceId })
+    const np2 = hl2.data.nodeProgress as Record<string, any>
+    assert.equal(np2.task1.members[0].done, true, 'userA 应 done')
+    assert.equal(np2.task1.members[1].active, true, 'userB 应 active')
+    // 全部完成 → 全部 done
+    const doing2 = await repo.findDoingTasks(r1.data.processInstanceId)
+    await repo.addTaskActor(doing2[0].id, ['userB'])
+    await engine.executeProcessTask(doing2[0].id, 'userB')
+    const hl3 = await facade.flow('processInstance/highLight', { id: r1.data.processInstanceId })
+    const np3 = hl3.data.nodeProgress as Record<string, any>
+    assert.equal(np3.task1.members[0].done, true)
+    assert.equal(np3.task1.members[1].done, true)
+    assert.equal(np3.task1.members[1].active, undefined)
+  })
