@@ -10,7 +10,7 @@ import {
 } from './model.js'
 import type { OrgUserProvider, ProcessExtRepository, ProcessRepository, QueryCondition } from './spi.js'
 import type { EngineImpl } from './engine.js'
-import { KeyNextNodeOperator, KeyProcessStartNextNodeOperator } from './engine.js'
+import { KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign } from './engine.js'
 
 // submitType 枚举（对齐 boot3）
 const SUBMIT_APPLY = 0
@@ -612,7 +612,7 @@ export class JeeflowFacade {
       const node = (flow.nodes ?? []).find((n: any) => n.id === name)
       // 会签判定：定义节点属性（引擎创建任务时 performType 未落任务表，取模型为准）
       const nodeProps = node?.properties ?? {}
-      const isCountersign = nodeProps.performType === 1 || nodeProps.countersignType != null
+      const isCs = isCountersign(nodeProps.performType) || nodeProps.countersignType != null
       const item: Record<string, any> = {
         members: members.map((id: string) => {
           const m: Record<string, any> = { id, name: '' }
@@ -621,7 +621,7 @@ export class JeeflowFacade {
           return m
         }),
       }
-      if (isCountersign && nodeProps.countersignType) {
+      if (isCs && nodeProps.countersignType) {
         item.type = nodeProps.countersignType
       }
       progress[name] = item

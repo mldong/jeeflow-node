@@ -361,12 +361,11 @@ export class EngineImpl implements Engine {
   private async createTask(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>): Promise<void> {
     const actors = await this.resolveActors(node, inst, operator, vars)
     if (!actors.length) return
-    const performType = parseInt(String(node.properties?.performType ?? '0'))
     const ct = node.properties?.countersignType as string | undefined
     const now = new Date()
     const form = node.properties?.form ?? ''
 
-    if (performType === 1 && ct) {
+    if (isCountersign(node.properties?.performType) && ct) {
       switch (ct) {
         case 'PARALLEL':
           for (const actor of actors) await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now))
@@ -506,6 +505,14 @@ function isTruthy(v: any): boolean {
   if (typeof v === 'string') return v !== '' && v !== 'false'
   if (typeof v === 'number') return v !== 0
   return v != null
+}
+
+/** 会签判定（issue 42，对齐 Java ProcessTaskPerformTypeEnum.codeOf）：
+ *  '1' / 'ALL' / 'COUNTERSIGN'（大小写不敏感）→ 会签。
+ *  设计器属性面板保存 'ALL' 字符串符合 Java 契约，引擎必须兼容 */
+export function isCountersign(v: any): boolean {
+  const s = String(v ?? '').trim().toUpperCase()
+  return s === '1' || s === 'ALL' || s === 'COUNTERSIGN'
 }
 
 

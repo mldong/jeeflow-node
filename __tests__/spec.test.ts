@@ -854,7 +854,7 @@ describe('jeeflow compliance tests', () => {
     // 返回 id 必须是 string（JS number 无法承载雪花值，前端回传必须用字符串）
     assert.equal(typeof r.data.processInstanceId, 'string', JSON.stringify(r))
   })
-})
+
   it('27 highLight nodeProgress 成员进度回显（issue 41）', async () => {
     const { engine, repo } = setup()
     const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
@@ -894,3 +894,30 @@ describe('jeeflow compliance tests', () => {
     assert.equal(np3.task1.members[1].done, true)
     assert.equal(np3.task1.members[1].active, undefined)
   })
+
+  it('28 performType 字符串兼容（issue 42）：ALL 面板格式会签行为与数字 1 一致', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    // 面板格式：performType 存 'ALL' 字符串（Java codeOf 契约）
+    const contentAll = readFileSync(flowDir + '05-countersign-parallel.json', 'utf-8')
+      .replace('\"performType\": 1', '\"performType\": \"ALL\"')
+    const r0 = await facade.flow('processDefine/deploy', { content: contentAll })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const r1 = await facade.flow('processInstance/startAndExecute', { processDefineId: r0.data.processDefineId, operator: 'user1' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    // 并行会签：3 参与者 → 3 个任务（普通语义只有 1 个）
+    const doing = await repo.findDoingTasks(r1.data.processInstanceId)
+    const csTasks = doing.filter(t => t.taskName === 'task1')
+    assert.equal(csTasks.length, 3, `ALL 格式应生成 3 个会签任务: ${csTasks.length}`)
+    assert.deepEqual(csTasks.map(t => t.actorIds[0]).sort(), ['userA', 'userB', 'userC'])
+    // 数字 1 格式对照：行为一致
+    const r2 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '05-countersign-parallel.json', 'utf-8') })
+    const r3 = await facade.flow('processInstance/startAndExecute', { processDefineId: r2.data.processDefineId, operator: 'user1' })
+    const doing2 = await repo.findDoingTasks(r3.data.processInstanceId)
+    assert.equal(doing2.filter(t => t.taskName === 'task1').length, 3, '数字 1 格式同样 3 个会签任务')
+    // nodeProgress 对 ALL 格式同样识别为会签（type=PARALLEL）
+    const hl = await facade.flow('processInstance/highLight', { id: r3.data.processInstanceId })
+    assert.equal(hl.code, 0, JSON.stringify(hl))
+    assert.equal(hl.data.nodeProgress.task1.type, 'PARALLEL')
+  })
+})
