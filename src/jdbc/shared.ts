@@ -154,8 +154,8 @@ export class JdbcRepository implements ProcessRepository {
         id: row.id, name: row.name, displayName: row.display_name, type: row.type,
         state: row.state,
         content: row.content ? Buffer.from(row.content).toString('utf8') : '',
-        version: row.version, createTime: row.create_time, createUser: row.create_user,
-        updateTime: row.update_time, updateUser: row.update_user,
+        version: row.version, createTime: row.create_time, createUser: rowId(row.create_user),
+        updateTime: row.update_time, updateUser: rowId(row.update_user),
       }
     } finally {
       await this.done(conn)
@@ -229,8 +229,8 @@ export class JdbcRepository implements ProcessRepository {
         id: rowId(row.id), name: row.name, displayName: row.display_name, type: row.type,
         state: row.state,
         content: row.content ? Buffer.from(row.content).toString('utf8') : '',
-        version: row.version, createTime: row.create_time, createUser: row.create_user,
-        updateTime: row.update_time, updateUser: row.update_user,
+        version: row.version, createTime: row.create_time, createUser: rowId(row.create_user),
+        updateTime: row.update_time, updateUser: rowId(row.update_user),
       }
     } finally {
       await this.done(conn)
@@ -254,8 +254,8 @@ export class JdbcRepository implements ProcessRepository {
         defineId: rowId(row.process_define_id),
         state: row.state, parentNodeName: row.parent_node_name, businessNo: row.business_no,
         operator: row.operator, expireTime: row.expire_time,
-        createTime: row.create_time, createUser: row.create_user,
-        updateTime: row.update_time, updateUser: row.update_user,
+        createTime: row.create_time, createUser: rowId(row.create_user),
+        updateTime: row.update_time, updateUser: rowId(row.update_user),
         tasks: [],
       })
       inst.variables = row.variable ? JSON.parse(row.variable) : {}
@@ -411,8 +411,8 @@ export class JdbcRepository implements ProcessRepository {
       taskState: row.task_state, actorId: row.operator, finishTime: row.finish_time,
       expireTime: row.expire_time, formKey: row.form_key,
       parentTaskId: row.task_parent_id != null ? rowId(row.task_parent_id) : undefined,
-      createTime: row.create_time, createUser: row.create_user,
-      updateTime: row.update_time, updateUser: row.update_user,
+      createTime: row.create_time, createUser: rowId(row.create_user),
+      updateTime: row.update_time, updateUser: rowId(row.update_user),
     })
     task.variables = row.variable ? JSON.parse(row.variable) : {}
     task.actorIds = []
@@ -518,8 +518,8 @@ export class JdbcRepository implements ProcessRepository {
         rows: rows.map(r => ({
           id: rowId(r.id), name: r.name, displayName: r.display_name, type: r.type,
           state: Number(r.state), version: Number(r.version),
-          createTime: r.create_time, createUser: r.create_user ?? '',
-          updateTime: r.update_time, updateUser: r.update_user ?? '',
+          createTime: r.create_time, createUser: rowId(r.create_user),
+          updateTime: r.update_time, updateUser: rowId(r.update_user),
         })),
         total,
       }
@@ -592,8 +592,8 @@ export class JdbcRepository implements ProcessRepository {
       defineId: rowId(r.process_define_id), state: r.state as InstanceState,
       parentNodeName: r.parent_node_name ?? '', businessNo: r.business_no ?? '', operator: r.operator ?? '',
       expireTime: r.expire_time ?? undefined, variables,
-      createTime: r.create_time, createUser: r.create_user ?? '',
-      updateTime: r.update_time, updateUser: r.update_user ?? '',
+      createTime: r.create_time, createUser: rowId(r.create_user),
+      updateTime: r.update_time, updateUser: rowId(r.update_user),
       defineName: r.name ?? '', defineDisplayName: r.display_name ?? '',
       defineVersion: Number(r.version ?? 0),
     }
@@ -643,8 +643,8 @@ export class JdbcRepository implements ProcessRepository {
       taskState: r.task_state as TaskState, operator: r.operator ?? '', finishTime: r.finish_time ?? undefined,
       expireTime: r.expire_time ?? undefined, formKey: r.form_key ?? '',
       taskParentId: r.task_parent_id != null ? rowId(r.task_parent_id) : undefined,
-      variables, createTime: r.create_time, createUser: r.create_user ?? '',
-      updateTime: r.update_time, updateUser: r.update_user ?? '',
+      variables, createTime: r.create_time, createUser: rowId(r.create_user),
+      updateTime: r.update_time, updateUser: rowId(r.update_user),
       processDefineName: r.name ?? '', processDefineDisplayName: r.display_name ?? '',
       defineVersion: Number(r.process_define_version ?? 0),
       instanceVariable: r.instance_variable ?? '', instanceCreateTime: r.instance_create_time,
@@ -687,8 +687,8 @@ export class JdbcRepository implements ProcessRepository {
       defineId: rowId(r.process_define_id), state: r.state as InstanceState,
       parentNodeName: r.parent_node_name ?? '', businessNo: r.business_no ?? '', operator: r.operator ?? '',
       expireTime: r.expire_time ?? undefined, variables,
-      createTime: r.create_time, createUser: r.create_user ?? '',
-      updateTime: r.update_time, updateUser: r.update_user ?? '',
+      createTime: r.create_time, createUser: rowId(r.create_user),
+      updateTime: r.update_time, updateUser: rowId(r.update_user),
       defineName: r.name ?? '', defineDisplayName: r.display_name ?? '',
       defineVersion: Number(r.version ?? 0),
     }

@@ -181,7 +181,7 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
       return rows.map(r => ({
         id: rowId(r.id), processDesignId: rowId(r.process_design_id),
         content: r.content ? Buffer.from(r.content).toString('utf8') : '',
-        createTime: r.create_time, createUser: r.create_user,
+        createTime: r.create_time, createUser: rowId(r.create_user),
       }))
     } finally {
       await this.done(conn)
@@ -311,8 +311,8 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
     return {
       id: rowId(row.id), name: row.name, displayName: row.display_name, type: row.type,
       icon: row.icon, isDeployed: row.is_deployed, remark: row.remark,
-      createTime: row.create_time, createUser: row.create_user,
-      updateTime: row.update_time, updateUser: row.update_user,
+      createTime: row.create_time, createUser: rowId(row.create_user),
+      updateTime: row.update_time, updateUser: rowId(row.update_user),
     }
   }
 
@@ -320,8 +320,8 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
     return {
       id: rowId(row.id), processName: row.process_name, operator: row.operator, surrogate: row.surrogate,
       startTime: row.start_time, endTime: row.end_time, enabled: row.enabled,
-      createTime: row.create_time, createUser: row.create_user,
-      updateTime: row.update_time, updateUser: row.update_user,
+      createTime: row.create_time, createUser: rowId(row.create_user),
+      updateTime: row.update_time, updateUser: rowId(row.update_user),
     }
   }
 }
