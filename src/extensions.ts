@@ -31,8 +31,8 @@ export enum EventType {
 
 export interface ProcessEvent {
   type: EventType
-  instanceId: number
-  taskId?: number
+  instanceId: string
+  taskId?: string
   nodeId?: string
   operator: string
 }

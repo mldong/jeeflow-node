@@ -77,7 +77,7 @@ const userProv: UserProvider = {
 class SeqIDGen implements IDGenerator {
   private base = Date.now() * 1000
   private n = 0
-  nextId(): number { this.n += 1; return this.base + this.n }
+  nextId(): string { this.n += 1; return String(this.base + this.n) }
 }
 
 async function applySchema(): Promise<void> {

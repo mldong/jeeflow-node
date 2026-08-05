@@ -194,7 +194,7 @@ export class JeeflowFacade {
     return { processDefineId: defineId }
   }
 
-  private async saveDeployedDefine(content: string, args: Record<string, any>): Promise<number> {
+  private async saveDeployedDefine(content: string, args: Record<string, any>): Promise<string> {
     let flow: any
     try {
       flow = JSON.parse(content)
@@ -208,7 +208,7 @@ export class JeeflowFacade {
     if (latest) version = (latest.version ?? 0) + 1
     const operator = String(args.operator ?? 'system')
     const def: ProcessDefine = {
-      id: 0, name, displayName: flow.displayName ?? '', type: flow.type ?? 'approval',
+      id: '', name, displayName: flow.displayName ?? '', type: flow.type ?? 'approval',
       state: 1, content, version, createTime: new Date(), createUser: operator,
       updateTime: new Date(), updateUser: operator,
     }
@@ -325,7 +325,7 @@ export class JeeflowFacade {
     const hisList = await ext.listDesignHis(designId)
     if (hisList.length === 0 || toStr(hisList[0].content) !== content) {
       await ext.saveDesignHis({
-        id: 0, processDesignId: designId, content,
+        id: '', processDesignId: designId, content,
         createTime: new Date(), createUser: String(args.operator ?? 'system'),
       })
     }
@@ -440,7 +440,7 @@ export class JeeflowFacade {
     if (!flow?.name) throw new Error('流程定义缺少 name')
     // 按 name 取最新定义：有则替换内容（version 不变），无则新建（对齐 boot3 redeploy）
     const last = await this.repo.findDefineByName(flow.name)
-    let defineId: number
+    let defineId: string
     if (!last) {
       defineId = await this.saveDeployedDefine(content, args)
     } else {
@@ -487,11 +487,11 @@ export class JeeflowFacade {
   private async designSave(args: Record<string, any>): Promise<Record<string, any>> {
     const ext = this.ext()
     const operator = String(args.operator ?? 'user1')
-    const designId = args.id != null ? toId(args.id) : 0
+    const designId = args.id != null ? toId(args.id) : ''
     let design: ProcessDesign
     if (!designId) {
       design = {
-        id: 0, name: String(args.name ?? ''), displayName: String(args.displayName ?? ''),
+        id: '', name: String(args.name ?? ''), displayName: String(args.displayName ?? ''),
         type: String(args.type ?? 'approval'), icon: String(args.icon ?? ''),
         isDeployed: 0, remark: String(args.remark ?? ''),
         createTime: new Date(), createUser: operator,
@@ -514,7 +514,7 @@ export class JeeflowFacade {
     // 内容快照（设计稿内容存历史表）
     if (args.content != null) {
       await ext.saveDesignHis({
-        id: 0, processDesignId: design.id, content: String(args.content),
+        id: '', processDesignId: design.id, content: String(args.content),
         createTime: new Date(), createUser: operator,
       })
     }
@@ -533,11 +533,11 @@ export class JeeflowFacade {
   private async surrogateSave(args: Record<string, any>): Promise<Record<string, any>> {
     const ext = this.ext()
     const operator = String(args.operator ?? 'user1')
-    const surrogateId = args.id != null ? toId(args.id) : 0
+    const surrogateId = args.id != null ? toId(args.id) : ''
     let surrogate: ProcessSurrogate
     if (!surrogateId) {
       surrogate = {
-        id: 0, operator, // 授权人 = 操作人
+        id: '', operator, // 授权人 = 操作人
         surrogate: String(args.surrogate ?? ''), processName: String(args.processName ?? ''),
         enabled: toInt(args.enabled ?? 1),
         createTime: new Date(), createUser: operator,
@@ -1051,10 +1051,13 @@ function toStr(v: any): string {
   return String(v)
 }
 
-function toId(v: any): number {
-  const n = Number(v)
-  if (!Number.isFinite(n) || n <= 0) throw new Error('id 缺失或非法')
-  return n
+function toId(v: any): string {
+  // issue 38 E9：id 全程 string 承载——Java 雪花 id（>2^53）经 Number() 必丢精度。
+  // 数字输入（JS 安全整数内）转字符串；字符串输入原样保留（含超长雪花 id）。
+  if (v == null) throw new Error('id 缺失或非法')
+  const s = String(v).trim()
+  if (!/^\d+$/.test(s) || s === '0') throw new Error('id 缺失或非法')
+  return s
 }
 
 function toStringList2(v: any): string[] {

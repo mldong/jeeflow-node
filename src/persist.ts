@@ -207,7 +207,7 @@ export class SqliteDynamicTableWriter implements DynamicTableWriter {
 // ═══ 工作流入库适配拦截器 ════════════════════════════════════════════════════
 
 /** 流程定义加载器（用于解析 relTableName / persistMode / 流程 name），通常透传仓库 findDefineById */
-export type DefineLoader = (defineId: number) => Promise<ProcessDefine | null>
+export type DefineLoader = (defineId: string) => Promise<ProcessDefine | null>
 
 /** 持久化模式（流程定义顶层 persistMode，缺省 ARCHIVE） */
 export const PersistModeArchive = 'ARCHIVE' // 结束归档（现状）：流程结束同意后落库

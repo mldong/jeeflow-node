@@ -25,11 +25,11 @@ export const KeyAutoExecute = 'flow.auto'
 export const KeyAdminID     = 'flow.admin'
 
 export interface Engine {
-  startProcessInstanceById(defineId: number, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
-  executeProcessTask(taskId: number, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
-  executeAndJumpToEnd(taskId: number, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
-  executeAndJumpTask(taskId: number, operator: string, args: Record<string, any>, targetTaskName?: string): Promise<ProcessInstance>
-  executeAndJumpToFirstTaskNode(taskId: number, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
+  startProcessInstanceById(defineId: string, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
+  executeProcessTask(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
+  executeAndJumpToEnd(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
+  executeAndJumpTask(taskId: string, operator: string, args: Record<string, any>, targetTaskName?: string): Promise<ProcessInstance>
+  executeAndJumpToFirstTaskNode(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
 }
 
 export class EngineImpl implements Engine {
@@ -49,7 +49,7 @@ export class EngineImpl implements Engine {
   }
   setRegistry(reg: HandlerRegistry) { this.registry = reg }
 
-  private interceptorCache = new Map<number, FlowInterceptor[]>()
+  private interceptorCache = new Map<string, FlowInterceptor[]>()
 
   /** 定义级拦截器解析（issue 34，对齐 Java 模型级 postInterceptors）：
    *  流程定义顶层 postInterceptors 声明 → 按名从 interceptorRegistry 取（未声明该流程不触发）；
@@ -104,7 +104,7 @@ export class EngineImpl implements Engine {
 
   // ─── Start ─────────────────────────────────────────────────────────────────
 
-  async startProcessInstanceById(defineId: number, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
+  async startProcessInstanceById(defineId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
     const def = await this.repo.findDefineById(defineId)
     if (!def) throw new Error(`define not found: ${defineId}`)
     const content = typeof def.content === 'string' ? def.content : new TextDecoder().decode(def.content as Uint8Array)
@@ -130,7 +130,7 @@ export class EngineImpl implements Engine {
 
   // ─── Execute ───────────────────────────────────────────────────────────────
 
-  async executeProcessTask(taskId: number, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
+  async executeProcessTask(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
     const { task, inst } = await this.loadAndCheck(taskId, operator)
     // issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）——
     // 被拒值无法经流程变量落到下游节点写入，上游只读声明不可被绕过
@@ -192,7 +192,7 @@ export class EngineImpl implements Engine {
 
   // ─── Reject ────────────────────────────────────────────────────────────────
 
-  async executeAndJumpToEnd(taskId: number, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
+  async executeAndJumpToEnd(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
     const { task, inst } = await this.loadAndCheck(taskId, operator)
     const now = new Date()
     // 聚合根：废弃所有进行中任务
@@ -211,7 +211,7 @@ export class EngineImpl implements Engine {
 
   // ─── Jump ──────────────────────────────────────────────────────────────────
 
-  async executeAndJumpTask(taskId: number, operator: string, args: Record<string, any> = {}, targetTaskName?: string): Promise<ProcessInstance> {
+  async executeAndJumpTask(taskId: string, operator: string, args: Record<string, any> = {}, targetTaskName?: string): Promise<ProcessInstance> {
     const { task, inst } = await this.loadAndCheck(taskId, operator)
     const now = new Date()
     // 聚合根：废弃所有进行中任务
@@ -231,7 +231,7 @@ export class EngineImpl implements Engine {
 
   // ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）────────────
 
-  async executeAndJumpToFirstTaskNode(taskId: number, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
+  async executeAndJumpToFirstTaskNode(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
     const { task, inst } = await this.loadAndCheck(taskId, operator)
     const now = new Date()
     // 聚合根：废弃所有进行中任务
@@ -258,7 +258,7 @@ export class EngineImpl implements Engine {
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
 
-  private async loadAndCheck(taskId: number, operator: string) {
+  private async loadAndCheck(taskId: string, operator: string) {
     const task = await this.repo.findTaskById(taskId)
     if (!task) throw new Error(`task not found: ${taskId}`)
     if (task.taskState !== TaskState.Doing) throw new Error(`task not doing`)
@@ -461,9 +461,9 @@ export class EngineImpl implements Engine {
     if (u.postName) vars[KeyPostName] = u.postName
   }
 
-  private nextId(): number {
+  private nextId(): string {
     if (this.idGen) return this.idGen.nextId()
-    return Date.now() * 1000 + Math.floor(Math.random() * 1000)
+    return String(Date.now() * 1000 + Math.floor(Math.random() * 1000))
   }
 }
 

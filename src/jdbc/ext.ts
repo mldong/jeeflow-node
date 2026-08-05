@@ -7,7 +7,7 @@ import {
   ProcessDesign, ProcessDesignHis, ProcessSurrogate,
 } from '../model.js'
 import type { IDGenerator, ProcessExtRepository, QueryCondition } from '../spi.js'
-import { TsIDGenerator, type SqlAdapter, type SqlConnection } from './shared.js'
+import { TsIDGenerator, rowId, type SqlAdapter, type SqlConnection } from './shared.js'
 
 const txStore = new AsyncLocalStorage<SqlConnection>()
 
@@ -38,7 +38,7 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
   private static DESIGN_COLS =
     'id, name, display_name, type, icon, is_deployed, remark, create_time, create_user, update_time, update_user'
 
-  async findDesignById(id: number): Promise<ProcessDesign | null> {
+  async findDesignById(id: string): Promise<ProcessDesign | null> {
     const conn = await this.c()
     try {
       const row = await conn.fetchOne(this.sql(
@@ -79,7 +79,7 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
     }
   }
 
-  async removeDesign(id: number): Promise<void> {
+  async removeDesign(id: string): Promise<void> {
     const conn = await this.c()
     try {
       await conn.execute(this.sql('DELETE FROM wf_process_design WHERE id=?'), [id])
@@ -172,14 +172,14 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
     }
   }
 
-  async listDesignHis(designId: number): Promise<ProcessDesignHis[]> {
+  async listDesignHis(designId: string): Promise<ProcessDesignHis[]> {
     const conn = await this.c()
     try {
       const rows = await conn.fetchAll(this.sql(
         'SELECT id, process_design_id, content, create_time, create_user FROM wf_process_design_his WHERE process_design_id = ? ORDER BY id DESC'),
         [designId])
       return rows.map(r => ({
-        id: r.id, processDesignId: r.process_design_id,
+        id: rowId(r.id), processDesignId: rowId(r.process_design_id),
         content: r.content ? Buffer.from(r.content).toString('utf8') : '',
         createTime: r.create_time, createUser: r.create_user,
       }))
@@ -193,7 +193,7 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
   private static SURROGATE_COLS =
     'id, process_name, operator, surrogate, start_time, end_time, enabled, create_time, create_user, update_time, update_user'
 
-  async findSurrogateById(id: number): Promise<ProcessSurrogate | null> {
+  async findSurrogateById(id: string): Promise<ProcessSurrogate | null> {
     const conn = await this.c()
     try {
       const row = await conn.fetchOne(this.sql(
@@ -235,7 +235,7 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
     }
   }
 
-  async removeSurrogate(id: number): Promise<void> {
+  async removeSurrogate(id: string): Promise<void> {
     const conn = await this.c()
     try {
       await conn.execute(this.sql('DELETE FROM wf_process_surrogate WHERE id=?'), [id])
@@ -309,7 +309,7 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
 
   private mapDesign(row: any): ProcessDesign {
     return {
-      id: row.id, name: row.name, displayName: row.display_name, type: row.type,
+      id: rowId(row.id), name: row.name, displayName: row.display_name, type: row.type,
       icon: row.icon, isDeployed: row.is_deployed, remark: row.remark,
       createTime: row.create_time, createUser: row.create_user,
       updateTime: row.update_time, updateUser: row.update_user,
@@ -318,7 +318,7 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
 
   private mapSurrogate(row: any): ProcessSurrogate {
     return {
-      id: row.id, processName: row.process_name, operator: row.operator, surrogate: row.surrogate,
+      id: rowId(row.id), processName: row.process_name, operator: row.operator, surrogate: row.surrogate,
       startTime: row.start_time, endTime: row.end_time, enabled: row.enabled,
       createTime: row.create_time, createUser: row.create_user,
       updateTime: row.update_time, updateUser: row.update_user,

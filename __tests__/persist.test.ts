@@ -45,7 +45,7 @@ function setupEngine(repo: MemoryRepository, writer: SqliteDynamicTableWriter | 
   const userProv: UserProvider = {
     async getUser(userId) { return { userId, realName: '用户' + userId, deptId: 'D01', deptName: '测试部门', postId: 'P01', postName: '测试岗位' } },
   }
-  const idGen = { nextId() { return Date.now() * 1000 + Math.floor(Math.random() * 1000) } }
+  const idGen = { nextId() { return String(Date.now() * 1000 + Math.floor(Math.random() * 1000)) } }
   const exprEval: ExpressionEvaluator = {
     async eval() { return false },
   }
@@ -91,7 +91,8 @@ describe('persist 动态表写入 + 流程入库拦截器', () => {
     const row = db.prepare('SELECT title, amount, process_instance_id, apply_user_id, apply_dept_id, create_user, is_deleted FROM biz_leave').get() as any
     assert.equal(row.title, '年假申请')
     assert.equal(row.amount, 800)
-    assert.equal(row.process_instance_id, inst.id)
+    // sqlite 驱动返回 INTEGER 为 number，归一化后与引擎 string id 比较（issue 38 E9）
+    assert.equal(String(row.process_instance_id), inst.id)
     assert.equal(row.apply_user_id, 'user1')
     assert.equal(row.apply_dept_id, 'D01')
     assert.equal(row.create_user, 'user1') // issues/19: 用户列默认值优先 operator
@@ -430,7 +431,7 @@ describe('1.8.4 issues/34 定义级拦截器 + 30/31 facade', () => {
     const writer = new SqliteDynamicTableWriter(db)
     const ic = new PersistPostInterceptor(writer, async id => repo.findDefineById(id))
     const userProv: UserProvider = { async getUser(userId) { return { userId, realName: '用户' + userId, deptId: 'D01' } } }
-    const engine = new EngineImpl(repo, userProv, { nextId() { return Date.now() } }, { async eval() { return false } })
+    const engine = new EngineImpl(repo, userProv, { nextId() { return String(Date.now()) } }, { async eval() { return false } })
     // 注册表挂载（定义级）
     engine.setExtensions({ interceptors: [], interceptorRegistry: { persist: ic } })
 
@@ -463,13 +464,13 @@ describe('1.8.4 issues/34 定义级拦截器 + 30/31 facade', () => {
   it('⑩ facade 顶层 JSON 保存 + listByType + bizData', async () => {
     const { JeeflowFacade } = await import('../src/index.js')
     const repo = new MemoryRepository()
-    // 内存扩展仓储（mock，避免测试依赖真实数据库 adapter）
-    const designs = new Map<number, any>()
-    const hisMap = new Map<number, any[]>()
+    // 内存扩展仓储（mock，避免测试依赖真实数据库 adapter）——id 为 string（issue 38 E9）
+    const designs = new Map<string, any>()
+    const hisMap = new Map<string, any[]>()
     let dseq = 1
     const ext: any = {
       async findDesignById(id) { return designs.get(id) ?? null },
-      async saveDesign(d) { if (!d.id) d.id = dseq++; designs.set(d.id, d) },
+      async saveDesign(d) { if (!d.id) d.id = String(dseq++); designs.set(d.id, d) },
       async updateDesign(d) { designs.set(d.id, d) },
       async removeDesign(id) { designs.delete(id); hisMap.delete(id) },
       async pageDesigns() { return [[...designs.values()], designs.size] },
@@ -479,9 +480,9 @@ describe('1.8.4 issues/34 定义级拦截器 + 30/31 facade', () => {
       async removeSurrogate() {}, async pageSurrogates() { return [[], 0] }, async getSurrogate() { return null },
     }
     const userProv: UserProvider = { async getUser(userId) { return { userId, realName: '用户' + userId, deptId: 'D01' } } }
-    const engine = new EngineImpl(repo, userProv, { nextId() { return Date.now() } }, { async eval() { return false } })
+    const engine = new EngineImpl(repo, userProv, { nextId() { return String(Date.now()) } }, { async eval() { return false } })
     const facade = new JeeflowFacade(engine, repo, ext)
-    ext.saveDesign({ id: 1, name: 'old', displayName: '旧名', type: 'approval', icon: '', isDeployed: 0, remark: '', createTime: new Date(), createUser: '', updateTime: new Date(), updateUser: '' })
+    ext.saveDesign({ id: '1', name: 'old', displayName: '旧名', type: 'approval', icon: '', isDeployed: 0, remark: '', createTime: new Date(), createUser: '', updateTime: new Date(), updateUser: '' })
 
     // 顶层 JSON 保存（无 content）——issue 31
     const r = await facade.flow('processDesign/updateDefine', {
@@ -490,7 +491,7 @@ describe('1.8.4 issues/34 定义级拦截器 + 30/31 facade', () => {
       relTableName: 'biz_top', nodes: [], edges: [],
     })
     assert.equal(r.code, 0, JSON.stringify(r))
-    const his = await ext.listDesignHis(1)
+    const his = await ext.listDesignHis('1')
     assert.ok(his.length > 0 && his[0].content.includes('"nodes"'))
 
     // listByType——issue 30

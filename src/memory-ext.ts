@@ -31,17 +31,17 @@ function pickFields(row: any, map: Record<string, string>): Record<string, any> 
 }
 
 export class MemoryExtRepository implements ProcessExtRepository {
-  private designs = new Map<number, ProcessDesign>()
-  private designHis = new Map<number, ProcessDesignHis[]>()
-  private surrogates = new Map<number, ProcessSurrogate>()
+  private designs = new Map<string, ProcessDesign>()
+  private designHis = new Map<string, ProcessDesignHis[]>()
+  private surrogates = new Map<string, ProcessSurrogate>()
   private seq = 1
 
   // ── 流程设计 ──
 
-  async findDesignById(id: number) { return this.designs.get(id) ?? null }
+  async findDesignById(id: string) { return this.designs.get(id) ?? null }
 
   async saveDesign(d: ProcessDesign) {
-    if (!d.id) d.id = this.seq++
+    if (!d.id) d.id = String(this.seq++)
     const now = new Date()
     if (!d.createTime) d.createTime = now
     if (!d.updateTime) d.updateTime = now
@@ -53,7 +53,7 @@ export class MemoryExtRepository implements ProcessExtRepository {
     this.designs.set(d.id, { ...d })
   }
 
-  async removeDesign(id: number) {
+  async removeDesign(id: string) {
     this.designs.delete(id)
     this.designHis.delete(id)
   }
@@ -67,23 +67,23 @@ export class MemoryExtRepository implements ProcessExtRepository {
   // ── 设计历史 ──
 
   async saveDesignHis(his: ProcessDesignHis) {
-    if (!his.id) his.id = this.seq++
+    if (!his.id) his.id = String(this.seq++)
     if (!his.createTime) his.createTime = new Date()
     const list = this.designHis.get(his.processDesignId) ?? []
     list.unshift({ ...his })
     this.designHis.set(his.processDesignId, list)
   }
 
-  async listDesignHis(designId: number) {
+  async listDesignHis(designId: string) {
     return this.designHis.get(designId) ?? []
   }
 
   // ── 委托代理 ──
 
-  async findSurrogateById(id: number) { return this.surrogates.get(id) ?? null }
+  async findSurrogateById(id: string) { return this.surrogates.get(id) ?? null }
 
   async saveSurrogate(s: ProcessSurrogate) {
-    if (!s.id) s.id = this.seq++
+    if (!s.id) s.id = String(this.seq++)
     const now = new Date()
     if (!s.createTime) s.createTime = now
     if (!s.updateTime) s.updateTime = now
@@ -96,7 +96,7 @@ export class MemoryExtRepository implements ProcessExtRepository {
     this.surrogates.set(s.id, { ...s })
   }
 
-  async removeSurrogate(id: number) {
+  async removeSurrogate(id: string) {
     this.surrogates.delete(id)
   }
 

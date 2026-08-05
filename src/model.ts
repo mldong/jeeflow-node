@@ -37,8 +37,11 @@ export const TypeCustom   = 'snaker:custom'
 
 // ─── Domain Types ─────────────────────────────────────────────────────────────
 
+// ⚠️ 引擎 id 全程 string（issue 38 E9）：Java 雪花 id（>2^53）在 JS number 下丢精度，
+// 跨语言共享流程定义/实例必须用字符串承载。mysql2 需配置 supportBigNumbers+bigNumberStrings。
+
 export interface ProcessDefine {
-  id: number
+  id: string
   name: string
   displayName: string
   type: string
@@ -54,7 +57,7 @@ export interface ProcessDefine {
 // ─── 管理扩展（v1.1.0）──────────────────────────────────────────────────────
 
 export interface ProcessDesign {
-  id: number
+  id: string
   name: string
   displayName: string
   type: string
@@ -68,15 +71,15 @@ export interface ProcessDesign {
 }
 
 export interface ProcessDesignHis {
-  id: number
-  processDesignId: number
+  id: string
+  processDesignId: string
   content: Uint8Array | string
   createTime: Date
   createUser: string
 }
 
 export interface ProcessSurrogate {
-  id: number
+  id: string
   processName?: string
   operator: string
   surrogate: string
@@ -152,9 +155,9 @@ export const BusinessNoKey = 'BUSINESS_NO'
 // ─── 聚合根：ProcessInstance ───────────────────────────────────────────────────
 
 export class ProcessInstance {
-  id!: number
-  parentId?: number
-  defineId!: number
+  id!: string
+  parentId?: string
+  defineId!: string
   state!: InstanceState
   parentNodeName!: string
   businessNo!: string
@@ -172,7 +175,7 @@ export class ProcessInstance {
   }
 
   /** 工厂——创建流程实例 */
-  static create(id: number, defineId: number, operator: string, vars: Record<string, any>, now: Date): ProcessInstance {
+  static create(id: string, defineId: string, operator: string, vars: Record<string, any>, now: Date): ProcessInstance {
     return new ProcessInstance({
       id, defineId, state: InstanceState.Doing,
       operator, variables: vars,
@@ -242,7 +245,7 @@ export class ProcessInstance {
   }
 
   /** 创建任务（子实体工厂） */
-  createTask(id: number, taskName: string, displayName: string, actor: string, operator: string, formKey: string, now: Date): ProcessTask {
+  createTask(id: string, taskName: string, displayName: string, actor: string, operator: string, formKey: string, now: Date): ProcessTask {
     const task = new ProcessTask({
       id, processInstanceId: this.id,
       taskName, displayName, taskState: TaskState.Doing,
@@ -259,8 +262,8 @@ export class ProcessInstance {
 // ─── 子实体：ProcessTask ────────────────────────────────────────────────────────
 
 export class ProcessTask {
-  id!: number
-  processInstanceId!: number
+  id!: string
+  processInstanceId!: string
   taskName!: string
   displayName!: string
   taskType!: number
@@ -271,7 +274,7 @@ export class ProcessTask {
   finishTime?: Date
   expireTime?: Date
   formKey!: string
-  parentTaskId?: number
+  parentTaskId?: string
   variables!: Record<string, any>
   createTime!: Date
   createUser!: string
@@ -333,9 +336,9 @@ export interface UserInfo {
 
 // 抄送实例行数据（ccList 分页，v1.3.0，对齐 Java InstanceRow）
 export interface CcInstanceRow {
-  id: number
-  parentId?: number
-  defineId: number
+  id: string
+  parentId?: string
+  defineId: string
   state: InstanceState
   parentNodeName: string
   businessNo: string
@@ -354,7 +357,7 @@ export interface CcInstanceRow {
 // ─── 核心表分页行数据（v1.5.0，对齐 Java DefineRow/InstanceRow/TaskRow） ─────
 
 export interface DefineRow {
-  id: number
+  id: string
   name: string
   displayName: string
   type: string
@@ -367,9 +370,9 @@ export interface DefineRow {
 }
 
 export interface InstanceRow {
-  id: number
-  parentId?: number
-  defineId: number
+  id: string
+  parentId?: string
+  defineId: string
   state: InstanceState
   parentNodeName: string
   businessNo: string
@@ -386,8 +389,8 @@ export interface InstanceRow {
 }
 
 export interface TaskRow {
-  id: number
-  processInstanceId: number
+  id: string
+  processInstanceId: string
   taskName: string
   displayName: string
   taskType: number
@@ -397,7 +400,7 @@ export interface TaskRow {
   finishTime?: Date
   expireTime?: Date
   formKey: string
-  taskParentId?: number
+  taskParentId?: string
   variables: Record<string, any>
   createTime: Date
   createUser: string

@@ -8,31 +8,31 @@ export interface QueryCondition {
 }
 
 export interface ProcessRepository {
-  findDefineById(id: number): Promise<ProcessDefine | null>
+  findDefineById(id: string): Promise<ProcessDefine | null>
   // findDefineByName 按流程编码查最新一条定义（v1.1.0，Facade deploy 版本管理用）
   findDefineByName(name: string): Promise<ProcessDefine | null>
   // 定义写操作（v1.0.1，集成反馈①）：保存/更新/启停/删除流程定义
   saveDefine(define: ProcessDefine): Promise<void>
   updateDefine(define: ProcessDefine): Promise<void>
-  updateDefineState(defineId: number, state: number): Promise<void>
-  removeDefine(defineId: number): Promise<void>
-  findInstanceById(id: number): Promise<ProcessInstance | null>
+  updateDefineState(defineId: string, state: number): Promise<void>
+  removeDefine(defineId: string): Promise<void>
+  findInstanceById(id: string): Promise<ProcessInstance | null>
   saveInstance(inst: ProcessInstance): Promise<void>
   updateInstance(inst: ProcessInstance): Promise<void>
 
-  findTaskById(taskId: number): Promise<ProcessTask | null>
+  findTaskById(taskId: string): Promise<ProcessTask | null>
   saveTask(task: ProcessTask): Promise<void>
   updateTask(task: ProcessTask): Promise<void>
-  findDoingTasks(instanceId: number, taskNames?: string[]): Promise<ProcessTask[]>
-  findDoneTasks(instanceId: number, taskNames?: string[]): Promise<ProcessTask[]>
-  findHistoryTasks(instanceId: number): Promise<ProcessTask[]>
+  findDoingTasks(instanceId: string, taskNames?: string[]): Promise<ProcessTask[]>
+  findDoneTasks(instanceId: string, taskNames?: string[]): Promise<ProcessTask[]>
+  findHistoryTasks(instanceId: string): Promise<ProcessTask[]>
 
-  findTaskActors(taskId: number): Promise<string[]>
-  addTaskActor(taskId: number, actors: string[]): Promise<void>
-  removeTaskActor(taskId: number, actors: string[]): Promise<void>
+  findTaskActors(taskId: string): Promise<string[]>
+  addTaskActor(taskId: string, actors: string[]): Promise<void>
+  removeTaskActor(taskId: string, actors: string[]): Promise<void>
 
-  createCcInstance(instanceId: number, creator: string, ...actorIds: string[]): Promise<void>
-  updateCcStatus(instanceId: number, actorId: string): Promise<void>
+  createCcInstance(instanceId: string, creator: string, ...actorIds: string[]): Promise<void>
+  updateCcStatus(instanceId: string, actorId: string): Promise<void>
 
   // PageCcInstances 我的抄送分页（v1.3.0，对齐 Java pageCcInstances）：
   // 按抄送人 actorId 过滤实例列表，返回行数据（含关联定义名/版本）+ 总数
@@ -59,7 +59,7 @@ export interface OrgUserProvider {
 }
 
 export interface IDGenerator {
-  nextId(): number
+  nextId(): string
 }
 
 export interface ExpressionEvaluator {
@@ -70,21 +70,21 @@ export interface ExpressionEvaluator {
 
 export interface ProcessExtRepository {
   // 流程设计（wf_process_design）
-  findDesignById(id: number): Promise<ProcessDesign | null>
+  findDesignById(id: string): Promise<ProcessDesign | null>
   saveDesign(d: ProcessDesign): Promise<void>
   updateDesign(d: ProcessDesign): Promise<void>
-  removeDesign(id: number): Promise<void>
+  removeDesign(id: string): Promise<void>
   pageDesigns(pageNum?: number, pageSize?: number, filters?: Record<string, any>, conditions?: QueryCondition[]): Promise<[ProcessDesign[], number]>
 
   // 设计历史（wf_process_design_his）
   saveDesignHis(his: ProcessDesignHis): Promise<void>
-  listDesignHis(designId: number): Promise<ProcessDesignHis[]>
+  listDesignHis(designId: string): Promise<ProcessDesignHis[]>
 
   // 委托代理（wf_process_surrogate）
-  findSurrogateById(id: number): Promise<ProcessSurrogate | null>
+  findSurrogateById(id: string): Promise<ProcessSurrogate | null>
   saveSurrogate(s: ProcessSurrogate): Promise<void>
   updateSurrogate(s: ProcessSurrogate): Promise<void>
-  removeSurrogate(id: number): Promise<void>
+  removeSurrogate(id: string): Promise<void>
   pageSurrogates(pageNum?: number, pageSize?: number, filters?: Record<string, any>, conditions?: QueryCondition[]): Promise<[ProcessSurrogate[], number]>
 
   // getSurrogate 查询指定时间生效中的委托（enabled=1 + 时间窗内；processName 精确优先，空值全流程兜底）

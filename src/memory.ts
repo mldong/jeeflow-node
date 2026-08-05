@@ -68,25 +68,26 @@ export function eqValue(v: any, expect: any): boolean {
 }
 
 export class MemoryRepository implements ProcessRepository {
-  private defines  = new Map<number, ProcessDefine>()
-  private instances = new Map<number, ProcessInstance>()
-  private tasks    = new Map<number, ProcessTask>()
-  private actors   = new Map<number, string[]>()
-  private ccInstances = new Map<number, string[]>()
+  private defines  = new Map<string, ProcessDefine>()
+  private instances = new Map<string, ProcessInstance>()
+  private tasks    = new Map<string, ProcessTask>()
+  private actors   = new Map<string, string[]>()
+  private ccInstances = new Map<string, string[]>()
   private seq = 1
 
   addDefine(def: ProcessDefine) {
-    if (!def.id) def.id = this.seq++
+    if (!def.id) def.id = String(this.seq++)
     this.defines.set(def.id, def)
   }
 
-  async findDefineById(id: number) { return this.defines.get(id) ?? null }
+  async findDefineById(id: string) { return this.defines.get(id) ?? null }
 
   // findDefineByName 按流程编码查最新一条定义（id 倒序取首条，v1.1.0）
   async findDefineByName(name: string) {
     let latest: ProcessDefine | null = null
     for (const d of this.defines.values()) {
-      if (d.name === name && (!latest || d.id > latest.id)) latest = d
+      // BigInt 比较：id 为 string（issue 38 E9），大整数数字比较不可靠
+      if (d.name === name && (!latest || BigInt(d.id) > BigInt(latest.id))) latest = d
     }
     return latest
   }
@@ -94,22 +95,22 @@ export class MemoryRepository implements ProcessRepository {
   // ── 定义写操作（v1.0.1，对齐 SPI）──
 
   async saveDefine(def: ProcessDefine) {
-    if (!def.id) def.id = this.seq++
+    if (!def.id) def.id = String(this.seq++)
     this.defines.set(def.id, def)
   }
   async updateDefine(def: ProcessDefine) {
     this.defines.set(def.id, def)
   }
-  async updateDefineState(defineId: number, state: number) {
+  async updateDefineState(defineId: string, state: number) {
     const d = this.defines.get(defineId)
     if (d) d.state = state
   }
-  async removeDefine(defineId: number) {
+  async removeDefine(defineId: string) {
     this.defines.delete(defineId)
   }
 
   async saveInstance(inst: ProcessInstance) {
-    if (!inst.id) inst.id = this.seq++
+    if (!inst.id) inst.id = String(this.seq++)
     const cp = cloneInstance(inst)
     cp.tasks = []
     this.instances.set(inst.id, cp)
@@ -127,7 +128,7 @@ export class MemoryRepository implements ProcessRepository {
       if (t.actorIds.length) this.actors.set(t.id, [...t.actorIds])
     }
   }
-  async findInstanceById(id: number) {
+  async findInstanceById(id: string) {
     const inst = this.instances.get(id)
     if (!inst) return null
     const cp = cloneInstance(inst)
@@ -142,7 +143,7 @@ export class MemoryRepository implements ProcessRepository {
     return cp
   }
 
-  async findTaskById(id: number) {
+  async findTaskById(id: string) {
     const t = this.tasks.get(id)
     if (!t) return null
     const cp = cloneTask(t)
@@ -150,7 +151,7 @@ export class MemoryRepository implements ProcessRepository {
     return cp
   }
   async saveTask(task: ProcessTask) {
-    if (!task.id) task.id = this.seq++
+    if (!task.id) task.id = String(this.seq++)
     const cp = cloneTask(task)
     cp.actorIds = []
     this.tasks.set(task.id, cp)
@@ -162,7 +163,7 @@ export class MemoryRepository implements ProcessRepository {
     this.tasks.set(task.id, cp)
     if (task.actorIds.length) this.actors.set(task.id, [...task.actorIds])
   }
-  async findDoingTasks(instanceId: number, taskNames?: string[]) {
+  async findDoingTasks(instanceId: string, taskNames?: string[]) {
     const result: ProcessTask[] = []
     for (const t of this.tasks.values()) {
       if (t.processInstanceId === instanceId && t.taskState === 10) {
@@ -174,7 +175,7 @@ export class MemoryRepository implements ProcessRepository {
     }
     return result
   }
-  async findDoneTasks(instanceId: number, _taskNames?: string[]) {
+  async findDoneTasks(instanceId: string, _taskNames?: string[]) {
     const result: ProcessTask[] = []
     for (const t of this.tasks.values()) {
       if (t.processInstanceId === instanceId && t.taskState === 20) {
@@ -185,7 +186,7 @@ export class MemoryRepository implements ProcessRepository {
     }
     return result
   }
-  async findHistoryTasks(instanceId: number) {
+  async findHistoryTasks(instanceId: string) {
     const result: ProcessTask[] = []
     for (const t of this.tasks.values()) {
       if (t.processInstanceId === instanceId) {
@@ -196,24 +197,24 @@ export class MemoryRepository implements ProcessRepository {
     }
     return result
   }
-  async findTaskActors(taskId: number) { return this.actors.get(taskId) ?? [] }
-  async addTaskActor(taskId: number, actors: string[]) {
+  async findTaskActors(taskId: string) { return this.actors.get(taskId) ?? [] }
+  async addTaskActor(taskId: string, actors: string[]) {
     const existing = this.actors.get(taskId) ?? []
     const seen = new Set(existing)
     for (const a of actors) { if (!seen.has(a)) { existing.push(a); seen.add(a) } }
     this.actors.set(taskId, existing)
   }
-  async removeTaskActor(taskId: number, actors: string[]) {
+  async removeTaskActor(taskId: string, actors: string[]) {
     const remove = new Set(actors)
     this.actors.set(taskId, (this.actors.get(taskId) ?? []).filter(a => !remove.has(a)))
   }
-  async createCcInstance(instanceId: number, _creator: string, ...actorIds: string[]) {
+  async createCcInstance(instanceId: string, _creator: string, ...actorIds: string[]) {
     const existing = this.ccInstances.get(instanceId) ?? []
     const seen = new Set(existing)
     for (const a of actorIds) { if (!seen.has(a)) { existing.push(a); seen.add(a) } }
     this.ccInstances.set(instanceId, existing)
   }
-  async updateCcStatus(_instanceId: number, _actorId: string) {}
+  async updateCcStatus(_instanceId: string, _actorId: string) {}
 
   // ── 核心表分页（v1.5.0）──
 

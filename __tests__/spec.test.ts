@@ -17,7 +17,7 @@ function setup() {
   const userProv: UserProvider = {
     async getUser(userId) { return { userId, realName: '用户' + userId, deptId: 'D01', deptName: '测试部门', postId: 'P01', postName: '测试岗位' } },
   }
-  const idGen = { nextId() { return Date.now() * 1000 + Math.floor(Math.random() * 1000) } }
+  const idGen = { nextId() { return String(Date.now() * 1000 + Math.floor(Math.random() * 1000)) } }
   const exprEval: ExpressionEvaluator = {
     async eval(expr, vars) {
       const amt = Number(vars.amount ?? 0)
@@ -718,7 +718,7 @@ describe('jeeflow compliance tests', () => {
     }
     const registry = new HandlerRegistry()
     registerBuiltinAssignments(registry, userProv, orgProv)
-    const idGen = { nextId() { return Date.now() * 1000 + Math.floor(Math.random() * 1000) } }
+    const idGen = { nextId() { return String(Date.now() * 1000 + Math.floor(Math.random() * 1000)) } }
     const exprEval: ExpressionEvaluator = {
       async eval(expr, vars) {
         const amt = Number(vars.amount ?? 0)
@@ -766,7 +766,7 @@ describe('jeeflow compliance tests', () => {
 
   it('24 candidatePage 双源候选（issues/16 GlobalCandidateHandler 语义）', async () => {
     const repo = new MemoryRepository()
-    const idGen = { nextId() { return Date.now() * 1000 + Math.floor(Math.random() * 1000) } }
+    const idGen = { nextId() { return String(Date.now() * 1000 + Math.floor(Math.random() * 1000)) } }
     const exprEval: ExpressionEvaluator = {
       async eval() { return false },
     }
@@ -819,5 +819,39 @@ describe('jeeflow compliance tests', () => {
     const doing2 = await repo.findDoingTasks(r2.data.processInstanceId)
     assert.equal(doing2[0].taskName, 'task1')
     assert.deepEqual(doing2[0].actorIds, ['leader'], `未指定时 task1 参与者应为 leader: ${doing2[0].actorIds}`)
+  })
+
+  it('26 Java 雪花 id（>2^53）跨语言共享（issue 38 E9）：string id 全程直通', async () => {
+    const { engine, repo } = setup()
+    // Java 雪花 id：2084320543834124290 ≈ 2.08e18 > Number.MAX_SAFE_INTEGER（2^53）
+    const SNOWFLAKE = '2084320543834124290'
+    const def: ProcessDefine = {
+      id: SNOWFLAKE, name: 'snow-flow', displayName: '雪花流程', type: 'approval',
+      state: 1, content: readFileSync(flowDir + '01-simple.json', 'utf-8'),
+      version: 1, createTime: new Date(), updateTime: new Date(), createUser: '', updateUser: '',
+    }
+    repo.addDefine(def)
+    // 按 string id 发起（前端从列表拿到 id 即 string，不做 Number() 转换）
+    const inst = await engine.startProcessInstanceById(SNOWFLAKE, 'user1')
+    assert.equal(inst.defineId, SNOWFLAKE, `defineId 必须原样保留: ${inst.defineId}`)
+    const doing = await repo.findDoingTasks(inst.id)
+    assert.ok(doing.length > 0, '应创建任务')
+    await repo.addTaskActor(doing[0].id, ['user1'])
+    await engine.executeProcessTask(doing[0].id, 'user1')
+    // 01-simple 双任务：继续完成 task1 → end
+    const doing2 = await repo.findDoingTasks(inst.id)
+    assert.ok(doing2.length > 0, 'task1 应创建')
+    await repo.addTaskActor(doing2[0].id, ['user1'])
+    await engine.executeProcessTask(doing2[0].id, 'user1')
+    const finished = await repo.findInstanceById(inst.id)
+    assert.equal(finished?.state, InstanceState.Done, '流程应结束')
+    // facade 全链路：startAndExecute 传字符串雪花 id
+    const facade = new JeeflowFacade(engine, repo, undefined)
+    const r = await facade.flow('processInstance/startAndExecute', {
+      processDefineId: SNOWFLAKE, operator: 'user1',
+    })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    // 返回 id 必须是 string（JS number 无法承载雪花值，前端回传必须用字符串）
+    assert.equal(typeof r.data.processInstanceId, 'string', JSON.stringify(r))
   })
 })

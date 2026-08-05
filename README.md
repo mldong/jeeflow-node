@@ -18,7 +18,7 @@ const repo = new MemoryRepository()
 const engine = new EngineImpl(repo)
 
 const def = {
-  id: 1, name: 'leave', displayName: '请假审批',
+  id: '1', name: 'leave', displayName: '请假审批',
   content: JSON.stringify({ nodes: [...], edges: [...] })
 }
 repo.addDefine(def)
@@ -27,6 +27,28 @@ const inst = await engine.startProcessInstanceById(def.id, '张三')
 const tasks = await repo.findDoingTasks(inst.id)
 await engine.executeProcessTask(tasks[0].id, 'leader')
 ```
+
+> ⚠️ **id 全程 string（issue 38 E9）**：引擎内部与 API 契约的 id（流程定义/实例/任务/设计）一律为**字符串**。
+> Java 雪花 id（>2^53）超出 JS 安全整数，`Number()` 转换必丢精度；字符串可无损承载，保证四语言同库共享流程。
+
+## JDBC（MySQL/PostgreSQL）
+
+```ts
+import mysql from 'mysql2/promise'
+import { JdbcRepository, TsIDGenerator, MysqlAdapter } from '@mldong/jeeflow/jdbc'
+
+// ⚠️ 必须配置 bigNumberStrings（issue 38 E9）：BIGINT 列以 string 返回，
+// 否则 mysql2 默认转 number，Java 雪花 id（>2^53）在驱动层就已丢精度
+const pool = mysql.createPool({
+  host: 'localhost', user: 'root', password: '***', database: 'wf',
+  supportBigNumbers: true,
+  bigNumberStrings: true,
+})
+const repo = new JdbcRepository(new MysqlAdapter(pool), new TsIDGenerator())
+```
+
+- MySQL 连接池必须带 `supportBigNumbers: true, bigNumberStrings: true`；PostgreSQL 的 int8 默认即字符串，无此要求
+- 引擎侧已做驱动兜底：`rowId()` 把驱动返回的 number/string 统一归一化为 string，未开 `bigNumberStrings` 时小 id（Node 自建）仍可用
 
 ## 运行演示
 
