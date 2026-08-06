@@ -922,4 +922,31 @@ describe('jeeflow compliance tests', () => {
     assert.equal(hl.code, 0, JSON.stringify(hl))
     assert.equal(hl.data.nodeProgress.task1.type, 'PARALLEL')
   })
+
+  it('29 E2E 反馈回归：撤回状态 30 / 会签 performType 落库 / 发起抄送（issues 53/52/56）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    // 56：发起时抄送 f_ccActors
+    const r0 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') })
+    const r1 = await facade.flow('processInstance/startAndExecute', {
+      processDefineId: r0.data.processDefineId, operator: 'user1', f_ccActors: 'wangqiang,zhaomin',
+    })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const cc = await repo.pageCcInstances(1, 10, 'wangqiang')
+    assert.ok(cc.total >= 1, `抄送应创建: ${cc.total}`)
+    // 52：会签任务 performType 落库
+    const r2 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '05-countersign-parallel.json', 'utf-8') })
+    const r3 = await facade.flow('processInstance/startAndExecute', { processDefineId: r2.data.processDefineId, operator: 'user1' })
+    const doing = await repo.findDoingTasks(r3.data.processInstanceId)
+    const cs = doing.filter(t => t.taskName === 'task1')
+    assert.ok(cs.length === 3 && cs.every(t => t.performType === 1), `会签任务 performType 应=1: ${cs.map(t => t.performType)}`)
+    // 53：撤回状态 30
+    const r4 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') })
+    const r5 = await facade.flow('processInstance/startAndExecute', { processDefineId: r4.data.processDefineId, operator: 'user1' })
+    const wr = await facade.flow('processInstance/withdraw', { id: r5.data.processInstanceId, operator: 'user1' })
+    assert.equal(wr.code, 0, JSON.stringify(wr))
+    const after = await repo.findInstanceById(r5.data.processInstanceId)
+    assert.equal(after?.state, InstanceState.Withdraw, `撤回状态应为 30: ${after?.state}`)
+    assert.equal(await repo.findDoingTasks(r5.data.processInstanceId).then(x => x.length), 0, '撤回后无 doing')
+  })
 })

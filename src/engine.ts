@@ -164,7 +164,7 @@ export class EngineImpl implements Engine {
           const [actors, lc] = getCsState(vars, curNode.id)
           if (actors && lc + 1 < actors.length) {
             // 聚合根：创建串行会签下一步任务
-            const nt = inst.createTask(this.nextId(), curNode.id, curNode.text.value, actors[lc + 1], operator, curNode.properties?.form ?? '', now)
+            const nt = inst.createTask(this.nextId(), curNode.id, curNode.text.value, actors[lc + 1], operator, curNode.properties?.form ?? '', now, 1)
             nt.variables = {
               [`nrOfInstances_${curNode.id}`]: actors.length,
               [`loopCounter_${curNode.id}`]: lc + 1,
@@ -368,10 +368,10 @@ export class EngineImpl implements Engine {
     if (isCountersign(node.properties?.performType) && ct) {
       switch (ct) {
         case 'PARALLEL':
-          for (const actor of actors) await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now))
+          for (const actor of actors) await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1))
           return
         case 'SEQUENTIAL': {
-          const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now)
+          const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now, 1)
           nt.variables = {
             [`nrOfInstances_${node.id}`]: actors.length,
             [`loopCounter_${node.id}`]: 0,
@@ -381,12 +381,12 @@ export class EngineImpl implements Engine {
           return
         }
         default:
-          for (const actor of actors) await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now))
+          for (const actor of actors) await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1))
           return
       }
     }
     // 普通任务：一个任务承载全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
-    const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now)
+    const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now, 1)
     if (actors.length > 1) nt.actorIds = actors
     await this.repo.saveTask(nt)
   }

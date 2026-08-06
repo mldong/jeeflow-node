@@ -568,10 +568,12 @@ export class JdbcRepository implements ProcessRepository {
     try {
       const countRow = await conn.fetchOne(this.sql('SELECT COUNT(DISTINCT t.id) ' + where), [filter, ...cond.params])
       const total = Number(Object.values(countRow as Record<string, unknown>)[0] ?? 0)
+      // issues/45 E17：pd.display_name 与 t.display_name 列名冲突（DISTINCT 时后者覆盖）——
+      // 流程名加别名 pd_display_name，mapTaskRow 分别映射
       const cols = 'DISTINCT t.id, t.process_instance_id, t.task_name, t.display_name, t.task_type, t.perform_type,' +
         ' t.task_state, t.operator, t.finish_time, t.expire_time, t.form_key, t.task_parent_id, t.variable,' +
         ' t.create_time, t.create_user, t.update_time, t.update_user,' +
-        ' pd.name, pd.display_name, pd.version AS process_define_version,' +
+        ' pd.name, pd.display_name AS pd_display_name, pd.version AS process_define_version,' +
         ' pi.variable AS instance_variable, pi.create_time AS instance_create_time'
       const rows = await conn.fetchAll(this.sql(
         `SELECT ${cols}${where} ORDER BY t.id DESC LIMIT ? OFFSET ?`),
@@ -645,7 +647,7 @@ export class JdbcRepository implements ProcessRepository {
       taskParentId: r.task_parent_id != null ? rowId(r.task_parent_id) : undefined,
       variables, createTime: r.create_time, createUser: rowId(r.create_user),
       updateTime: r.update_time, updateUser: rowId(r.update_user),
-      processDefineName: r.name ?? '', processDefineDisplayName: r.display_name ?? '',
+      processDefineName: r.name ?? '', processDefineDisplayName: r.pd_display_name ?? '',
       defineVersion: Number(r.process_define_version ?? 0),
       instanceVariable: r.instance_variable ?? '', instanceCreateTime: r.instance_create_time,
     }

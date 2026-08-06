@@ -224,6 +224,12 @@ export class ProcessInstance {
     this.updateTime = now
   }
 
+  /** 撤回流程（issues/53 E25：withdraw 用 Withdraw(30)，与 reject 区分） */
+  withdraw(now: Date): void {
+    this.state = InstanceState.Withdraw
+    this.updateTime = now
+  }
+
   /** 追加变量 */
   addVariable(vars: Record<string, any>): void {
     Object.assign(this.variables, vars)
@@ -244,13 +250,13 @@ export class ProcessInstance {
     return !this.tasks.some(t => t.isDoing())
   }
 
-  /** 创建任务（子实体工厂） */
-  createTask(id: string, taskName: string, displayName: string, actor: string, operator: string, formKey: string, now: Date): ProcessTask {
+  /** 创建任务（子实体工厂）——performType：0 普通 / 1 会签（issues/52 E24 落库对齐 Java） */
+  createTask(id: string, taskName: string, displayName: string, actor: string, operator: string, formKey: string, now: Date, performType = 0): ProcessTask {
     const task = new ProcessTask({
       id, processInstanceId: this.id,
       taskName, displayName, taskState: TaskState.Doing,
       actorId: '', actorIds: [actor],
-      taskType: 0, performType: 0, formKey,
+      taskType: 0, performType, formKey,
       variables: {},
       createTime: now, updateTime: now, createUser: operator, updateUser: operator,
     })

@@ -157,6 +157,13 @@ export class JeeflowFacade {
       flowArgs[k] = v
     }
     const inst = await this.engine.startProcessInstanceById(defineId, operator, flowArgs)
+    // issues/56 E28：发起时抄送（f_ccActors）创建 cc 实例（对齐 Java enableCcActors 语义）
+    const ccList = Array.isArray(flowArgs.f_ccActors) ? flowArgs.f_ccActors
+      : typeof flowArgs.f_ccActors === 'string' && flowArgs.f_ccActors.trim()
+        ? flowArgs.f_ccActors.split(',').map((x: string) => x.trim()).filter(Boolean) : []
+    if (ccList.length > 0) {
+      await this.repo.createCcInstance(inst.id, operator, ...ccList)
+    }
     // startAndExecute：自动完成申请节点（assignee="applicant" → 发起人）
     const doing = await this.repo.findDoingTasks(inst.id)
     for (const task of doing) {
@@ -241,7 +248,8 @@ export class JeeflowFacade {
     const operator = String(args.operator ?? 'user1')
     const now = new Date()
     const abandoned = inst.abandonAllDoing(now)
-    inst.reject(now)
+    // issues/53 E25：撤回状态应为 Withdraw(30) 而非 Reject(45)（对齐 Java）
+    inst.withdraw(now)
     inst.updateUser = operator
     for (const t of abandoned) await this.repo.updateTask(t)
     await this.repo.updateInstance(inst)
@@ -511,10 +519,20 @@ export class JeeflowFacade {
       await ext.updateDesign(found)
       design = found
     }
-    // 内容快照（设计稿内容存历史表）
+    // 内容快照（设计稿内容存历史表）——issues/51 E23：无 content 也写默认快照
+    // （对齐 Java contentBytes 默认 JSON），保证「新建 → 部署」链路可用
     if (args.content != null) {
       await ext.saveDesignHis({
         id: '', processDesignId: design.id, content: String(args.content),
+        createTime: new Date(), createUser: operator,
+      })
+    } else {
+      await ext.saveDesignHis({
+        id: '', processDesignId: design.id,
+        content: JSON.stringify({
+          name: design.name, displayName: design.displayName, type: design.type,
+          nodes: [], edges: [],
+        }),
         createTime: new Date(), createUser: operator,
       })
     }
