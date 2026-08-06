@@ -371,6 +371,7 @@ export class EngineImpl implements Engine {
           for (const actor of actors) await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1))
           return
         case 'SEQUENTIAL': {
+          // 顺序会签任务也是会签任务（issues/57 E29 修正：仅普通分支默认 0）
           const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now, 1)
           nt.variables = {
             [`nrOfInstances_${node.id}`]: actors.length,
@@ -386,7 +387,7 @@ export class EngineImpl implements Engine {
       }
     }
     // 普通任务：一个任务承载全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
-    const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now, 1)
+    const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now)
     if (actors.length > 1) nt.actorIds = actors
     await this.repo.saveTask(nt)
   }

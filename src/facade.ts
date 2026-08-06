@@ -247,10 +247,18 @@ export class JeeflowFacade {
     // 撤回：废弃全部 doing 任务 + 实例状态（v1.0.1：updateInstance 级联落库）
     const operator = String(args.operator ?? 'user1')
     const now = new Date()
-    const abandoned = inst.abandonAllDoing(now)
+    // findInstanceById 不加载 tasks（空），必须按实例查 doing 任务废弃
+    const abandoned: ProcessTask[] = []
+    for (const t of await this.repo.findDoingTasks(instanceId)) {
+      t.abandon(now)
+      abandoned.push(t)
+    }
     // issues/53 E25：撤回状态应为 Withdraw(30) 而非 Reject(45)（对齐 Java）
     inst.withdraw(now)
     inst.updateUser = operator
+    // 级联覆盖防护（issues/57 补正）：废弃副本同步回聚合——updateInstance 级联会用
+    // 聚合内旧任务覆盖已废弃状态（memory 加载 tasks 时必现）
+    inst.tasks = abandoned
     for (const t of abandoned) await this.repo.updateTask(t)
     await this.repo.updateInstance(inst)
   }
