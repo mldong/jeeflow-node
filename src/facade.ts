@@ -1134,6 +1134,8 @@ function toStr(v: any): string {
   if (v == null) return ''
   if (typeof v === 'string') return v
   if (v instanceof Uint8Array || Buffer.isBuffer(v)) return Buffer.from(v).toString('utf8')
+  // 对象/数组（content 等字段前端直接传 JSON 对象）：序列化为 JSON 字符串
+  if (typeof v === 'object') return JSON.stringify(v)
   return String(v)
 }
 
