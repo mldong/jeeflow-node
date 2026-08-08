@@ -2,6 +2,7 @@ import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { KeySubmitType, KeyDeptID } from './engine.js'
 import { TypeEnd, TypeTask, TypeCustom, InstanceState, SubmitType, type ProcessInstance, type ProcessDefine, type FlowNode } from './model.js'
 import type { FlowInterceptor } from './extensions.js'
+import type { HandlerRegistry } from './registry.js'
 
 // ═══ 动态表写入组件（引擎无关）— issues/18 ═══════════════════════════════════
 
@@ -390,4 +391,17 @@ export class PersistPostInterceptor implements FlowInterceptor {
     data['apply_user_id'] ??= inst.operator
     data['apply_dept_id'] ??= inst.variables[KeyDeptID] ?? null
   }
+}
+
+// ─── 注册助手（issues/60）──────────────────────────────────────────────────────
+
+/** 将 PersistPostInterceptor 元数据注册进处理器注册中心（SPI 字典源），
+ *  集成方在实例组装处调用一次即可，保证"字典项 ⟺ 实例"同步（避免各端写死注册遗漏/名不一致）。 */
+export function registerPersistMeta(registry: HandlerRegistry) {
+  registry.registerMeta('FlowInterceptor', {
+    name: 'com.mldong.jeeflow.persist.interceptor.PersistPostInterceptor',
+    displayName: '业务数据自动入库',
+    order: 0,
+    group: 'post',
+  })
 }

@@ -1,12 +1,13 @@
 export { EngineImpl, type Engine } from './engine.js'
 export { MemoryRepository } from './memory.js'
-export { HandlerRegistry, type IAssignmentHandler, type IDecisionHandler, type HandlerMeta } from './registry.js'
+export { HandlerRegistry, type IAssignmentHandler, type IDecisionHandler, type HandlerMeta, type HandlerType } from './registry.js'
 export { enumDict, enumDictKeys, type DictItem } from './metadata.js'
 export * from './model.js'
 export type { ProcessRepository, UserProvider, OrgUserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
 export {
   SqliteDynamicTableWriter,
   PersistPostInterceptor,
+  registerPersistMeta,
   type DynamicTableWriter,
   type DefineLoader,
 } from './persist.js'

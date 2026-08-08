@@ -53,7 +53,9 @@ export class EngineImpl implements Engine {
 
   /** 定义级拦截器解析（issue 34，对齐 Java 模型级 postInterceptors）：
    *  流程定义顶层 postInterceptors 声明 → 按名从 interceptorRegistry 取（未声明该流程不触发）；
-   *  未声明 → 回落引擎级列表（向后兼容）。结果按 defineId 缓存。 */
+   *  未声明 → 回落引擎级列表（向后兼容）。结果按 defineId 缓存。
+   *  issues/60：解析与校验分离——定义读取/JSON 解析失败回落引擎级（现状语义），
+   *  声明中存在未注册名时抛错（不静默跳过），且错误不写缓存保证持续报错。 */
   private async resolveInterceptors(inst: ProcessInstance): Promise<FlowInterceptor[]> {
     if (!this.ext) return []
     const defineId = inst.defineId
@@ -61,21 +63,24 @@ export class EngineImpl implements Engine {
     const cached = this.interceptorCache.get(defineId)
     if (cached) return cached
     let list = this.ext.interceptors ?? []
+    let declared = ''
     try {
       const def = await this.repo.findDefineById(defineId)
       if (def) {
         const content = typeof def.content === 'string' ? def.content : new TextDecoder().decode(def.content as Uint8Array)
         const meta = JSON.parse(content)
-        const declared = String(meta.postInterceptors ?? '').trim()
-        if (declared) {
-          list = []
-          for (const name of declared.split(',').map(n => n.trim())) {
-            const ic = this.ext.interceptorRegistry?.[name]
-            if (name && ic) list.push(ic)
-          }
-        }
+        declared = String(meta.postInterceptors ?? '').trim()
       }
-    } catch { /* 解析失败回落引擎级 */ }
+    } catch { /* 定义读取/JSON 解析失败回落引擎级 */ }
+    if (declared) {
+      list = []
+      for (const name of declared.split(',').map(n => n.trim())) {
+        if (!name) continue
+        const ic = this.ext.interceptorRegistry?.[name]
+        if (!ic) throw new Error(`postInterceptors 声明的拦截器未注册: ${name}`)
+        list.push(ic)
+      }
+    }
     this.interceptorCache.set(defineId, list)
     return list
   }

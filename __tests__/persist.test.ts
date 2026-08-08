@@ -7,7 +7,8 @@ import { MemoryRepository } from '../src/memory.js'
 import { InstanceState, type ProcessDefine, type ProcessInstance } from '../src/model.js'
 import type { ExpressionEvaluator, UserProvider } from '../src/spi.js'
 import { KeySubmitType, KeyDeptID } from '../src/engine.js'
-import { SqliteDynamicTableWriter, PersistPostInterceptor } from '../src/persist.js'
+import { SqliteDynamicTableWriter, PersistPostInterceptor, registerPersistMeta } from '../src/persist.js'
+import { HandlerRegistry } from '../src/registry.js'
 import type { EngineExtensions } from '../src/extensions.js'
 
 const flowDir = '../jeeflow-java/jeeflow-core/src/test/resources/flows/'
@@ -459,6 +460,45 @@ describe('1.8.4 issues/34 定义级拦截器 + 30/31 facade', () => {
     const n2 = (db.prepare('SELECT COUNT(1) AS c FROM biz_decl').get() as any).c
     assert.equal(n2, 1, '未声明拦截器的流程不应落库')
     db.close()
+  })
+
+  it('⑨.1 issues/60 定义级声明未注册 → 显式报错（不静默跳过）', async () => {
+    const repo = new MemoryRepository()
+    const engine = new EngineImpl(repo, { async getUser(userId) { return { userId, realName: '用户' + userId, deptId: 'D01' } } },
+      { nextId() { return String(Date.now()) } }, { async eval() { return false } })
+    engine.setExtensions({ interceptors: [], interceptorRegistry: {} })
+    const ghost = {
+      id: 0, name: 'ghost', displayName: '幽灵拦截器', type: 'approval', state: 1, version: 1,
+      content: JSON.stringify({
+        name: 'ghost', displayName: '幽灵拦截器', type: 'approval', relTableName: 'biz_ghost', persistMode: 'SYNC',
+        postInterceptors: 'com.xxx.GhostInterceptor',
+        nodes: [
+          { id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } },
+          { id: 'finish', type: 'snaker:end', properties: {}, text: { value: '结束' } },
+        ],
+        edges: [{ id: 'e0', sourceNodeId: 'start', targetNodeId: 'finish', properties: {} }],
+      }),
+      createTime: new Date(), updateTime: new Date(), createUser: '', updateUser: '',
+    }
+    repo.addDefine(ghost)
+    await assert.rejects(
+      () => engine.startProcessInstanceById(ghost.id, 'user1', { f_title: '幽灵流程' }),
+      /未注册/,
+    )
+  })
+
+  it('⑨.2 issues/60 注册助手 registerPersistMeta（字典 1 项 / 全名 / 显示名 / post 组 / 同名覆盖）', () => {
+    const reg = new HandlerRegistry()
+    registerPersistMeta(reg)
+    const metas = reg.listHandlers('FlowInterceptor')
+    assert.equal(metas.length, 1)
+    assert.equal(metas[0].name, 'com.mldong.jeeflow.persist.interceptor.PersistPostInterceptor')
+    assert.equal(metas[0].displayName, '业务数据自动入库')
+    assert.equal(metas[0].group, 'post')
+    assert.equal(metas[0].order, 0)
+    // 二次注册同名覆盖（Node 注册表 Map 语义，与 Java/Go/Python 追加语义对齐输出：字典同名唯一）
+    registerPersistMeta(reg)
+    assert.equal(reg.listHandlers('FlowInterceptor').length, 1)
   })
 
   it('⑩ facade 顶层 JSON 保存 + listByType + bizData', async () => {
