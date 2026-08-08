@@ -613,12 +613,15 @@ describe('jeeflow compliance tests', () => {
     assert.equal(r1.code, 0, JSON.stringify(r1))
     const defineId = r1.data.processDefineId
     assert.equal((await extRepo.findDesignById(designId))?.isDeployed, 1)
+    const versionAfterDeploy = (await repo.findDefineById(String(defineId)))?.version
 
     // 重新部署 → 同一 defineId + is_deployed=1
     const r2 = await facade.flow('processDesign/redeploy', { id: designId, operator: 'zhangsan' })
     assert.equal(r2.code, 0, JSON.stringify(r2))
     assert.equal(r2.data.processDefineId, defineId, JSON.stringify(r2))
     assert.equal((await extRepo.findDesignById(designId))?.isDeployed, 1)
+    // issues/59：redeploy 是替换语义，version 必须保持
+    assert.equal((await repo.findDefineById(String(defineId)))?.version, versionAfterDeploy)
 
     // 设计稿内容变更（updateDefine，不同 content）→ 新快照 + is_deployed=0 + name 同步
     const r3 = await facade.flow('processDesign/updateDefine',
@@ -641,6 +644,17 @@ describe('jeeflow compliance tests', () => {
     const r5 = await facade.flow('processDesign/deploy', { id: designId, operator: 'zhangsan' })
     assert.equal(r5.code, 0, JSON.stringify(r5))
     assert.equal((await extRepo.findDesignById(designId))?.isDeployed, 1)
+
+    // issues/59 强回归：把定义 version 抬到 >0 后 redeploy 必须保持
+    const defineId2 = String(r5.data.processDefineId)
+    const defV1 = await repo.findDefineById(defineId2)
+    if (defV1) {
+      defV1.version = 5
+      await repo.updateDefine(defV1)
+    }
+    const r6 = await facade.flow('processDesign/redeploy', { id: designId, operator: 'zhangsan' })
+    assert.equal(r6.code, 0, JSON.stringify(r6))
+    assert.equal((await repo.findDefineById(defineId2))?.version, 5)
   })
 
   it('22 表单数据契约 formData/taskFormData/审批记录 ext（issues/15）', async () => {
