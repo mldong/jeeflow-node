@@ -23,6 +23,8 @@ export const KeyProcessStartNextNodeOperator = 'f_nextNodeOperator'
 // v1.0.1：系统代执行 / 超级管理员（对齐 boot3 FlowConst）
 export const KeyAutoExecute = 'flow.auto'
 export const KeyAdminID     = 'flow.admin'
+// issue 29：自动生成标题（对齐 boot3 FlowConst.AUTO_GEN_TITLE）
+export const KeyAutoGenTitle = 'autoGenTitle'
 
 export interface Engine {
   startProcessInstanceById(defineId: string, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
@@ -117,6 +119,7 @@ export class EngineImpl implements Engine {
 
     const vars = { ...args }
     await this.addUserInfo(operator, vars)
+    this.addAutoGenTitle(def.displayName, vars)
 
     const now = new Date()
     // 聚合根工厂创建实例
@@ -464,6 +467,15 @@ export class EngineImpl implements Engine {
     if (u.deptName) vars[KeyDeptName] = u.deptName
     if (u.postId) vars[KeyPostID] = u.postId
     if (u.postName) vars[KeyPostName] = u.postName
+  }
+
+  /** issue 29：自动生成标题（对齐 boot3 FlowUtil.addAutoGenTitle） */
+  private addAutoGenTitle(displayName: string, vars: Record<string, any>) {
+    const realName = vars[KeyRealName] || ''
+    const now = new Date()
+    const pad = (n: number) => n.toString().padStart(2, '0')
+    const timeStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`
+    vars[KeyAutoGenTitle] = `${realName}的${displayName}-${timeStr}`
   }
 
   /** 用户提供者访问（issue 41 补强：nodeProgress 姓名解析用） */

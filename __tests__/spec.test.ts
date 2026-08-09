@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { EngineImpl } from '../src/engine.js'
+import { EngineImpl, KeyAutoGenTitle } from '../src/engine.js'
 import { HandlerRegistry, registerBuiltinAssignments } from '../src/index.js'
 import { MemoryRepository } from '../src/memory.js'
 import { MemoryExtRepository } from '../src/memory-ext.js'
@@ -59,6 +59,9 @@ describe('jeeflow compliance tests', () => {
     const { engine, repo } = setup()
     const def = loadFlow(repo, '01-simple.json')
     const inst = await startAndExecute(engine, repo, def.id, 'applicant')
+    // issue 29：autoGenTitle 自动生成验证
+    assert.ok(inst.variables[KeyAutoGenTitle], 'autoGenTitle should be set in instance variables')
+    assert.ok(typeof inst.variables[KeyAutoGenTitle] === 'string' && inst.variables[KeyAutoGenTitle].length > 0, 'autoGenTitle should not be empty')
     const doing = await repo.findDoingTasks(inst.id)
     assert.equal(doing.length, 1)
     assert.equal(doing[0].taskName, 'task1')
