@@ -1,0 +1,48 @@
+name: Demo Deploy
+on:
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy Node demo
+    runs-on: ubuntu-latest
+    steps:
+      # Node demo 依赖共享流程 JSON，需 checkout jeeflow-java
+      - name: Checkout jeeflow-java
+        uses: actions/checkout@v4
+        with:
+          repository: mldong/jeeflow-java
+          path: jeeflow-java
+      - name: Checkout jeeflow-node
+        uses: actions/checkout@v4
+        with:
+          path: jeeflow-node
+      - name: Build Docker image
+        run: |
+          # Dockerfile.demo 期望构建上下文包含 jeeflow-java/ 和 node 源码
+          mkdir -p /tmp/demo-build
+          cp -r jeeflow-node /tmp/demo-build/
+          cp -r jeeflow-java /tmp/demo-build/
+          docker build -f /tmp/demo-build/jeeflow-node/Dockerfile.demo -t jeeflow-node-demo:latest /tmp/demo-build/
+      - name: Export image
+        run: docker save jeeflow-node-demo:latest -o jeeflow-node-demo.tar
+      - name: Upload to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: jeeflow-node-demo.tar
+          target: /java_projects/jeeflow/demo/
+      - name: Load image and restart
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd /java_projects/jeeflow/demo
+            docker load -i jeeflow-node-demo.tar
+            docker-compose up -d jeeflow-node-demo
+            rm -f jeeflow-node-demo.tar
+            echo "✅ Node demo deployed"
