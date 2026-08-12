@@ -454,6 +454,10 @@ describe('jeeflow compliance tests', () => {
     assert.equal(r6.code, 0, JSON.stringify(r6))
     assert.equal(r6.data.executable, true)
     assert.ok(r6.data.taskModel)
+    // issues/62：taskModel 补 form/ext（字段权限）
+    assert.equal(r6.data.taskModel.form, 'leave-form', JSON.stringify(r6.data.taskModel))
+    assert.equal(r6.data.taskModel.ext.PERMISSION_f_leaveType, 1, JSON.stringify(r6.data.taskModel))
+    assert.equal(r6.data.taskModel.ext.PERMISSION_days, 2, JSON.stringify(r6.data.taskModel))
 
     const r7 = await facade.flow('processTask/latest', { processInstanceId: instanceId })
     assert.equal(r7.code, 0, JSON.stringify(r7))

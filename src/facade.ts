@@ -786,7 +786,12 @@ export class JeeflowFacade {
           const flow = JSON.parse(toStr(def.content))
           for (const n of flow.nodes ?? []) {
             if (n.id === task.taskName) {
-              vo.taskModel = { name: n.id, displayName: n.text?.value ?? '', type: n.type }
+              // issues/62：taskModel 补 form/ext（节点字段权限，对齐 boot2）
+              vo.taskModel = {
+                name: n.id, displayName: n.text?.value ?? '', type: n.type,
+                form: n.properties?.form ?? null,
+                ext: n.properties?.field ?? null,
+              }
               break
             }
           }

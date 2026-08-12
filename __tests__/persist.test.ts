@@ -304,6 +304,8 @@ describe('1.8.0 SYNC 同步演进', () => {
 
   function loadSyncFlow(repo: MemoryRepository): ProcessDefine {
     let content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    // issues/62：共享 flow 自带 field（PERMISSION_*）→ 先移除，避免与下方注入重复键（JSON.parse 后者覆盖前者）
+    content = content.replace(/,\s*"field":\s*\{[^}]*\}/, '')
     content = content.replace('"type": "approval"', '"type": "approval", "relTableName": "biz_sync", "persistMode": "SYNC"')
     content = content.replace('"assignee": "leader"', '"assignee": "leader", "field": {"PERMISSION_f_title": 1, "PERMISSION_amount": 2}')
     content = content.replaceAll('"id": "end"', '"id": "finish"')
