@@ -302,7 +302,7 @@ export class JeeflowFacade {
 
   private async designPage(args: Record<string, any>): Promise<Record<string, any>> {
     const [rows, total] = await this.ext().pageDesigns(toInt(args.pageNum ?? 1), toInt(args.pageSize ?? 10), undefined, parseMQuery(args))
-    return { rows, recordCount: total }
+    return { rows: rows.map(r => designRowToMap(r)), recordCount: total }
   }
 
   /** 修改流程设计基本信息（对齐 boot3 ProcessDesignController.update，不写设计稿快照） */
@@ -1055,6 +1055,16 @@ function defineRowToMap(r: DefineRow): Record<string, any> {
   return {
     id: r.id, name: r.name, displayName: r.displayName, type: r.type,
     state: r.state, version: r.version,
+    createTime: fmtTime(r.createTime), createUser: r.createUser,
+    updateTime: fmtTime(r.updateTime), updateUser: r.updateUser,
+  }
+}
+
+/** 设计行：时间格式化（issues/63） */
+function designRowToMap(r: ProcessDesign): Record<string, any> {
+  return {
+    id: r.id, name: r.name, displayName: r.displayName,
+    type: r.type, icon: r.icon, isDeployed: r.isDeployed, remark: r.remark,
     createTime: fmtTime(r.createTime), createUser: r.createUser,
     updateTime: fmtTime(r.updateTime), updateUser: r.updateUser,
   }

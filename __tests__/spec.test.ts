@@ -599,6 +599,14 @@ describe('jeeflow compliance tests', () => {
     const r8 = await facade.flow('processDesign/page', { m_LIKE_name: 'leave' })
     assert.equal(r8.code, 0, JSON.stringify(r8))
     assert.equal(r8.data.rows.length, 1, JSON.stringify(r8))
+
+    // issues/63：processDesign/page 时间格式应为 yyyy-MM-dd HH:mm:ss
+    const timeRe = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/
+    const pageAll = await facade.flow('processDesign/page', { pageNum: 1, pageSize: 100 })
+    for (const row of pageAll.data.rows) {
+      assert.match(row.createTime, timeRe, `createTime should be yyyy-MM-dd HH:mm:ss, got ${row.createTime}`)
+      assert.match(row.updateTime, timeRe, `updateTime should be yyyy-MM-dd HH:mm:ss, got ${row.updateTime}`)
+    }
   })
 
   it('21 设计部署/重新部署/内容变更的 is_deployed 同步（issues/08）', async () => {
