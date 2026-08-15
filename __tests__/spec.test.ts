@@ -978,4 +978,23 @@ describe('jeeflow compliance tests', () => {
     assert.equal(after?.state, InstanceState.Withdraw, `撤回状态应为 30: ${after?.state}`)
     assert.equal(await repo.findDoingTasks(r5.data.processInstanceId).then(x => x.length), 0, '撤回后无 doing')
   })
+
+  it('30 分页信封五键（issues/64）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const empty = await facade.flow('processDefine/page', { pageNum: 1, pageSize: 10 })
+    assert.equal(empty.code, 0, JSON.stringify(empty))
+    for (const k of ['pageNum', 'pageSize', 'rows', 'recordCount', 'totalPage']) {
+      assert.ok(k in empty.data, `缺 ${k}: ${JSON.stringify(empty.data)}`)
+    }
+    assert.equal(empty.data.recordCount, 0)
+    assert.equal(empty.data.totalPage, 0)
+    await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') })
+    const r = await facade.flow('processDefine/page', { pageNum: 1, pageSize: 1 })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    assert.equal(r.data.pageNum, 1)
+    assert.equal(r.data.pageSize, 1)
+    assert.ok(r.data.recordCount >= 1)
+    assert.equal(r.data.totalPage, r.data.recordCount)
+  })
 })

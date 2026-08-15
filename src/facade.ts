@@ -301,8 +301,10 @@ export class JeeflowFacade {
   // ── 流程设计（需扩展仓储） ───────────────────────────────────────────────
 
   private async designPage(args: Record<string, any>): Promise<Record<string, any>> {
-    const [rows, total] = await this.ext().pageDesigns(toInt(args.pageNum ?? 1), toInt(args.pageSize ?? 10), undefined, parseMQuery(args))
-    return { rows: rows.map(r => designRowToMap(r)), recordCount: total }
+    const pageNum = toInt(args.pageNum ?? 1)
+    const pageSize = toInt(args.pageSize ?? 10)
+    const [rows, total] = await this.ext().pageDesigns(pageNum, pageSize, undefined, parseMQuery(args))
+    return pageData(pageNum, pageSize, total, rows.map(r => designRowToMap(r)))
   }
 
   /** 修改流程设计基本信息（对齐 boot3 ProcessDesignController.update，不写设计稿快照） */
@@ -551,9 +553,11 @@ export class JeeflowFacade {
 
   private async surrogatePage(args: Record<string, any>): Promise<Record<string, any>> {
     const filters = args.operator != null ? { operator: String(args.operator) } : undefined
+    const pageNum = toInt(args.pageNum ?? 1)
+    const pageSize = toInt(args.pageSize ?? 10)
     const [rows, total] = await this.ext().pageSurrogates(
-      toInt(args.pageNum ?? 1), toInt(args.pageSize ?? 10), filters, parseMQuery(args))
-    return { rows, recordCount: total }
+      pageNum, pageSize, filters, parseMQuery(args))
+    return pageData(pageNum, pageSize, total, rows)
   }
 
   private async surrogateSave(args: Record<string, any>): Promise<Record<string, any>> {
@@ -759,7 +763,7 @@ export class JeeflowFacade {
     const pageSize = toInt(args.pageSize ?? 10)
     const actorId = String(args.operator ?? 'user1')
     const { rows, total } = await this.repo.pageCcInstances(pageNum, pageSize, actorId, parseMQuery(args))
-    return { rows: rows.map(r => ccRowToMap(r)), recordCount: total }
+    return pageData(pageNum, pageSize, total, rows.map(r => ccRowToMap(r)))
   }
 
   private async taskDetail(args: Record<string, any>): Promise<any> {
@@ -817,6 +821,8 @@ export class JeeflowFacade {
   }
 
   private async candidatePage(args: Record<string, any>): Promise<any> {
+    const pageNum = toInt(args.pageNum ?? 1)
+    const pageSize = toInt(args.pageSize ?? 10)
     const taskId = toId(args.processTaskId ?? args.id)
     const task = await this.repo.findTaskById(taskId)
     if (!task) throw new Error('任务不存在')
@@ -833,12 +839,12 @@ export class JeeflowFacade {
     }
     if (candidates.length > 0) {
       const rows = candidates.map(c => ({ userId: c, realName: c }))
-      return { rows, recordCount: rows.length }
+      return pageData(pageNum, pageSize, rows.length, rows)
     }
     // 无模型候选 → 用户分页搜索（依赖 userSearch 钩子）
     if (!this.userSearch) throw new Error('未配置 userSearch（用户搜索钩子）')
     const [rows, total] = await this.userSearch(args)
-    return { rows, recordCount: total }
+    return pageData(pageNum, pageSize, total, rows)
   }
 
   private async nextTaskCandidates(flow: any, taskName: string): Promise<string[]> {
@@ -910,7 +916,7 @@ export class JeeflowFacade {
     const pageNum = toInt(args.pageNum ?? 1)
     const pageSize = toInt(args.pageSize ?? 10)
     const { rows, total } = await this.repo.pageDefines(pageNum, pageSize, parseMQuery(args))
-    return { rows: rows.map(r => defineRowToMap(r)), recordCount: total }
+    return pageData(pageNum, pageSize, total, rows.map(r => defineRowToMap(r)))
   }
 
   private async defineDetail(args: Record<string, any>): Promise<Record<string, any>> {
@@ -929,7 +935,7 @@ export class JeeflowFacade {
     const pageSize = toInt(args.pageSize ?? 10)
     const operator = String(args.operator ?? 'user1')
     const { rows, total } = await this.repo.pageInstances(pageNum, pageSize, operator, parseMQuery(args))
-    return { rows: rows.map(r => instanceRowToMap(r)), recordCount: total }
+    return pageData(pageNum, pageSize, total, rows.map(r => instanceRowToMap(r)))
   }
 
   private async instanceDetail(args: Record<string, any>): Promise<Record<string, any>> {
@@ -994,7 +1000,7 @@ export class JeeflowFacade {
     const pageSize = toInt(args.pageSize ?? 10)
     const actorId = String(args.operator ?? 'user1')
     const { rows, total } = await this.repo.pageTodoTasks(pageNum, pageSize, actorId, parseMQuery(args))
-    return { rows: rows.map(r => taskRowToMap(r)), recordCount: total }
+    return pageData(pageNum, pageSize, total, rows.map(r => taskRowToMap(r)))
   }
 
   private async doneList(args: Record<string, any>): Promise<Record<string, any>> {
@@ -1002,7 +1008,7 @@ export class JeeflowFacade {
     const pageSize = toInt(args.pageSize ?? 10)
     const operator = String(args.operator ?? 'user1')
     const { rows, total } = await this.repo.pageDoneTasks(pageNum, pageSize, operator, parseMQuery(args))
-    return { rows: rows.map(r => taskRowToMap(r)), recordCount: total }
+    return pageData(pageNum, pageSize, total, rows.map(r => taskRowToMap(r)))
   }
 
   /** 定义 content 解析为 LogicFlow JSON（issues/05 jsonObject） */
@@ -1173,5 +1179,13 @@ function toInt(v: any): number {
   const n = Number(v)
   if (!Number.isFinite(n)) throw new Error('数值缺失或非法')
   return n
+}
 
+/** issues/64：对齐 mldong 分页五键（Java pageResult / Go pageData） */
+function pageData(pageNum: number, pageSize: number, total: number, rows: any): Record<string, any> {
+  const pn = pageNum || 1
+  const ps = pageSize || 10
+  let totalPage = 0
+  if (total > 0 && ps > 0) totalPage = Math.ceil(total / ps)
+  return { pageNum: pn, pageSize: ps, recordCount: total, totalPage, rows }
 }
