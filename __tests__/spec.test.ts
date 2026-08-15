@@ -997,4 +997,28 @@ describe('jeeflow compliance tests', () => {
     assert.ok(r.data.recordCount >= 1)
     assert.equal(r.data.totalPage, r.data.recordCount)
   })
+
+  it('31 MysqlAdapter 分页走 query 而非 execute（issues/66）', async () => {
+    const { MysqlConnection } = await import('../src/jdbc/mysql.js')
+    let executeCalls = 0
+    let queryCalls = 0
+    const fake = {
+      async execute() {
+        executeCalls++
+        throw new Error('Incorrect arguments to mysqld_stmt_execute')
+      },
+      async query(_sql: string, _args: any[]) {
+        queryCalls++
+        return [[{ id: '1' }], []]
+      },
+    }
+    const conn = new MysqlConnection(fake as any)
+    const rows = await conn.fetchAll('SELECT id FROM wf_process_define t WHERE 1=1 ORDER BY t.id DESC LIMIT ? OFFSET ?', [5, 0])
+    assert.equal(executeCalls, 0, '不得走 mysql2 execute（LIMIT 预处理会失败）')
+    assert.equal(queryCalls, 1)
+    assert.equal(rows[0].id, '1')
+    await conn.execute('INSERT INTO t (id) VALUES (?)', ['2'])
+    assert.equal(executeCalls, 0)
+    assert.equal(queryCalls, 2)
+  })
 })

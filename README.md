@@ -49,6 +49,7 @@ const repo = new JdbcRepository(new MysqlAdapter(pool), new TsIDGenerator())
 
 - MySQL 连接池必须带 `supportBigNumbers: true, bigNumberStrings: true`；PostgreSQL 的 int8 默认即字符串，无此要求
 - 引擎侧已做驱动兜底：`rowId()` 把驱动返回的 number/string 统一归一化为 string，未开 `bigNumberStrings` 时小 id（Node 自建）仍可用
+- `MysqlAdapter` 走 `query()` 不走 `execute()`：mysql2 预处理绑 `LIMIT ?` 会失败，分页整段 99999999（issues/66）
 
 ## 运行演示
 

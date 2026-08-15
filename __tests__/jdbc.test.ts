@@ -385,4 +385,20 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
       await cleanup()
     }
   })
+
+  it('pageDefines / pageTodoTasks 不因 LIMIT 占位符抛错（issues/66）', async () => {
+    await cleanup()
+    try {
+      await applySchema()
+      await insertDefine()
+      const repo = new JdbcRepository(makeAdapter(pool), new TsIDGenerator())
+      const page = await repo.pageDefines(1, 5)
+      assert.ok(page.total >= 1, `pageDefines total=${page.total}`)
+      assert.ok(Array.isArray(page.rows), 'pageDefines rows')
+      const todos = await repo.pageTodoTasks(1, 50, 'zhangsan')
+      assert.ok(Array.isArray(todos.rows), 'pageTodoTasks rows')
+    } finally {
+      await cleanup()
+    }
+  })
 })
