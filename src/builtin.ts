@@ -29,7 +29,7 @@ export class OperatorAssignmentHandler implements IAssignmentHandler {
   }
 }
 
-/** 按表单字段值分配参与者：精确匹配 node.id → vars 字段；_数字 后缀去后缀再匹配。 */
+/** 按表单字段值分配参与者：f_ 前缀优先 → 裸名回落 → _数字 后缀去后缀再匹配。 */
 export class FormFieldAssigneeHandler implements IAssignmentHandler {
   async assign(node: FlowNode, inst: ProcessInstance | null, _operator: string): Promise<string[]> {
     if (!inst || !node) return []
@@ -38,7 +38,9 @@ export class FormFieldAssigneeHandler implements IAssignmentHandler {
     return this.collect(value)
   }
 
+  /** issues/48：f_ 前缀优先 → 裸名回落 → 编号后缀去后缀匹配裸名 */
   private findFieldValue(variables: Record<string, any>, fieldName: string): any {
+    if ('f_' + fieldName in variables) return variables['f_' + fieldName]
     if (fieldName in variables) return variables[fieldName]
     const m = NUMBER_SUFFIX_PATTERN.exec(fieldName)
     if (m && m[1] in variables) return variables[m[1]]

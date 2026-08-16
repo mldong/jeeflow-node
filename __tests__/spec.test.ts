@@ -793,6 +793,38 @@ describe('jeeflow compliance tests', () => {
     assert.equal(inst?.state, InstanceState.Done, `⑤ state: ${inst?.state}`)
   })
 
+  it('23b FormFieldAssigneeHandler f_ 前缀（issues/48）', async () => {
+    const repo = new MemoryRepository()
+    const userProv: UserProvider = {
+      async getUser(userId) { return { userId, realName: '用户' + userId, deptId: 'D01', deptName: '测试部门', postId: 'P01', postName: '测试岗位' } },
+    }
+    const orgProv = {
+      async findDeptLeaders() { return [] },
+      async findDeptMainLeaders() { return [] },
+      async findByRole() { return [] },
+    }
+    const registry = new HandlerRegistry()
+    registerBuiltinAssignments(registry, userProv, orgProv)
+    const idGen = { nextId() { return String(Date.now() * 1000 + Math.floor(Math.random() * 1000)) } }
+    const exprEval: ExpressionEvaluator = { async eval() { return false } }
+    const engine = new EngineImpl(repo, userProv, idGen, exprEval)
+    engine.setRegistry(registry)
+    const def = loadFlow(repo, '11-assignment-handler.json')
+
+    // ① f_ 前缀变量（前端表单提交格式）
+    let inst = await engine.startProcessInstanceById(def.id, 'user1', { f_task1: 'userA,userB' })
+    let doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing[0].taskName, 'task1')
+    assert.deepEqual([...doing[0].actorIds].sort(), ['userA', 'userB'], `① f_ prefix: ${doing[0].actorIds}`)
+    await repo.addTaskActor(doing[0].id, doing[0].actorIds)
+    await engine.executeProcessTask(doing[0].id, 'userA')
+
+    // ② f_ 前缀优先于裸名
+    inst = await engine.startProcessInstanceById(def.id, 'user1', { f_task1: 'userX', task1: 'userY' })
+    doing = await repo.findDoingTasks(inst.id)
+    assert.deepEqual([...doing[0].actorIds], ['userX'], `② f_ priority: ${doing[0].actorIds}`)
+  })
+
   it('24 candidatePage 双源候选（issues/16 GlobalCandidateHandler 语义）', async () => {
     const repo = new MemoryRepository()
     const idGen = { nextId() { return String(Date.now() * 1000 + Math.floor(Math.random() * 1000)) } }
