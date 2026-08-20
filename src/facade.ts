@@ -114,6 +114,10 @@ export class JeeflowFacade {
         return this.surrogatePage(args)
       case 'processSurrogate/save':
         return this.surrogateSave(args)
+      case 'processSurrogate/update': // issues/77
+        return this.surrogateUpdate(args)
+      case 'processSurrogate/detail': // issues/77
+        return this.surrogateDetail(args)
       case 'processSurrogate/remove':
         return this.ext().removeSurrogate(toId(args.id))
       case 'processDefine/getLastByName':
@@ -557,7 +561,8 @@ export class JeeflowFacade {
     const pageSize = toInt(args.pageSize ?? 10)
     const [rows, total] = await this.ext().pageSurrogates(
       pageNum, pageSize, filters, parseMQuery(args))
-    return pageData(pageNum, pageSize, total, rows)
+    // issues/77：行走 surrogateRowToMap（时间格式化），与 detail 同构
+    return pageData(pageNum, pageSize, total, rows.map(r => surrogateRowToMap(r)))
   }
 
   private async surrogateSave(args: Record<string, any>): Promise<Record<string, any>> {
@@ -567,24 +572,53 @@ export class JeeflowFacade {
     let surrogate: ProcessSurrogate
     if (!surrogateId) {
       surrogate = {
-        id: '', operator, // 授权人 = 操作人
-        surrogate: String(args.surrogate ?? ''), processName: String(args.processName ?? ''),
-        enabled: toInt(args.enabled ?? 1),
+        id: '', operator, surrogate: '', processName: '', // 授权人 = 操作人（新建必有）
+        enabled: 1,
         createTime: new Date(), createUser: operator,
         updateTime: new Date(), updateUser: operator,
       }
+      this.applySurrogateFields(surrogate, args, operator)
       await ext.saveSurrogate(surrogate)
     } else {
       const found = await ext.findSurrogateById(surrogateId)
       if (!found) throw new Error('委托记录不存在')
-      if (args.surrogate != null) found.surrogate = String(args.surrogate)
-      if (args.processName != null) found.processName = String(args.processName)
-      if (args.enabled != null) found.enabled = toInt(args.enabled)
-      found.updateUser = operator
+      this.applySurrogateFields(found, args, operator)
       await ext.updateSurrogate(found)
       surrogate = found
     }
     return { id: surrogate.id }
+  }
+
+  /** 委托更新（issues/77）：按 id 全字段更新，id 缺失/不存在报错 */
+  private async surrogateUpdate(args: Record<string, any>): Promise<Record<string, any>> {
+    const ext = this.ext()
+    const surrogateId = toId(args.id)
+    const surrogate = await ext.findSurrogateById(surrogateId)
+    if (!surrogate) throw new Error('委托记录不存在')
+    const operator = String(args.operator ?? 'user1')
+    this.applySurrogateFields(surrogate, args, operator)
+    await ext.updateSurrogate(surrogate)
+    return { id: surrogate.id }
+  }
+
+  /** 委托详情（issues/77）：按 id 查单条，返回行结构（时间格式化） */
+  private async surrogateDetail(args: Record<string, any>): Promise<Record<string, any>> {
+    const surrogateId = toId(args.id)
+    const surrogate = await this.ext().findSurrogateById(surrogateId)
+    if (!surrogate) throw new Error('委托记录不存在')
+    return surrogateRowToMap(surrogate)
+  }
+
+  /** 委托写入公共字段。授权人（operator）仅在显式传入时覆盖，避免 update
+   *  时清空原授权人（前端编辑表单不带 operator；集成层注入时 operator=授权人，覆盖无害） */
+  private applySurrogateFields(s: ProcessSurrogate, args: Record<string, any>, operator: string): void {
+    s.processName = String(args.processName ?? '')
+    if ('operator' in args) s.operator = String(args.operator)
+    s.surrogate = String(args.surrogate ?? '')
+    s.startTime = parseSurrogateTime(args.startTime)
+    s.endTime = parseSurrogateTime(args.endTime)
+    s.enabled = args.enabled != null ? toInt(args.enabled) : 1
+    s.updateUser = operator
   }
 
   // ── 视图端点（v1.2.0） ──────────────────────────────────────────────────
@@ -1067,6 +1101,35 @@ function defineRowToMap(r: DefineRow): Record<string, any> {
 }
 
 /** 设计行：时间格式化（issues/63） */
+/** 委托行：时间格式化（issues/77，对齐 Java surrogateRowToMap / Go surrogateRowToMap / SPEC） */
+function surrogateRowToMap(s: ProcessSurrogate): Record<string, any> {
+  return {
+    id: s.id, processName: s.processName, operator: s.operator, surrogate: s.surrogate,
+    startTime: fmtTime(s.startTime ?? null), endTime: fmtTime(s.endTime ?? null),
+    enabled: s.enabled,
+    createTime: fmtTime(s.createTime ?? null), createUser: s.createUser,
+    updateTime: fmtTime(s.updateTime ?? null), updateUser: s.updateUser,
+  }
+}
+
+/** 解析委托时间入参：兼容 yyyy-MM-dd HH:mm:ss（前端 RangePicker/SPEC 契约）与 ISO T（issues/77） */
+function parseSurrogateTime(v: any): Date | undefined {
+  if (v == null) return undefined
+  const s = String(v).trim()
+  if (!s) return undefined
+  for (const fmt of ['YYYY-MM-DD HH:mm:ss', 'YYYY-MM-DDTHH:mm:ss', 'YYYY-MM-DD']) {
+    const m = s.match(fmt === 'YYYY-MM-DD'
+      ? /^(\d{4})-(\d{2})-(\d{2})$/
+      : /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})$/)
+    if (!m) continue
+    if (fmt === 'YYYY-MM-DD') return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+    return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6]))
+  }
+  // 兜底：交给 Date 解析（覆盖其它可解析形态），失败返回 undefined
+  const d = new Date(s)
+  return isNaN(d.getTime()) ? undefined : d
+}
+
 function designRowToMap(r: ProcessDesign): Record<string, any> {
   return {
     id: r.id, name: r.name, displayName: r.displayName,

@@ -420,6 +420,59 @@ describe('jeeflow compliance tests', () => {
     assert.equal(r6.code, 0, JSON.stringify(r6))
   })
 
+  it('门面委托编辑链路（issues/77）：save(空格格式时间窗)→detail 回显→update 改字段→detail 再回显 + 负向', async () => {
+    const { engine, repo } = setup()
+    const extRepo = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, extRepo)
+
+    // 新增（带时间窗，前端 RangePicker 实际提交的 yyyy-MM-dd HH:mm:ss 空格格式）
+    const r1 = await facade.flow('processSurrogate/save',
+      { operator: 'zhangsan', surrogate: 'lisi', processName: 'leave',
+        startTime: '2026-08-01 00:00:00', endTime: '2026-08-31 23:59:59', enabled: 1 })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const surrogateId = r1.data.id
+
+    // detail 回显：行结构齐全 + 时间格式化
+    const d1 = await facade.flow('processSurrogate/detail', { id: surrogateId })
+    assert.equal(d1.code, 0, JSON.stringify(d1))
+    assert.equal(d1.data.processName, 'leave')
+    assert.equal(d1.data.operator, 'zhangsan')
+    assert.equal(d1.data.surrogate, 'lisi')
+    assert.equal(d1.data.startTime, '2026-08-01 00:00:00', JSON.stringify(d1.data))
+    assert.equal(d1.data.endTime, '2026-08-31 23:59:59', JSON.stringify(d1.data))
+
+    // update：改代理人/时间窗/启用状态（不带 operator，授权人应保留）
+    const r2 = await facade.flow('processSurrogate/update',
+      { id: surrogateId, surrogate: 'wangwu', processName: 'leave',
+        startTime: '2026-09-01 00:00:00', endTime: '2026-09-30 23:59:59', enabled: 0 })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    assert.equal(r2.data.id, surrogateId)
+
+    // detail 再回显：变更生效 + 授权人未被清空
+    const d2 = await facade.flow('processSurrogate/detail', { id: surrogateId })
+    assert.equal(d2.code, 0, JSON.stringify(d2))
+    assert.equal(d2.data.surrogate, 'wangwu', JSON.stringify(d2.data))
+    assert.equal(d2.data.operator, 'zhangsan', JSON.stringify(d2.data))
+    assert.equal(d2.data.enabled, 0, JSON.stringify(d2.data))
+    assert.equal(d2.data.startTime, '2026-09-01 00:00:00', JSON.stringify(d2.data))
+    assert.equal(d2.data.endTime, '2026-09-30 23:59:59', JSON.stringify(d2.data))
+
+    // 仓储侧同步（update 真的写了）
+    const s = await extRepo.findSurrogateById(surrogateId)
+    assert.ok(s, 'repo should have surrogate')
+    assert.equal(s.surrogate, 'wangwu')
+    assert.equal(s.enabled, 0)
+
+    // 负向：id 不存在
+    const e1 = await facade.flow('processSurrogate/detail', { id: '99999' })
+    assert.equal(e1.code, 99999999, JSON.stringify(e1))
+    const e2 = await facade.flow('processSurrogate/update', { id: '99999', surrogate: 'wangwu' })
+    assert.equal(e2.code, 99999999, JSON.stringify(e2))
+    // 负向：update 缺 id
+    const e3 = await facade.flow('processSurrogate/update', { surrogate: 'wangwu' })
+    assert.equal(e3.code, 99999999, JSON.stringify(e3))
+  })
+
   it('17 门面视图端点（v1.2.0，spec §12 #16-18）', async () => {
     const { engine, repo } = setup()
     const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
