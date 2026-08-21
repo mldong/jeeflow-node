@@ -6,7 +6,7 @@ import { HandlerRegistry, registerBuiltinAssignments } from '../src/index.js'
 import { MemoryRepository } from '../src/memory.js'
 import { MemoryExtRepository } from '../src/memory-ext.js'
 import { JeeflowFacade } from '../src/facade.js'
-import { InstanceState, type ProcessDefine, type ProcessInstance, type ProcessTask } from '../src/model.js'
+import { InstanceState, TaskState, type ProcessDefine, type ProcessInstance, type ProcessTask } from '../src/model.js'
 import type { ExpressionEvaluator, UserProvider } from '../src/spi.js'
 import { type FlowInterceptor, EventType, type EngineExtensions } from '../src/extensions.js'
 
@@ -1109,6 +1109,146 @@ describe('jeeflow compliance tests', () => {
     assert.equal(r.data.pageSize, 1)
     assert.ok(r.data.recordCount >= 1)
     assert.equal(r.data.totalPage, r.data.recordCount)
+  })
+
+  // ═══ execute submitType 2/3/4/5/6/20 门面行为（issues/79，前端按钮全量暴露路径）═══
+
+  async function startMultiTaskAt(facade: JeeflowFacade, repo: MemoryRepository, name: string): Promise<string> {
+    // 02-multi-task：发起（apply 自动完成）→ 推进到名为 name 的任务节点
+    const r0 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '02-multi-task.json', 'utf-8') })
+    assert.equal(r0.code, 0, r0.msg)
+    const r1 = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: r0.data.processDefineId, operator: 'zhangsan' })
+    assert.equal(r1.code, 0, r1.msg)
+    const instanceId: string = r1.data.processInstanceId
+    const order = ['task1', 'task2', 'task3']
+    const actor = ['leader', 'manager', 'boss']
+    const target = order.indexOf(name)
+    for (let i = 0; i < target; i++) {
+      const doing = await repo.findDoingTasks(instanceId)
+      const tid = doing.find(t => t.taskName === order[i])?.id
+      assert.ok(tid, `应推进到 ${order[i]}`)
+      await repo.addTaskActor(tid, [actor[i]])
+      const r = await facade.flow('processTask/execute', { processTaskId: tid, operator: actor[i], submitType: 1 })
+      assert.equal(r.code, 0, r.msg)
+    }
+    return instanceId
+  }
+
+  async function doingTaskId(repo: MemoryRepository, instanceId: string, name: string): Promise<string | undefined> {
+    for (const t of await repo.findDoingTasks(instanceId)) if (t.taskName === name) return t.id
+    return undefined
+  }
+
+  it('79 execute submitType 3/4/5/6 + 负向（对齐 Java 参考实现断言）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+
+    // ── submitType=3 ROLLBACK：task2 退回上一步 → task1 新待办（actor=退回操作人），实例保持 DOING(10)
+    const rb = await startMultiTaskAt(facade, repo, 'task2')
+    const t2 = await doingTaskId(repo, rb, 'task2')
+    await repo.addTaskActor(t2!, ['manager'])
+    const r3 = await facade.flow('processTask/execute', { processTaskId: t2, operator: 'manager', submitType: 3 })
+    assert.equal(r3.code, 0, r3.msg)
+    const rbTask1 = await doingTaskId(repo, rb, 'task1')
+    assert.ok(rbTask1, 'ROLLBACK 应在 task1 产生新待办')
+    assert.ok((await repo.findTaskActors(rbTask1!)).includes('manager'), '退回任务 actor 应为退回操作人 manager')
+    assert.equal((await repo.findInstanceById(rb))!.state, InstanceState.Doing, 'ROLLBACK 后实例应保持 DOING(10)')
+
+    // ── submitType=4 JUMP：task3 跳转 apply（首任务节点 = start 直接后继，assignee 强制发起人）
+    const jp = await startMultiTaskAt(facade, repo, 'task3')
+    const t3 = await doingTaskId(repo, jp, 'task3')
+    await repo.addTaskActor(t3!, ['boss'])
+    const jl = await facade.flow('processTask/jumpAbleTaskNameList', { processInstanceId: jp })
+    assert.equal(jl.code, 0, jl.msg)
+    const jumpValues = (jl.data as any[]).map(m => m.value)
+    assert.ok(jumpValues.includes('task1') && jumpValues.includes('apply'), `jumpAble 应含 task1/apply: ${jumpValues}`)
+    const r4 = await facade.flow('processTask/execute', { processTaskId: t3, operator: 'boss', submitType: 4, taskName: 'apply' })
+    assert.equal(r4.code, 0, r4.msg)
+    const jpApply = await doingTaskId(repo, jp, 'apply')
+    assert.ok(jpApply, 'JUMP 应在 apply（首任务节点）产生新待办')
+    assert.deepEqual(await repo.findTaskActors(jpApply!), ['zhangsan'], '跳首任务节点 assignee 强制为发起人')
+    assert.equal((await repo.findInstanceById(jp))!.state, InstanceState.Doing, 'JUMP 后实例应保持 DOING(10)')
+
+    // ── 负向：JUMP taskName 不存在 → 99999999 + 「无法找到节点模型」
+    const jn = await startMultiTaskAt(facade, repo, 'task2')
+    const t2n = await doingTaskId(repo, jn, 'task2')
+    await repo.addTaskActor(t2n!, ['manager'])
+    const jr = await facade.flow('processTask/execute', { processTaskId: t2n, operator: 'manager', submitType: 4, taskName: 'no-such-node' })
+    assert.equal(jr.code, 99999999, jr.msg)
+    assert.match(String(jr.msg), /无法找到节点模型/, jr.msg)
+
+    // ── submitType=5 RE_APPLY：task1 重新提交（前端 detail 抽屉场景，含 f_ 表单 + tf_nextNodeOperator）
+    const ra = await startMultiTaskAt(facade, repo, 'task1')
+    const t1r = await doingTaskId(repo, ra, 'task1')
+    await repo.addTaskActor(t1r!, ['leader'])
+    const r5 = await facade.flow('processTask/execute',
+      { processTaskId: t1r, operator: 'leader', submitType: 5, tf_nextNodeOperator: 'manager', f_leaveType: 'annual' })
+    assert.equal(r5.code, 0, r5.msg)
+    const doingAfter = await repo.findDoingTasks(ra)
+    assert.equal(doingAfter.length, 1)
+    assert.equal(doingAfter[0].taskName, 'task2', 'RE_APPLY 后应推进到 task2')
+    assert.deepEqual(await repo.findTaskActors(doingAfter[0].id), ['manager'], 'tf_nextNodeOperator 应覆盖 task2 处理人')
+    const instRa = await repo.findInstanceById(ra)
+    assert.equal(instRa!.variables.f_leaveType, 'annual', 'f_ 表单字段应落实例变量')
+    assert.equal(instRa!.state, InstanceState.Doing, 'RE_APPLY 后实例应保持 DOING(10)')
+
+    // ── submitType=6 ROLLBACK_TO_OPERATOR：task3 退回发起人 → apply 重执行、actor=发起人 zhangsan
+    const ro = await startMultiTaskAt(facade, repo, 'task3')
+    const t3o = await doingTaskId(repo, ro, 'task3')
+    await repo.addTaskActor(t3o!, ['boss'])
+    const r6 = await facade.flow('processTask/execute', { processTaskId: t3o, operator: 'boss', submitType: 6 })
+    assert.equal(r6.code, 0, r6.msg)
+    const roApply = await doingTaskId(repo, ro, 'apply')
+    assert.ok(roApply, 'ROLLBACK_TO_OPERATOR 应重执行首个任务节点 apply')
+    assert.deepEqual(await repo.findTaskActors(roApply!), ['zhangsan'], '退回发起人 assignee 强制为发起人')
+    assert.equal((await repo.findInstanceById(ro))!.state, InstanceState.Doing, '退回发起人后实例应保持 DOING(10)')
+
+    // ── 负向：非处理人执行被拒（NOT_ALLOWED_EXECUTE）
+    const na = await startMultiTaskAt(facade, repo, 'task1')
+    const t1n = await doingTaskId(repo, na, 'task1')
+    const nr = await facade.flow('processTask/execute', { processTaskId: t1n, operator: 'hacker', submitType: 1 })
+    assert.equal(nr.code, 99999999, nr.msg)
+    assert.match(String(nr.msg), /not allowed/, nr.msg)
+  })
+
+  it('79 execute submitType=2 REJECT → REJECT(45)（对齐 Java/Go/Python/PHP）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const instId = await startMultiTaskAt(facade, repo, 'task1')
+    const t1 = await doingTaskId(repo, instId, 'task1')
+    await repo.addTaskActor(t1!, ['leader'])
+    const r = await facade.flow('processTask/execute', { processTaskId: t1, operator: 'leader', submitType: 2 })
+    assert.equal(r.code, 0, r.msg)
+    assert.equal((await repo.findInstanceById(instId))!.state, InstanceState.Reject, 'REJECT 后实例应为 REJECT(45)')
+    assert.equal((await repo.findDoingTasks(instId)).length, 0, 'REJECT 后应无 DOING 任务')
+  })
+
+  it('79 execute submitType=20 会签一票否决（对齐 Java CountersignHandler / PHP setMerged）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    // 06-countersign-sequential：apply 自动完成 → task1 串行会签 userA（userB 未开始）
+    const r0 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '06-countersign-sequential.json', 'utf-8') })
+    assert.equal(r0.code, 0, r0.msg)
+    const r1 = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: r0.data.processDefineId, operator: 'user1' })
+    assert.equal(r1.code, 0, r1.msg)
+    const instanceId: string = r1.data.processInstanceId
+    const taskA = await doingTaskId(repo, instanceId, 'task1')
+    assert.ok(taskA, '会签节点应有 userA 的 DOING 任务')
+    await repo.addTaskActor(taskA!, ['userA'])
+    // submitType=20：门面自动注入 countersignDisagreeFlag=1 → 引擎一票否决
+    // （会签节点提前流转 end）；flag 落任务/实例变量
+    const r = await facade.flow('processTask/execute', { processTaskId: taskA, operator: 'userA', submitType: 20 })
+    assert.equal(r.code, 0, r.msg)
+    const inst = await repo.findInstanceById(instanceId)
+    // 一票否决效果：会签节点被提前流转 end（若否决未生效，串行会签将停在 DOING 等 userB）
+    assert.equal(inst!.state, InstanceState.Done, `会签否决后实例应完成 FINISHED(20): ${inst?.state}`)
+    assert.equal(Number(inst!.variables.countersignDisagreeFlag), 1, 'countersignDisagreeFlag=1 应落实例变量')
+    const doneA = await repo.findTaskById(taskA!)
+    assert.equal(doneA!.taskState, TaskState.Done, '否决任务应已完成')
+    assert.equal(Number(doneA!.variables.countersignDisagreeFlag), 1, 'countersignDisagreeFlag=1 应落任务变量')
+    assert.equal(doneA!.actorId, 'userA', '否决人应记录为实际操作人 userA')
   })
 
   it('31 MysqlAdapter 分页走 query 而非 execute（issues/66）', async () => {

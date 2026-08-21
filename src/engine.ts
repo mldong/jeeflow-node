@@ -139,34 +139,18 @@ export class EngineImpl implements Engine {
   // ─── Execute ───────────────────────────────────────────────────────────────
 
   async executeProcessTask(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
-    const { task, inst } = await this.loadAndCheck(taskId, operator)
-    // issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）——
-    // 被拒值无法经流程变量落到下游节点写入，上游只读声明不可被绕过
-    const def = await this.repo.findDefineById(inst.defineId)
-    const flow: FlowModel = JSON.parse(typeof def!.content === 'string' ? def!.content : new TextDecoder().decode(def!.content as Uint8Array))
-    args = filterFieldByPerm(args, findNode(flow, task.taskName))
-    const vars = { ...inst.variables, ...task.variables, ...args }
-    await this.addUserInfo(operator, vars)
-
+    const { task, inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
     const now = new Date()
-    // 聚合根：完成任务（子实体状态转换 + 实例变量合并）
-    inst.completeTask(task, operator, vars, now)
-    await this.repo.updateTask(task)
-    // v1.0.1：updateInstance 级联持久化依赖聚合内任务副本为最新状态，
-    // completeTask 改的是外部任务对象，需同步回聚合根
-    syncTaskToAggregate(inst, task)
-    await this.fireEvent({ type: EventType.TaskComplete, instanceId: inst.id, taskId: task.id, nodeId: task.taskName, operator })
-
-    inst.variables = vars
-    await this.repo.updateInstance(inst)
-
     const curNode = findNode(flow, task.taskName)
     if (curNode) {
       // 1.8.0：任务完成节点自身的后置拦截器（SYNC 同步演进——任务节点推进更新状态/字段）。
       // createTask 不再触发（引擎语义修正），此处为完成任务节点的唯一触发点
       await this.firePost(curNode, inst)
       const ct = curNode.properties?.countersignType as string | undefined
-      if (ct === 'SEQUENTIAL') {
+      // issues/79：会签一票否决（对齐 Java CountersignHandler / PHP setMerged(true)）——
+      // submitType=20 COUNTERSIGN_DISAGREE 时跳过会签"未完成即停留"门控，提前流转后续节点
+      const csVeto = !!ct && Number(vars[KeySubmitType]) === Number(SubmitType.CountersignDisagree)
+      if (ct === 'SEQUENTIAL' && !csVeto) {
         const doing = await this.repo.findDoingTasks(inst.id)
         if (doing.length === 0) {
           const [actors, lc] = getCsState(vars, curNode.id)
@@ -185,7 +169,7 @@ export class EngineImpl implements Engine {
           return (await this.repo.findInstanceById(inst.id))!
         }
       }
-      if (ct === 'PARALLEL' || ct?.startsWith('RATIO')) {
+      if ((ct === 'PARALLEL' || ct?.startsWith('RATIO')) && !csVeto) {
         const doing = await this.repo.findDoingTasks(inst.id)
         if (doing.length > 0) return (await this.repo.findInstanceById(inst.id))!
       }
@@ -201,67 +185,171 @@ export class EngineImpl implements Engine {
   // ─── Reject ────────────────────────────────────────────────────────────────
 
   async executeAndJumpToEnd(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
-    const { task, inst } = await this.loadAndCheck(taskId, operator)
-    const now = new Date()
-    // 聚合根：废弃所有进行中任务
-    for (const t of inst.abandonAllDoing(now)) await this.repo.updateTask(t)
-    // 子实体：完成任务
-    task.finish(operator, task.variables, now)
-    await this.repo.updateTask(task)
-    // v1.0.1：同步回聚合根，避免 updateInstance 级联把任务写回旧状态
-    syncTaskToAggregate(inst, task)
-    // 聚合根：驳回
-    inst.reject(now)
+    const { inst } = await this.prepareExecuteTask(taskId, operator, args)
+    // 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
+    inst.reject(new Date())
     await this.repo.updateInstance(inst)
     await this.fireEvent({ type: EventType.ProcessReject, instanceId: inst.id, taskId, operator })
-    return inst
+    return (await this.repo.findInstanceById(inst.id))!
   }
 
-  // ─── Jump ──────────────────────────────────────────────────────────────────
+  // ─── Jump（ROLLBACK 空 target / JUMP 命名 target，boot2 executeAndJumpTask）────
 
   async executeAndJumpTask(taskId: string, operator: string, args: Record<string, any> = {}, targetTaskName?: string): Promise<ProcessInstance> {
-    const { task, inst } = await this.loadAndCheck(taskId, operator)
-    const now = new Date()
-    // 聚合根：废弃所有进行中任务
-    for (const t of inst.abandonAllDoing(now)) await this.repo.updateTask(t)
-    // 子实体：完成任务
-    task.finish(operator, task.variables, now)
-    await this.repo.updateTask(task)
-
-    if (targetTaskName) {
-      const def = await this.repo.findDefineById(inst.defineId)
-      const flow: FlowModel = JSON.parse(typeof def!.content === 'string' ? def!.content : new TextDecoder().decode(def!.content as Uint8Array))
+    const { task, inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
+    if (!targetTaskName) {
+      // issues/79：ROLLBACK 对齐 Java rejectTask——退回上一任务节点（首条输入边 source），
+      // 新任务 actor=当前任务完成人（退回操作人）；无上一任务节点则不产生新待办
+      const prevName = this.previousTaskName(flow, task.taskName)
+      if (prevName) {
+        const prev = findNode(flow, prevName)
+        if (prev) {
+          const actors = this.rollbackActors(prev, inst, task)
+          await this.createTaskWithActors(prev, inst, operator, vars, actors)
+        }
+      }
+    } else {
+      // issues/79：对齐 Java——目标节点不存在显式报错（前端 JUMP 无效 taskName 不再静默空操作）
       const target = findNode(flow, targetTaskName)
-      if (target) await this.executeNode(flow, inst, target, operator, inst.variables)
+      if (!target) throw new Error(`根据节点名称[${targetTaskName}]无法找到节点模型`)
+      // 对齐 Java isFirstTaskName：跳首任务节点（start 直接后继）assignee 强制为发起人
+      if (target.type === TypeTask && this.isFirstTaskNode(flow, target)) {
+        target.properties = target.properties ?? {}
+        target.properties.assignee = inst.operator
+      }
+      await this.executeNode(flow, inst, target, operator, vars)
     }
-    return inst
+    return (await this.repo.findInstanceById(inst.id))!
   }
 
   // ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）────────────
 
   async executeAndJumpToFirstTaskNode(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
-    const { task, inst } = await this.loadAndCheck(taskId, operator)
-    const now = new Date()
-    // 聚合根：废弃所有进行中任务
-    for (const t of inst.abandonAllDoing(now)) await this.repo.updateTask(t)
-    // 子实体：完成任务
-    task.finish(operator, task.variables, now)
-    await this.repo.updateTask(task)
+    const { inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
     // 找到第一个任务节点，强制参与者为发起人，重新执行
-    const def = await this.repo.findDefineById(inst.defineId)
-    const flow: FlowModel = JSON.parse(typeof def!.content === 'string' ? def!.content : new TextDecoder().decode(def!.content as Uint8Array))
     const startNode = findNodeByType(flow, TypeStart)
     if (startNode) {
       for (const node of followEdges(flow, startNode.id)) {
         if (node.type === TypeTask || node.type === TypeCustom) {
           node.properties = node.properties ?? {}
           node.properties.assignee = inst.operator
-          await this.executeNode(flow, inst, node, operator, inst.variables)
+          await this.executeNode(flow, inst, node, operator, vars)
           break
         }
       }
     }
-    return inst
+    return (await this.repo.findInstanceById(inst.id))!
+  }
+
+  // ─── Execute 公共序言（对齐 Java prepareExecution）──────────────────────────
+
+  // 执行公共序言（对齐 Java prepareExecution）：权限校验 → f_ 字段权限过滤 →
+  // 完成任务（子实体状态转换 + 实例变量合并，经 updateInstance 级联落库）→
+  // 返回流程模型 + 合并后执行变量。Java jump 路径不废弃其余 DOING 任务
+  // （会签兄弟任务不受影响），此处保持一致。
+  private async prepareExecuteTask(taskId: string, operator: string, args: Record<string, any>) {
+    const { task, inst } = await this.loadAndCheck(taskId, operator)
+    // issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）
+    const def = await this.repo.findDefineById(inst.defineId)
+    const flow: FlowModel = JSON.parse(typeof def!.content === 'string' ? def!.content : new TextDecoder().decode(def!.content as Uint8Array))
+    args = filterFieldByPerm(args, findNode(flow, task.taskName))
+    const vars = { ...inst.variables, ...task.variables, ...args }
+    await this.addUserInfo(operator, vars)
+
+    const now = new Date()
+    // 聚合根：完成任务（子实体状态转换 + 实例变量合并）
+    inst.completeTask(task, operator, vars, now)
+    await this.repo.updateTask(task)
+    // v1.0.1：updateInstance 级联持久化依赖聚合内任务副本为最新状态，
+    // completeTask 改的是外部任务对象，需同步回聚合根
+    syncTaskToAggregate(inst, task)
+    await this.fireEvent({ type: EventType.TaskComplete, instanceId: inst.id, taskId: task.id, nodeId: task.taskName, operator })
+
+    inst.variables = vars
+    await this.repo.updateInstance(inst)
+    return { task, inst, flow, vars }
+  }
+
+  // 当前任务节点的首条输入边 source（issues/79 对齐 Java getPreviousTaskName）
+  private previousTaskName(flow: FlowModel, taskName: string): string {
+    const node = findNode(flow, taskName)
+    if (!node) return ''
+    for (const edge of flow.edges) {
+      if (edge.targetNodeId === node.id) {
+        const src = findNode(flow, edge.sourceNodeId)
+        if (src && (src.type === TypeTask || src.type === TypeCustom)) return src.id
+      }
+    }
+    return ''
+  }
+
+  // 是否 start 直接后继任务节点（issues/79 对齐 Java FlowUtil.isFirstTaskName）
+  private isFirstTaskNode(flow: FlowModel, node: FlowNode): boolean {
+    const start = findNodeByType(flow, TypeStart)
+    if (!start) return false
+    return flow.edges.some(e => e.sourceNodeId === start.id && e.targetNodeId === node.id)
+  }
+
+  // ROLLBACK 新任务参与者：优先当前任务完成人（退回操作人，对齐 Java rejectTask
+  // singletonList(currentTask.getActorId())），其次按目标节点 assignee 解析
+  private rollbackActors(node: FlowNode, inst: ProcessInstance, task: ProcessTask): string[] {
+    if (task.actorId) return [task.actorId]
+    const nextOp = inst.variables[KeyNextNodeOperator]
+    if (nextOp != null) {
+      if (typeof nextOp === 'string') return nextOp.split(',').map(s => s.trim()).filter(Boolean)
+      if (Array.isArray(nextOp)) return nextOp.map(String)
+      return [String(nextOp)]
+    }
+    const assignee = node.properties?.assignee as string | undefined
+    if (assignee) {
+      const actors: string[] = []
+      for (const raw of assignee.split(',')) {
+        let token = raw.trim()
+        if (!token) continue
+        if (token.includes('applicant')) token = token.replace('applicant', inst.operator)
+        if (token in inst.variables) {
+          const val = inst.variables[token]
+          if (Array.isArray(val)) actors.push(...val.map(String))
+          else actors.push(String(val))
+        } else {
+          actors.push(token)
+        }
+      }
+      return actors
+    }
+    return []
+  }
+
+  // 以显式参与者建任务（会签节点拆分为逐人任务，对齐 Java 会签创建语义）
+  private async createTaskWithActors(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>, actors: string[]): Promise<void> {
+    if (!actors.length) return
+    const ct = node.properties?.countersignType as string | undefined
+    const now = new Date()
+    const form = node.properties?.form ?? ''
+    if (isCountersign(node.properties?.performType) && ct) {
+      switch (ct) {
+        case 'PARALLEL':
+        case '':
+          for (const actor of actors) await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1))
+          return
+        case 'SEQUENTIAL': {
+          const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now, 1)
+          nt.variables = {
+            [`nrOfInstances_${node.id}`]: actors.length,
+            [`loopCounter_${node.id}`]: 0,
+            [`operatorList_${node.id}`]: actors,
+          }
+          await this.repo.saveTask(nt)
+          return
+        }
+        default:
+          for (const actor of actors) await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1))
+          return
+      }
+    }
+    const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now)
+    if (actors.length > 1) nt.actorIds = actors
+    await this.repo.saveTask(nt)
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
