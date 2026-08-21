@@ -1011,6 +1011,34 @@ describe('jeeflow compliance tests', () => {
     assert.equal(np3.task1.members[1].active, undefined)
   })
 
+  it('27b taskDetail performType/taskType 出口数字契约（issues/78）：普通 0 / 会签 1', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+
+    // 普通流程：task1 performType=0 / taskType=0
+    const r0 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const r1 = await facade.flow('processInstance/startAndExecute', { processDefineId: r0.data.processDefineId, operator: 'zhangsan' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const doing = await repo.findDoingTasks(r1.data.processInstanceId)
+    assert.ok(doing.length > 0, '应有进行中任务')
+    const d = await facade.flow('processTask/detail', { id: doing[0].id, operator: 'leader' })
+    assert.equal(d.code, 0, JSON.stringify(d))
+    assert.equal(d.data.performType, 0, `普通任务 performType 应=0: ${d.data.performType}`)
+    assert.equal(d.data.taskType, 0, `普通任务 taskType 应=0: ${d.data.taskType}`)
+
+    // 会签流程：task1 performType=1
+    const r2 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '06-countersign-sequential.json', 'utf-8') })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    const r3 = await facade.flow('processInstance/startAndExecute', { processDefineId: r2.data.processDefineId, operator: 'user1' })
+    assert.equal(r3.code, 0, JSON.stringify(r3))
+    const csDoing = await repo.findDoingTasks(r3.data.processInstanceId)
+    assert.ok(csDoing.length > 0, '会签应有进行中任务')
+    const cs = await facade.flow('processTask/detail', { id: csDoing[0].id, operator: 'userA' })
+    assert.equal(cs.code, 0, JSON.stringify(cs))
+    assert.equal(cs.data.performType, 1, `会签任务 performType 应=1（非 'COUNTERSIGN'）: ${cs.data.performType}`)
+  })
+
   it('28 performType 字符串兼容（issue 42）：ALL 面板格式会签行为与数字 1 一致', async () => {
     const { engine, repo } = setup()
     const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
