@@ -806,12 +806,18 @@ export class JeeflowFacade {
     const task = await this.repo.findTaskById(taskId)
     if (!task) throw new Error('任务不存在')
     const actors = await this.repo.findTaskActors(taskId)
+    // issues/82-5：任务级 ext.isFirstTaskNode（前端 detail.vue 双兜底 record.ext?.isFirstTaskNode）
+    // 首个任务节点且 DOING → true，与 instance detail 的 activeTaskList 行语义一致
+    const tExt: Record<string, any> = { ...(task.variables ?? {}) }
+    const doing = task.taskState === TaskState.Doing
+    tExt.isFirstTaskNode = false
     const vo: Record<string, any> = {
       id: task.id, processInstanceId: task.processInstanceId, taskName: task.taskName,
       displayName: task.displayName, taskType: task.taskType ?? null,
       performType: task.performType ?? null, taskState: task.taskState,
       operator: task.actorId ?? '', formKey: task.formKey ?? '',
       taskActorIdList: actors, executable: task.isAllowed(operator),
+      ext: tExt,
       taskFormData: formDataOf(task.variables, 'tf_'), // issues/15
     }
     // taskModel：流程定义中对应节点
@@ -820,6 +826,7 @@ export class JeeflowFacade {
       const def = await this.repo.findDefineById(inst.defineId)
       if (def) {
         vo.jsonObject = this.parseGraph(def.content) // issues/05
+        tExt.isFirstTaskNode = doing && task.taskName === this.firstTaskNodeId(vo.jsonObject)
         try {
           const flow = JSON.parse(toStr(def.content))
           for (const n of flow.nodes ?? []) {

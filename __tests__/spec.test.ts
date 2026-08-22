@@ -637,6 +637,15 @@ describe('jeeflow compliance tests', () => {
       { operator: 'zhangsan', m_pd_LIKE_displayName: 'zzz' })
     assert.equal(r5.data.rows.length, 0, JSON.stringify(r5))
 
+    // issues/82-6：实例列表按编码搜 m_pd_LIKE_name（别名 pd → pd.name）
+    const r5b = await facade.flow('processInstance/page',
+      { operator: 'zhangsan', m_pd_LIKE_name: 'simple' })
+    assert.equal(r5b.code, 0, JSON.stringify(r5b))
+    assert.equal(r5b.data.rows.length, 1, JSON.stringify(r5b))
+    const r5c = await facade.flow('processInstance/page',
+      { operator: 'zhangsan', m_pd_LIKE_name: 'zzz' })
+    assert.equal(r5c.data.rows.length, 0, JSON.stringify(r5c))
+
     // 任务列表：m_t_LIKE_displayName（别名 t → t.display_name）
     const r6 = await facade.flow('processTask/todoList',
       { operator: 'leader', m_t_LIKE_displayName: '审批' })
@@ -1283,5 +1292,58 @@ describe('jeeflow compliance tests', () => {
     await conn.execute('INSERT INTO t (id) VALUES (?)', ['2'])
     assert.equal(executeCalls, 0)
     assert.equal(queryCalls, 2)
+  })
+
+  it('82-5 taskDetail 任务级 ext.isFirstTaskNode（前端 detail.vue 双兜底，对齐 Java 1912456）', async () => {
+    // 场景 1：startAndExecute 自动完成 apply → 剩 task1（DOING，非首节点）→ false
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const c1 = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    const r0 = await facade.flow('processDefine/deploy', { content: c1 })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const r1 = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: r0.data.processDefineId, operator: 'zhangsan' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const instanceId = r1.data.processInstanceId
+    const task1Id = await doingTaskId(repo, instanceId, 'task1')
+    assert.ok(task1Id, '应有 task1 进行中任务')
+    const r = await facade.flow('processTask/detail', { id: task1Id, operator: 'leader' })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    assert.ok(r.data.ext && typeof r.data.ext === 'object', JSON.stringify(r.data))
+    assert.equal(r.data.ext.isFirstTaskNode, false, 'task1 非首任务节点，ext.isFirstTaskNode 应为 false')
+
+    // 场景 2：直接启动（不自动完成 apply）→ apply 为首任务节点且 DOING → true
+    const { engine: engine2, repo: repo2 } = setup()
+    const facade2 = new JeeflowFacade(engine2, repo2, new MemoryExtRepository())
+    const def = loadFlow(repo2, '01-simple.json')
+    const inst2 = await engine2.startProcessInstanceById(def.id, 'zhangsan', {})
+    const applyId = await doingTaskId(repo2, inst2.id, 'apply')
+    assert.ok(applyId, 'apply 应为进行中任务')
+    const r2 = await facade2.flow('processTask/detail', { id: applyId, operator: 'zhangsan' })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    assert.ok(r2.data.ext && typeof r2.data.ext === 'object', JSON.stringify(r2.data))
+    assert.equal(r2.data.ext.isFirstTaskNode, true, 'apply 为首任务节点且 DOING，ext.isFirstTaskNode 应为 true')
+  })
+
+  it('82 按 id 查"记录不存在"负向（对齐 PHP 模板 / Java 1912456）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const bigId = '999999999999999999'
+
+    const rd = await facade.flow('processDefine/detail', { id: bigId })
+    assert.equal(rd.code, 99999999, JSON.stringify(rd))
+    assert.ok(rd.msg.includes('流程定义不存在'), rd.msg)
+
+    const ri = await facade.flow('processInstance/detail', { id: bigId })
+    assert.equal(ri.code, 99999999, JSON.stringify(ri))
+    assert.ok(ri.msg.includes('流程实例不存在'), ri.msg)
+
+    const rx = await facade.flow('processDesign/detail', { id: bigId })
+    assert.equal(rx.code, 99999999, JSON.stringify(rx))
+    assert.ok(rx.msg.includes('流程设计不存在'), rx.msg)
+
+    const rt = await facade.flow('processTask/detail', { id: bigId, operator: 'leader' })
+    assert.equal(rt.code, 99999999, JSON.stringify(rt))
+    assert.ok(rt.msg.includes('任务不存在'), rt.msg)
   })
 })
