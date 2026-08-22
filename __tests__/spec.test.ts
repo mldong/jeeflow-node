@@ -710,11 +710,16 @@ describe('jeeflow compliance tests', () => {
     assert.equal(r7.data.rows.length, 0, JSON.stringify(r7))
 
     // 设计列表：无别名 m_LIKE_name（issues/05-5 process-design 页）
+    // 82-9：save 带 remark/icon，page 行应回显（设计页回显字段，对齐 Java/Go/Python）
     await facade.flow('processDesign/save',
-      { name: 'leave', displayName: '请假流程', content: c1, operator: 'zhangsan' })
+      { name: 'leave', displayName: '请假流程', content: c1, operator: 'zhangsan',
+        icon: 'icon-echo', remark: '回显验证备注' })
     const r8 = await facade.flow('processDesign/page', { m_LIKE_name: 'leave' })
     assert.equal(r8.code, 0, JSON.stringify(r8))
     assert.equal(r8.data.rows.length, 1, JSON.stringify(r8))
+    const dRow = r8.data.rows[0]
+    assert.equal(dRow.remark, '回显验证备注', `designPage remark 应回显保存值: ${dRow.remark}`)
+    assert.equal(dRow.icon, 'icon-echo', `designPage icon 应回显保存值: ${dRow.icon}`)
 
     // issues/63：processDesign/page 时间格式应为 yyyy-MM-dd HH:mm:ss
     const timeRe = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/
