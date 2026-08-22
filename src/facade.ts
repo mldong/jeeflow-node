@@ -872,7 +872,8 @@ export class JeeflowFacade {
       } catch { /* ignore */ }
     }
     if (candidates.length > 0) {
-      const rows = candidates.map(c => ({ userId: c, realName: c }))
+      // issues/80：行键对齐前端 UserSelect（valueField='id'）——补 id 键，保留 userId 兼容旧消费方
+      const rows = candidates.map(c => ({ id: c, userId: c, realName: c }))
       return pageData(pageNum, pageSize, rows.length, rows)
     }
     // 无模型候选 → 用户分页搜索（依赖 userSearch 钩子）

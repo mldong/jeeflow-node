@@ -903,9 +903,19 @@ describe('jeeflow compliance tests', () => {
     assert.equal(doing[0].taskName, 'apply')
     const r = await facade.flow('processTask/candidatePage', { processTaskId: doing[0].id })
     assert.equal(r.code, 0, JSON.stringify(r))
-    const userIds = (r.data.rows as Array<{ userId: string }>).map(x => x.userId).sort()
+    const rows = r.data.rows as Array<{ id?: string; userId?: string; realName?: string }>
+    const userIds = rows.map(x => x.userId).sort()
     assert.deepEqual(userIds, ['finA', 'finB', 'userA', 'userB'],
       `候选应为 candidateUsers(userA/userB) + candidateGroups(finA/finB): ${userIds}`)
+    // issues/80：行键契约 {id, realName}（对齐前端 UserSelect valueField='id'）
+    for (const x of rows) {
+      assert.ok(x.id && x.id.length > 0, `candidate row 缺 id 键: ${JSON.stringify(x)}`)
+      assert.ok(typeof x.realName === 'string', `candidate row 缺 realName 键: ${JSON.stringify(x)}`)
+      if (x.userId !== undefined) {
+        assert.equal(x.id, x.userId, `id 与 userId 应一一对齐（行键归一）: id=${x.id} userId=${x.userId}`)
+      }
+    }
+    assert.ok(rows.some(x => x.id === 'userA'), `id 列表应含 userA: ${rows.map(x => x.id)}`)
   })
 
   it('25 startAndExecute 预指派人 f_nextNodeOperator（对齐 boot3）', async () => {
