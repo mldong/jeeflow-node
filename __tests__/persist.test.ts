@@ -557,5 +557,22 @@ describe('1.8.4 issues/34 定义级拦截器 + 30/31 facade', () => {
     const bd2 = await facade.flow('processInstance/bizData', { processInstanceId: sr.data.processInstanceId })
     assert.equal(bd2.code, 0, JSON.stringify(bd2))
     assert.equal(bd2.data.tableName, 'biz_top')
+
+    // ── issues/81：listByType items 必含 processDefineState（前端发起按钮硬依赖）──
+    // 场景 A：deploy 后定义 state=1 → 可发起
+    const ltA = await facade.flow('processDesign/listByType', {})
+    assert.equal(ltA.code, 0, JSON.stringify(ltA))
+    const itemA = (ltA.data.approval as any[]).find((x) => x.name === 'simple')
+    assert.ok(itemA, `listByType 应含 simple: ${JSON.stringify(ltA.data.approval)}`)
+    assert.equal(String(itemA.processDefineId), String(dep.data.processDefineId), itemA)
+    assert.equal(itemA.processDefineState, 1, `启用定义 processDefineState 应为 1: ${JSON.stringify(itemA)}`)
+    // 场景 B：upAndDown 禁用 → 定义 state=0 → 前端置灰
+    const ud = await facade.flow('processDefine/upAndDown', { id: dep.data.processDefineId, opType: 0 })
+    assert.equal(ud.code, 0, JSON.stringify(ud))
+    const ltB = await facade.flow('processDesign/listByType', {})
+    assert.equal(ltB.code, 0, JSON.stringify(ltB))
+    const itemB = (ltB.data.approval as any[]).find((x) => x.name === 'simple')
+    assert.ok(itemB)
+    assert.equal(itemB.processDefineState, 0, `禁用定义 processDefineState 应为 0: ${JSON.stringify(itemB)}`)
   })
 })
