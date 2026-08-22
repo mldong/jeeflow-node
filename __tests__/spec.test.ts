@@ -1346,4 +1346,58 @@ describe('jeeflow compliance tests', () => {
     assert.equal(rt.code, 99999999, JSON.stringify(rt))
     assert.ok(rt.msg.includes('任务不存在'), rt.msg)
   })
+
+  it('83 嵌套对象 id 出口字符串化（82-4 / Python #76 对齐）：designDetail his 列表 + instanceDetail 任务行', async () => {
+    const { engine, repo } = setup()
+    const extRepo = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, extRepo)
+
+    // ── processDesign/detail 嵌套 his 列表（Python #76 同构；雪花大 id 奇数尾，float64 会改写值）──
+    const SNOW = '17769128440810003' // 17 位 >2^53
+    await extRepo.saveDesign({
+      id: SNOW, name: 'his-flow', displayName: '历史流程', type: 'approval',
+      isDeployed: 0, createTime: new Date(), createUser: 't', updateTime: new Date(), updateUser: 't',
+    })
+    await extRepo.saveDesignHis({ id: SNOW, processDesignId: SNOW, content: '{"v":2}', createTime: new Date(), createUser: 't' })
+    await extRepo.saveDesignHis({ id: '17769128440810002', processDesignId: SNOW, content: '{"v":1}', createTime: new Date(), createUser: 't' })
+
+    const r = await facade.flow('processDesign/detail', { id: SNOW })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    const d = r.data
+    assert.equal(d.id, SNOW, '主 id 必须精确字符串')
+    assert.equal(typeof d.id, 'string', JSON.stringify(d.id))
+    const his = d.his as Array<Record<string, any>>
+    assert.equal(his.length, 2, JSON.stringify(d))
+    for (const h of his) {
+      assert.ok(h && typeof h === 'object', `his 项应为普通对象: ${JSON.stringify(h)}`)
+      assert.equal(typeof h.id, 'string', `his[].id 必须字符串: ${JSON.stringify(h)}`)
+      assert.equal(typeof h.processDesignId, 'string', `his[].processDesignId 必须字符串: ${JSON.stringify(h)}`)
+    }
+    // 逐条精确十进制（顺序非契约点）——若 id 中途经 float64/Number，奇数尾被舍入改写，字符串值即不同
+    assert.deepEqual((his.map(h => h.id).sort()), ['17769128440810002', SNOW], JSON.stringify(his))
+    assert.ok(his.every(h => h.processDesignId === SNOW), 'his[].processDesignId 应指向主设计')
+
+    // ── processInstance/detail 嵌套任务行（activeTaskList/tasks）：雪花 defineId 发起 ──
+    const { engine: engine2, repo: repo2 } = setup()
+    const facade2 = new JeeflowFacade(engine2, repo2, new MemoryExtRepository())
+    repo2.addDefine({
+      id: SNOW, name: 'simple', displayName: '简单审批', type: 'approval', state: 1,
+      content: readFileSync(flowDir + '01-simple.json', 'utf-8'),
+      version: 1, createTime: new Date(), updateTime: new Date(), createUser: '', updateUser: '',
+    })
+    const inst = await engine2.startProcessInstanceById(SNOW, 'user1')
+    const ri = await facade2.flow('processInstance/detail', { id: inst.id })
+    assert.equal(ri.code, 0, JSON.stringify(ri))
+    const di = ri.data
+    assert.equal(typeof di.id, 'string', `实例 id 必须字符串: ${JSON.stringify(di.id)}`)
+    assert.equal(di.processDefineId, SNOW, 'processDefineId 必须精确字符串（雪花）')
+    const active = di.activeTaskList as Array<Record<string, any>>
+    assert.ok(Array.isArray(di.tasks) && (di.tasks as any[]).length >= 1, 'tasks 行非空')
+    assert.equal(active.length, 1, 'apply 应 DOING')
+    for (const row of [...(di.tasks as Array<Record<string, any>>), ...active]) {
+      assert.equal(typeof row.id, 'string', `任务行 id 必须字符串: ${JSON.stringify(row)}`)
+      assert.equal(typeof row.processInstanceId, 'string', `任务行 processInstanceId 必须字符串: ${JSON.stringify(row)}`)
+    }
+    assert.equal(active[0].taskName, 'apply')
+  })
 })
