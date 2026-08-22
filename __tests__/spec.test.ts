@@ -473,6 +473,60 @@ describe('jeeflow compliance tests', () => {
     assert.equal(e3.code, 99999999, JSON.stringify(e3))
   })
 
+  it('委托分页 m_ 条件（issues/82-7 五语言基准）：m_IN_processName / m_EQ_enabled', async () => {
+    const { engine, repo } = setup()
+    const extRepo = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, extRepo)
+
+    // 3 条委托：leave(启用) / overtime(启用) / sick(停用)
+    // 直接 save enabled:0（走 save 路径，覆盖 saveSurrogate 的 enabled clobber）
+    const r1 = await facade.flow('processSurrogate/save',
+      { operator: 'zhangsan', surrogate: 'lisi', processName: 'leave', enabled: 1 })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const r2 = await facade.flow('processSurrogate/save',
+      { operator: 'zhangsan', surrogate: 'wangwu', processName: 'overtime', enabled: 1 })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    const r3 = await facade.flow('processSurrogate/save',
+      { operator: 'zhangsan', surrogate: 'zhaoliu', processName: 'sick', enabled: 0 })
+    assert.equal(r3.code, 0, JSON.stringify(r3))
+
+    // 无过滤：3 条
+    const p0 = await facade.flow('processSurrogate/page', { operator: 'zhangsan' })
+    assert.equal(p0.code, 0, JSON.stringify(p0))
+    assert.equal(p0.data.recordCount, 3)
+
+    // m_IN_processName：IN 列表命中 2 条
+    const pIn = await facade.flow('processSurrogate/page',
+      { operator: 'zhangsan', m_IN_processName: ['leave', 'overtime'] })
+    assert.equal(pIn.code, 0, JSON.stringify(pIn))
+    assert.equal(pIn.data.recordCount, 2)
+    const names = pIn.data.rows.map((r: any) => r.processName)
+    assert.ok(names.includes('leave') && names.includes('overtime'), JSON.stringify(names))
+
+    // m_EQ_enabled：启用过滤命中 2 条（依赖 enabled=0 未被吞）
+    const pEq = await facade.flow('processSurrogate/page',
+      { operator: 'zhangsan', m_EQ_enabled: 1 })
+    assert.equal(pEq.code, 0, JSON.stringify(pEq))
+    assert.equal(pEq.data.recordCount, 2)
+
+    // m_IN + m_EQ 组合：sick/overtime 中仅启用 → 1 条（overtime）
+    const pCombo = await facade.flow('processSurrogate/page',
+      { operator: 'zhangsan', m_IN_processName: ['sick', 'overtime'], m_EQ_enabled: 1 })
+    assert.equal(pCombo.code, 0, JSON.stringify(pCombo))
+    assert.equal(pCombo.data.recordCount, 1)
+    assert.equal(pCombo.data.rows[0].processName, 'overtime', JSON.stringify(pCombo.data))
+
+    // 负向：IN 全不命中 / EQ 无匹配 → 0 条
+    const pNone = await facade.flow('processSurrogate/page',
+      { operator: 'zhangsan', m_IN_processName: ['none1', 'none2'] })
+    assert.equal(pNone.code, 0, JSON.stringify(pNone))
+    assert.equal(pNone.data.recordCount, 0)
+    const pEq2 = await facade.flow('processSurrogate/page',
+      { operator: 'zhangsan', m_EQ_enabled: 2 })
+    assert.equal(pEq2.code, 0, JSON.stringify(pEq2))
+    assert.equal(pEq2.data.recordCount, 0)
+  })
+
   it('17 门面视图端点（v1.2.0，spec §12 #16-18）', async () => {
     const { engine, repo } = setup()
     const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())

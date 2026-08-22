@@ -209,7 +209,7 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
     const now = new Date()
     if (!s.createTime) s.createTime = now
     if (!s.updateTime) s.updateTime = now
-    if (!s.enabled) s.enabled = 1
+    // 显式 enabled=0 是合法值（停用委托）；缺省由门面处理（对齐 Java/Go/Python，issues/82-7）
     const conn = await this.c()
     try {
       await conn.execute(this.sql(
