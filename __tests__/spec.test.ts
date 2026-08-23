@@ -1463,6 +1463,24 @@ describe('jeeflow compliance tests', () => {
     assert.ok(r2.msg.includes('actorIds 缺失'), r2.msg)
   })
 
+  it('82 雪花 id 精度守卫（对齐 Go TestSnowflakeIDPrecision / issues/38 E9）：float64 超 2^53 显性报错，字符串精确解析', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+
+    // ① 数字雪花 id（JSON.parse 降级为 float64，已丢精度）→ 显性报错（不静默截断）
+    const r1 = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: 2084320543834124288, operator: 'user1' })
+    assert.equal(r1.code, 99999999, JSON.stringify(r1))
+    assert.ok(r1.msg.includes('超出 float64 精确范围'), r1.msg)
+
+    // ② 字符串雪花 id → 精确解析（无该定义 → 报不存在，消息含原始完整 id）
+    const SNOW = '2084320543834124290'
+    const r2 = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: SNOW, operator: 'user1' })
+    assert.equal(r2.code, 99999999, JSON.stringify(r2))
+    assert.ok(r2.msg.includes(SNOW), `字符串应精确解析（消息应含原始雪花 id）: ${r2.msg}`)
+  })
+
   it('83 嵌套对象 id 出口字符串化（82-4 / Python #76 对齐）：designDetail his 列表 + instanceDetail 任务行', async () => {
     const { engine, repo } = setup()
     const extRepo = new MemoryExtRepository()

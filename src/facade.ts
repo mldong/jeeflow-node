@@ -1235,6 +1235,12 @@ function toId(v: any): string {
   // issue 38 E9：id 全程 string 承载——Java 雪花 id（>2^53）经 Number() 必丢精度。
   // 数字输入（JS 安全整数内）转字符串；字符串输入原样保留（含超长雪花 id）。
   if (v == null) throw new Error('id 缺失或非法')
+  // issues/82 负向（对齐 Go TestSnowflakeIDPrecision / issues/38 E9）：数字 id 超 2^53
+  // 说明它已被 JSON 解析器（JSON.parse / encoding/json）降级为 float64 且精度已丢，
+  // 必须显性报错而非 String() 静默截断成错误 id。
+  if (typeof v === 'number' && Math.abs(v) > 2 ** 53) {
+    throw new Error(`id ${v} 超出 float64 精确范围（2^53），请以字符串传递`)
+  }
   const s = String(v).trim()
   if (!/^\d+$/.test(s) || s === '0') throw new Error('id 缺失或非法')
   return s
