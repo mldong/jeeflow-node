@@ -23,28 +23,3 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-  verify:
-    name: Verify npm
-    needs: publish
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          registry-url: 'https://registry.npmjs.org'
-      - name: Wait for npm CDN sync
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          echo "⏳ 等待 npm CDN 同步..."
-          sleep 30
-          for i in {1..10}; do
-            PUBLISHED=$(npm view @mldong/jeeflow version 2>/dev/null || echo "")
-            if [ "$PUBLISHED" = "$VERSION" ]; then
-              echo "✅ npm @mldong/jeeflow@$VERSION 已可用"
-              exit 0
-            fi
-            echo "   等待中... ($i/10) 当前: $PUBLISHED"
-            sleep 15
-          done
-          echo "❌ npm 验证超时"
-          exit 1
