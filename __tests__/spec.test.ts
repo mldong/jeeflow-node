@@ -1446,6 +1446,23 @@ describe('jeeflow compliance tests', () => {
     assert.ok(rt.msg.includes('任务不存在'), rt.msg)
   })
 
+  it('82 抄送空 actors 报错负向（对齐 Java/Go/PHP 基准）：createCCInstance 空/缺失 actorIds → 99999999', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+
+    // 空 actorIds list
+    const r1 = await facade.flow('processInstance/createCCInstance',
+      { processInstanceId: '123', operator: 'user1', actorIds: [] })
+    assert.equal(r1.code, 99999999, JSON.stringify(r1))
+    assert.ok(r1.msg.includes('actorIds 缺失'), r1.msg)
+
+    // 负向边界：actorIds 键完全缺失同样报错
+    const r2 = await facade.flow('processInstance/createCCInstance',
+      { processInstanceId: '123', operator: 'user1' })
+    assert.equal(r2.code, 99999999, JSON.stringify(r2))
+    assert.ok(r2.msg.includes('actorIds 缺失'), r2.msg)
+  })
+
   it('83 嵌套对象 id 出口字符串化（82-4 / Python #76 对齐）：designDetail his 列表 + instanceDetail 任务行', async () => {
     const { engine, repo } = setup()
     const extRepo = new MemoryExtRepository()
