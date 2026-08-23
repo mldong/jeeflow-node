@@ -420,6 +420,46 @@ describe('jeeflow compliance tests', () => {
     assert.equal(r6.code, 0, JSON.stringify(r6))
   })
 
+  it('门面委托生效判断（issues/82-12）：时间窗 startTime/endTime + enabled 过滤（对齐 Java 基准）', async () => {
+    const { engine, repo } = setup()
+    const extRepo = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, extRepo)
+    const op = 'winop'
+
+    const save = async (sur: string, pn: string, extra: Record<string, any> = {}) => {
+      const r = await facade.flow('processSurrogate/save',
+        { operator: op, surrogate: sur, processName: pn, enabled: 1, ...extra })
+      assert.equal(r.code, 0, JSON.stringify(r))
+    }
+
+    // A 在窗（2026-08-01 ~ 08-31）
+    await save('sA', 'winA', { startTime: '2026-08-01 00:00:00', endTime: '2026-08-31 23:59:59' })
+    // B 未到（2026-09-01 起）
+    await save('sB', 'winB', { startTime: '2026-09-01 00:00:00' })
+    // C 已过（07-31 止）
+    await save('sC', 'winC', { endTime: '2026-07-31 23:59:59' })
+    // D 无窗但停用（enabled=0）
+    await save('sD', 'winD', { enabled: 0 })
+    // E 无窗且启用（enabled=1）
+    await save('sE', 'winE')
+
+    const at = new Date(2026, 7, 15, 12, 0, 0)
+    const hitA = await extRepo.getSurrogate(op, 'winA', at)
+    assert.equal(hitA?.surrogate, 'sA', '在窗委托应生效')
+    assert.equal(await extRepo.getSurrogate(op, 'winB', at), null, '未到窗委托不应生效')
+    assert.equal(await extRepo.getSurrogate(op, 'winC', at), null, '已过窗委托不应生效')
+    assert.equal(await extRepo.getSurrogate(op, 'winD', at), null, 'enabled=0 不应生效')
+    const hitE = await extRepo.getSurrogate(op, 'winE', at)
+    assert.equal(hitE?.surrogate, 'sE', '无窗启用委托应生效（NULL=不限）')
+    assert.equal(await extRepo.getSurrogate(op, 'winZ', at), null, '无匹配流程应返回 null')
+
+    // 换时间验证窗口边界随时间变化：B 在 9 月生效、A 在 9 月失效
+    const atSep = new Date(2026, 8, 15, 12, 0, 0)
+    const hitB = await extRepo.getSurrogate(op, 'winB', atSep)
+    assert.equal(hitB?.surrogate, 'sB', '9 月：B 进入窗口应生效')
+    assert.equal(await extRepo.getSurrogate(op, 'winA', atSep), null, '9 月：A 已出窗口不应生效')
+  })
+
   it('门面委托编辑链路（issues/77）：save(空格格式时间窗)→detail 回显→update 改字段→detail 再回显 + 负向', async () => {
     const { engine, repo } = setup()
     const extRepo = new MemoryExtRepository()
