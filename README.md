@@ -2,11 +2,11 @@
 
 [jeeflow](https://jeeflow-doc.mldong.com) 引擎规范的 **TypeScript 实现**。仅依赖 `node:*` 标准库，零外部依赖（引擎核心）。
 
-> **v1.1.0**：新增管理扩展（流程设计/历史/委托 + `ProcessExtRepository`）与统一门面
-> `JeeflowFacade.flow(action, args)`；assignee 变量解析与 `flow.auto`/`flow.admin` 系统代执行对齐 boot2/boot3。
+统一门面 `JeeflowFacade.flow(action, args)`；支持管理扩展（流程设计/历史/委托）、
+assignee 变量解析与 `flow.auto`/`flow.admin` 系统代执行。
 
 ```bash
-npm install @mldong/jeeflow   # 等发布到 npm 后
+npm install @mldong/jeeflow
 ```
 
 ## 快速开始
@@ -29,7 +29,7 @@ await engine.executeProcessTask(tasks[0].id, 'leader')
 ```
 
 > ⚠️ **id 全程 string（issue 38 E9）**：引擎内部与 API 契约的 id（流程定义/实例/任务/设计）一律为**字符串**。
-> Java 雪花 id（>2^53）超出 JS 安全整数，`Number()` 转换必丢精度；字符串可无损承载，保证四语言同库共享流程。
+> Java 雪花 id（>2^53）超出 JS 安全整数，`Number()` 转换必丢精度；字符串可无损承载，保证多语言同库共享流程。
 
 ## JDBC（MySQL/PostgreSQL）
 
@@ -74,8 +74,11 @@ npm run demo     # http://localhost:8082
 
 ## 节点支持
 
-对齐 [SPEC.md](https://jeeflow-doc.mldong.com) v1.0——与 Java/Go 版一致。
+对齐 [jeeflow-doc](https://jeeflow-doc.mldong.com)——与其他语言实现行为一致。
 
 ## License
 
-Apache-2.0
+Copyright © 2025-2026 mldong
+
+Licensed under the Apache License, Version 2.0.
+See [LICENSE](./LICENSE) and [NOTICE](./NOTICE).
