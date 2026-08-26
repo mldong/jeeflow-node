@@ -3,16 +3,17 @@ FROM node:22-alpine
 WORKDIR /app
 
 # 安装依赖
-COPY jeeflow-node/package.json jeeflow-node/package-lock.json ./
+COPY package.json package-lock.json ./
 RUN npm install
 
 # 复制源码
-COPY jeeflow-node/tsconfig.json ./
-COPY jeeflow-node/src/ /app/src/
-COPY jeeflow-node/demo/ /app/demo/
+COPY tsconfig.json ./
+COPY src/ /app/src/
+COPY demo/ /app/demo/
 
-# 复制共享 flows（demo/main.ts 的 flowsDir = __dirname/../../jeeflow-java/...，即容器根目录）
-COPY jeeflow-java/jeeflow-core/src/test/resources/flows /jeeflow-java/jeeflow-core/src/test/resources/flows
+# 流程定义用本仓 flows/ 副本（已入库，demo/main.ts 走 flows-resolver；用户单仓即可构建）
+COPY flows /app/flows
+COPY flows-resolver.ts /app/flows-resolver.ts
 
 EXPOSE 8082
 CMD ["node", "--import", "tsx", "demo/main.ts"]

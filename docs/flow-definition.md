@@ -42,7 +42,7 @@
 | `assignee` | 参与者（逗号分隔）；特殊值 `"applicant"` = 流程发起人 |
 | `performType` | `0` 普通参与 / `1` 会签 |
 | `countersignType` | `PARALLEL` / `SEQUENTIAL` / `RATIO(0.5)` |
-| `countersignCompletionCondition` | 会签放行表达式（如 `#nrOfCompletedInstances>=2`） |
+| `countersignCompletionCondition` | 会签放行表达式（如 `#nrOfCompletedInstances>=2`）；特殊值 `ONE_VOTE_VETO` = 开启一票否决（任一成员 submitType=20 即推进整单，未配置则软拒绝不阻断） |
 | `form` | 表单标识 |
 | `taskType` | `0` 主办 / `1` 协办 |
 
@@ -71,4 +71,4 @@ import type { FlowModel } from '@mldong/jeeflow/model'
 const flow: FlowModel = JSON.parse(content)   // 直接解析，类型见 src/model.ts
 ```
 
-> 演示站从 `jeeflow-java` 仓库的共享流程 JSON（`test/resources/flows/`，10 个）加载。完整示例与字段说明见[通用指南 02 · 流程定义](../../guides/02-flow-definition)。
+> 演示站从本仓 `flows/` 副本加载（唯一编辑源在 `jeeflow-java` 仓 `test/resources/flows/`，`flows-resolver` 在维护者机器上执行时把 Java 源精确镜像进本仓，单语言用户下载即用）。完整示例与字段说明见[通用指南 02 · 流程定义](../../guides/02-flow-definition)。

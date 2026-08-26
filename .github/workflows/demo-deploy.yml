@@ -9,23 +9,12 @@ jobs:
     name: Build & Deploy Node demo
     runs-on: ubuntu-latest
     steps:
-      # Node demo 依赖共享流程 JSON，需 checkout jeeflow-java
-      - name: Checkout jeeflow-java
-        uses: actions/checkout@v4
-        with:
-          repository: mldong/jeeflow-java
-          path: jeeflow-java
-      - name: Checkout jeeflow-node
-        uses: actions/checkout@v4
-        with:
-          path: jeeflow-node
+      # 流程定义用本仓 flows/ 副本（已入库），无需 checkout jeeflow-java
+      - uses: actions/checkout@v4
       - name: Build Docker image
         run: |
-          # Dockerfile.demo 期望构建上下文包含 jeeflow-java/ 和 node 源码
-          mkdir -p /tmp/demo-build
-          cp -r jeeflow-node /tmp/demo-build/
-          cp -r jeeflow-java /tmp/demo-build/
-          docker build -f /tmp/demo-build/jeeflow-node/Dockerfile.demo -t jeeflow-node-demo:latest /tmp/demo-build/
+          # Dockerfile.demo 构建上下文 = 本仓根（src/ + demo/ + flows/ + flows-resolver.ts）
+          docker build -f Dockerfile.demo -t jeeflow-node-demo:latest .
       - name: Export image
         run: |
           docker save jeeflow-node-demo:latest -o jeeflow-node-demo.tar

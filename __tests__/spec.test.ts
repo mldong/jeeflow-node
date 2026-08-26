@@ -9,8 +9,9 @@ import { JeeflowFacade } from '../src/facade.js'
 import { InstanceState, TaskState, type ProcessDefine, type ProcessInstance, type ProcessTask } from '../src/model.js'
 import type { ExpressionEvaluator, UserProvider } from '../src/spi.js'
 import { type FlowInterceptor, EventType, type EngineExtensions } from '../src/extensions.js'
+import { dir as flowsResolverDir } from '../flows-resolver.js'
 
-const flowDir = '../jeeflow-java/jeeflow-core/src/test/resources/flows/'
+const flowDir = flowsResolverDir() + '/'
 
 function setup() {
   const repo = new MemoryRepository()

@@ -14,6 +14,7 @@ import { EngineImpl } from '../src/engine.js'
 import { JdbcRepository, TsIDGenerator, convertPlaceholder } from '../src/jdbc/index.js'
 import { JdbcProcessExtRepository } from '../src/jdbc/ext.js'
 import { type ProcessDesign, type ProcessDesignHis, type ProcessSurrogate } from '../src/model.js'
+import { dir as flowsResolverDir } from '../flows-resolver.js'
 import { MysqlAdapter } from '../src/jdbc/mysql.js'
 import { PostgresAdapter } from '../src/jdbc/postgres.js'
 import { InstanceState, TaskState, ProcessInstance, type ProcessDefine } from '../src/model.js'
@@ -27,7 +28,7 @@ const DB_PORT = Number(process.env.JEFFLOW_DB_PORT ?? (isPg ? 5432 : 3306))
 const DB_USER = process.env.JEFFLOW_DB_USER ?? (isPg ? 'postgres' : 'root')
 const DB_PWD = process.env.JEFFLOW_DB_PWD ?? '8Eli#gr#AUk'
 const DEFINE_ID = isPg ? 910004 : 900004
-const FLOW_DIR = '../jeeflow-java/jeeflow-core/src/test/resources/flows/'
+const FLOW_DIR = flowsResolverDir() + '/'
 // 建表 SQL 唯一来源：jeeflow-java 仓 resources（schema-h2/mysql/postgres.sql，各语言引用）
 // 建表 SQL 各语言自带（维护者改 jeeflow-java 仓 resources 后用 scripts/sync-schema.sh 分发）
 const SCHEMA_DIR = 'tests/schema/'

@@ -10,8 +10,9 @@ import { KeySubmitType, KeyDeptID } from '../src/engine.js'
 import { SqliteDynamicTableWriter, PersistPostInterceptor, registerPersistMeta } from '../src/persist.js'
 import { HandlerRegistry } from '../src/registry.js'
 import type { EngineExtensions } from '../src/extensions.js'
+import { dir as flowsResolverDir } from '../flows-resolver.js'
 
-const flowDir = '../jeeflow-java/jeeflow-core/src/test/resources/flows/'
+const flowDir = flowsResolverDir() + '/'
 
 function setupDb() {
   const db = new DatabaseSync(':memory:')

@@ -16,6 +16,7 @@ import { MemoryRepository } from '../src/memory.js'
 import { MemoryExtRepository } from '../src/memory-ext.js'
 import { HandlerRegistry } from '../src/registry.js'
 import { registerBuiltinAssignments } from '../src/builtin.js'
+import { dir as flowsResolverDir } from '../flows-resolver.js'
 import type { ProcessDefine, UserInfo } from '../src/model.js'
 import type { UserProvider, OrgUserProvider } from '../src/spi.js'
 
@@ -112,9 +113,9 @@ function buildAll() {
   facade = new Facade(engine, repo, ext).setUserSearch(userSearch).setOrgProvider(orgProvider)
 }
 
-// 从共享 flows 目录加载种子流程（四端唯一事实源，id=1..N 文件名排序）
+// 从本仓 flows/ 加载种子流程（flows-resolver 已在维护者机器上把 Java 源精确镜像进来）
 function loadSeed() {
-  const flowsDir = join(__dirname, '..', '..', 'jeeflow-java', 'jeeflow-core', 'src', 'test', 'resources', 'flows')
+  const flowsDir = flowsResolverDir()
   const files = readdirSync(flowsDir).filter(f => f.endsWith('.json')).sort()
   files.forEach((fname, i) => {
     const content = readFileSync(join(flowsDir, fname), 'utf-8')
