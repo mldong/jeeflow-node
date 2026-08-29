@@ -119,7 +119,7 @@ export class JeeflowFacade {
       case 'processSurrogate/detail': // issues/77
         return this.surrogateDetail(args)
       case 'processSurrogate/remove':
-        return this.ext().removeSurrogate(toId(args.id))
+        return this.surrogateRemove(args)
       case 'processDefine/getLastByName':
         return this.getLastByName(args)
       case 'processInstance/highLight':
@@ -367,32 +367,20 @@ export class JeeflowFacade {
   /** 删除设计稿（issues/28：兼容 {ids} 批量与单 {id}） */
   private async designRemove(args: Record<string, any>): Promise<Record<string, any>> {
     const ext = this.ext()
-    if (Array.isArray(args.ids)) {
-      for (const id of args.ids) await ext.removeDesign(toId(id))
-    } else {
-      await ext.removeDesign(toId(args.id))
-    }
+    for (const id of idListArgs(args)) await ext.removeDesign(id)
     return {}
   }
 
   /** 删除定义（issues/28：兼容 {ids} 批量与单 {id}） */
   private async defineRemove(args: Record<string, any>): Promise<Record<string, any>> {
-    if (Array.isArray(args.ids)) {
-      for (const id of args.ids) await this.repo.removeDefine(toId(id))
-    } else {
-      await this.repo.removeDefine(toId(args.id))
-    }
+    for (const id of idListArgs(args)) await this.repo.removeDefine(id)
     return {}
   }
 
   /** 启用/停用（issues/28：兼容 {ids, opType} 批量；opType/state 二选一） */
   private async defineUpAndDown(args: Record<string, any>): Promise<Record<string, any>> {
     const state = toInt(args.opType ?? args.state)
-    if (Array.isArray(args.ids)) {
-      for (const id of args.ids) await this.repo.updateDefineState(toId(id), state)
-    } else {
-      await this.repo.updateDefineState(toId(args.id), state)
-    }
+    for (const id of idListArgs(args)) await this.repo.updateDefineState(id, state)
     return {}
   }
 
@@ -607,6 +595,13 @@ export class JeeflowFacade {
     const surrogate = await this.ext().findSurrogateById(surrogateId)
     if (!surrogate) throw new Error('委托记录不存在')
     return surrogateRowToMap(surrogate)
+  }
+
+  /** 删除委托（issues/95：前端「我的委托」行内/批量删除统一发 {ids}，与 define/design remove 同惯例） */
+  private async surrogateRemove(args: Record<string, any>): Promise<Record<string, any>> {
+    const ext = this.ext()
+    for (const id of idListArgs(args)) await ext.removeSurrogate(id)
+    return {}
   }
 
   /** 委托写入公共字段。授权人（operator）仅在显式传入时覆盖，避免 update
@@ -1244,6 +1239,16 @@ function toId(v: any): string {
   const s = String(v).trim()
   if (!/^\d+$/.test(s) || s === '0') throw new Error('id 缺失或非法')
   return s
+}
+
+/** 删除/启停类 action 的批量主键：mldong IdsParam 惯例下 {ids} 数组优先，兼容单 {id}；
+ *  两者皆缺失、空数组或含非法值一律报错（issues/95，对齐 Java idListArgs） */
+function idListArgs(args: Record<string, any>): string[] {
+  if (Array.isArray(args.ids)) {
+    if (args.ids.length === 0) throw new Error('id 缺失或非法')
+    return args.ids.map(toId)
+  }
+  return [toId(args.id)]
 }
 
 function toStringList2(v: any): string[] {

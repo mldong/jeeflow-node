@@ -514,6 +514,57 @@ describe('jeeflow compliance tests', () => {
     assert.equal(e3.code, 99999999, JSON.stringify(e3))
   })
 
+  it('委托删除 {ids} 批量（issues/95）：行内/批量统一走 ids，单 id 保留兼容', async () => {
+    const { engine, repo } = setup()
+    const extRepo = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, extRepo)
+
+    const save = async (op: string, agent: string, name: string) => {
+      const r = await facade.flow('processSurrogate/save', { operator: op, surrogate: agent, processName: name })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      return String(r.data.id)
+    }
+    const gone = async (id: string, label: string) => {
+      assert.equal(await extRepo.findSurrogateById(id), null, `${label} 应已删除`)
+    }
+
+    const a = await save('zhangsan', 'lisiA', 'leaveA')
+    const b = await save('zhangsan', 'lisiB', 'leaveB')
+    assert.equal((await facade.flow('processSurrogate/remove', { ids: [a, b] })).code, 0)
+    await gone(a, '批量 a')
+    await gone(b, '批量 b')
+
+    // 行内删除：前端同样走 {ids}，长度 1
+    const c = await save('lisiC', 'lisiD', 'leaveC')
+    assert.equal((await facade.flow('processSurrogate/remove', { ids: [c] })).code, 0)
+    await gone(c, '行内 c')
+
+    // 单 {id} 兼容形态回归（移动端 workflow.uts 发这个）
+    const d = await save('zhangsan', 'lisiE', 'leaveD')
+    assert.equal((await facade.flow('processSurrogate/remove', { id: d })).code, 0)
+    await gone(d, '单 id d')
+  })
+
+  it('{ids}/{id} 缺失或空数组一律报错，禁止静默成功（issues/95 §5②）', async () => {
+    const { engine, repo } = setup()
+    const extRepo = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, extRepo)
+
+    const cases: Array<[string, Record<string, any>]> = [
+      ['processSurrogate/remove', { ids: [] }],
+      ['processSurrogate/remove', { surrogate: 'lisi' }],
+      ['processSurrogate/remove', { ids: ['123', null] }],
+      ['processDefine/remove', { ids: [] }],
+      ['processDesign/remove', { ids: [] }],
+      ['processDefine/upAndDown', { ids: [], opType: 0 }],
+    ]
+    for (const [action, args] of cases) {
+      const r = await facade.flow(action, args)
+      assert.equal(r.code, 99999999, `${action} ${JSON.stringify(args)} → ${JSON.stringify(r)}`)
+      assert.ok(String(r.msg).includes('id 缺失或非法'), `${action} msg=${r.msg}`)
+    }
+  })
+
   it('委托分页 m_ 条件（issues/82-7 五语言基准）：m_IN_processName / m_EQ_enabled', async () => {
     const { engine, repo } = setup()
     const extRepo = new MemoryExtRepository()
