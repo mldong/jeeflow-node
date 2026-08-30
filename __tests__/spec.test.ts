@@ -565,6 +565,236 @@ describe('jeeflow compliance tests', () => {
     }
   })
 
+  // ── issues/96 §4B：入口参数形态矩阵（四 action × 四态）──────────────────────────
+  // 补测动机：既有门面用例历史上全发单数 {id}，引擎完全不认 {ids} 也照样全绿
+  // （issues/95 六语言集体漏检的根因）。每个 action 逐一断言前端 IdsParam 真实载荷。
+
+  it('入口形态矩阵 processSurrogate/remove（issues/96 §4B）：ids 批量 / 单 id / 空数组 / 含空值', async () => {
+    const { engine, repo } = setup()
+    const extRepo = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, extRepo)
+
+    // 造数：时间窗用前端 RangePicker 实际提交的 yyyy-MM-dd HH:mm:ss 空格格式
+    const save = async (tag: string) => {
+      const r = await facade.flow('processSurrogate/save', {
+        operator: 'zhangsan', surrogate: 'agent' + tag, processName: 'leave' + tag,
+        startTime: '2026-08-01 00:00:00', endTime: '2026-08-31 23:59:59', enabled: 1 })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      return String(r.data.id)
+    }
+    // 事后回查：仓储取不到 + 门面 detail 也取不到
+    const gone = async (id: string, label: string) => {
+      assert.equal(await extRepo.findSurrogateById(id), null, `${label} 仓储侧应已删除`)
+      const d = await facade.flow('processSurrogate/detail', { id })
+      assert.equal(d.code, 99999999, `${label} 门面 detail 应取不到: ${JSON.stringify(d)}`)
+    }
+    // 负向：必须报错且 msg 含「id 缺失或非法」，禁止静默成功
+    const rejected = async (args: Record<string, any>, label: string) => {
+      const r = await facade.flow('processSurrogate/remove', args)
+      assert.equal(r.code, 99999999, `${label} 应报错: ${JSON.stringify(r)}`)
+      assert.ok(String(r.msg).includes('id 缺失或非法'), `${label} msg=${r.msg}`)
+    }
+
+    // 态 1：{ids:[a,b]} —— Web 端「我的委托」勾选批量删除的真实载荷
+    const a = await save('A')
+    const b = await save('B')
+    const r1 = await facade.flow('processSurrogate/remove', { ids: [a, b] })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    await gone(a, '批量 a')
+    await gone(b, '批量 b')
+
+    // 态 2：{id:c} —— 单数旧形态回归保护（移动端 workflow.uts 发这个）
+    const c = await save('C')
+    const r2 = await facade.flow('processSurrogate/remove', { id: c })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    await gone(c, '单 id c')
+
+    // 态 3：{ids:[]} 空数组
+    await rejected({ ids: [] }, '空数组')
+    // 态 4：{ids:['']} 与含 null 的数组
+    await rejected({ ids: [''] }, '含空串')
+    await rejected({ ids: ['123', null] }, '含 null')
+
+    // 副作用检查：负向请求不得删数据（此时 a/b/c 已删，库里只剩 1 条）
+    const d = await save('D')
+    const p = await facade.flow('processSurrogate/page', { operator: 'zhangsan' })
+    assert.equal(p.code, 0, JSON.stringify(p))
+    assert.equal(p.data.recordCount, 1, `负向请求不应删数据: ${JSON.stringify(p.data)}`)
+    assert.equal((await facade.flow('processSurrogate/remove', { ids: [d] })).code, 0)
+  })
+
+  it('入口形态矩阵 processDesign/remove（issues/96 §4B）：ids 批量 / 单 id / 空数组 / 含空值', async () => {
+    const { engine, repo } = setup()
+    const extRepo = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, extRepo)
+    const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+
+    const saveDesign = async (tag: string) => {
+      const r = await facade.flow('processDesign/save',
+        { name: 'draft' + tag, displayName: '设计稿' + tag, content, operator: 'zhangsan' })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      return String(r.data.id)
+    }
+    const gone = async (id: string, label: string) => {
+      assert.equal(await extRepo.findDesignById(id), null, `${label} 仓储侧应已删除`)
+      const d = await facade.flow('processDesign/detail', { id })
+      assert.equal(d.code, 99999999, `${label} 门面 detail 应取不到: ${JSON.stringify(d)}`)
+    }
+    const rejected = async (args: Record<string, any>, label: string) => {
+      const r = await facade.flow('processDesign/remove', args)
+      assert.equal(r.code, 99999999, `${label} 应报错: ${JSON.stringify(r)}`)
+      assert.ok(String(r.msg).includes('id 缺失或非法'), `${label} msg=${r.msg}`)
+    }
+
+    // 态 1：{ids:[a,b]} 批量
+    const a = await saveDesign('A')
+    const b = await saveDesign('B')
+    const r1 = await facade.flow('processDesign/remove', { ids: [a, b] })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    await gone(a, '批量 a')
+    await gone(b, '批量 b')
+
+    // 态 2：{id:c} 单数回归
+    const c = await saveDesign('C')
+    const r2 = await facade.flow('processDesign/remove', { id: c })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    await gone(c, '单 id c')
+
+    // 态 3 + 态 4
+    await rejected({ ids: [] }, '空数组')
+    await rejected({ ids: [''] }, '含空串')
+    await rejected({ ids: ['123', null] }, '含 null')
+
+    // 副作用检查：态 3/4 不应动到未删的设计稿
+    const d = await saveDesign('D')
+    assert.ok(await extRepo.findDesignById(d), '负向请求不应删除设计稿')
+  })
+
+  it('入口形态矩阵 processDefine/remove（issues/96 §4B）：ids 批量 / 单 id / 空数组 / 含空值', async () => {
+    const { engine, repo } = setup()
+    const extRepo = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, extRepo)
+
+    // 造数：设计稿 save → updateDefine（内容快照）→ deploy，再 processDefine/getLastByName 回查命中
+    const deployDefine = async (file: string) => {
+      const content = readFileSync(flowDir + file, 'utf-8')
+      const flowName: string = JSON.parse(content).name
+      const s = await facade.flow('processDesign/save',
+        { name: 'draft-' + flowName, displayName: '草稿' + flowName, content, operator: 'zhangsan' })
+      assert.equal(s.code, 0, JSON.stringify(s))
+      const u = await facade.flow('processDesign/updateDefine',
+        { processDesignId: s.data.id, content, operator: 'zhangsan' })
+      assert.equal(u.code, 0, JSON.stringify(u))
+      const dp = await facade.flow('processDesign/deploy', { id: s.data.id, operator: 'zhangsan' })
+      assert.equal(dp.code, 0, JSON.stringify(dp))
+      const defineId = String(dp.data.processDefineId)
+      const g = await facade.flow('processDefine/getLastByName', { processDefineName: flowName })
+      assert.equal(g.code, 0, JSON.stringify(g))
+      assert.equal(String(g.data.id), defineId, `getLastByName 应命中刚部署的定义: ${JSON.stringify(g)}`)
+      return { defineId, flowName }
+    }
+    const gone = async (def: { defineId: string, flowName: string }, label: string) => {
+      assert.equal(await repo.findDefineById(def.defineId), null, `${label} 仓储侧应已删除`)
+      const g = await facade.flow('processDefine/getLastByName', { processDefineName: def.flowName })
+      assert.equal(g.code, 99999999, `${label} 按 name 应取不到: ${JSON.stringify(g)}`)
+      const d = await facade.flow('processDefine/detail', { id: def.defineId })
+      assert.equal(d.code, 99999999, `${label} 门面 detail 应取不到: ${JSON.stringify(d)}`)
+    }
+    const rejected = async (args: Record<string, any>, label: string) => {
+      const r = await facade.flow('processDefine/remove', args)
+      assert.equal(r.code, 99999999, `${label} 应报错: ${JSON.stringify(r)}`)
+      assert.ok(String(r.msg).includes('id 缺失或非法'), `${label} msg=${r.msg}`)
+    }
+
+    // 态 1：{ids:[a,b]} 批量
+    const a = await deployDefine('01-simple.json')
+    const b = await deployDefine('02-multi-task.json')
+    const r1 = await facade.flow('processDefine/remove', { ids: [a.defineId, b.defineId] })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    await gone(a, '批量 a')
+    await gone(b, '批量 b')
+
+    // 态 2：{id:c} 单数回归
+    const c = await deployDefine('03-decision-expr.json')
+    const r2 = await facade.flow('processDefine/remove', { id: c.defineId })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    await gone(c, '单 id c')
+
+    // 态 3 + 态 4
+    await rejected({ ids: [] }, '空数组')
+    await rejected({ ids: [''] }, '含空串')
+    await rejected({ ids: ['123', null] }, '含 null')
+
+    // 副作用检查：负向请求不应删掉仍在库的定义
+    const d = await deployDefine('04-fork-join.json')
+    assert.ok(await repo.findDefineById(d.defineId), '负向请求不应删除定义')
+  })
+
+  it('入口形态矩阵 processDefine/upAndDown（issues/96 §4B）：四态皆带合法 opType/state，空 ids 报错非恒真', async () => {
+    const { engine, repo } = setup()
+    const extRepo = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, extRepo)
+    const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+
+    // 造数：deploy 出的定义初始 state=1，停用后应为 0（upAndDown 是改状态而非删除，
+    // 故本 action 的「事后回查」= 两条 state 均按预期翻转，而非取不到）
+    const deployDefine = async (tag: string) => {
+      const s = await facade.flow('processDesign/save',
+        { name: 'updown' + tag, displayName: '启停' + tag, content, operator: 'zhangsan' })
+      assert.equal(s.code, 0, JSON.stringify(s))
+      const dp = await facade.flow('processDesign/deploy', { id: s.data.id, operator: 'zhangsan' })
+      assert.equal(dp.code, 0, JSON.stringify(dp))
+      const defineId = String(dp.data.processDefineId)
+      assert.equal((await repo.findDefineById(defineId))?.state, 1, '新部署定义 state 应为 1')
+      return defineId
+    }
+    const stateOf = async (id: string) => {
+      const d = await facade.flow('processDefine/detail', { id })
+      assert.equal(d.code, 0, JSON.stringify(d))
+      return d.data.state
+    }
+    const rejected = async (args: Record<string, any>, label: string) => {
+      const r = await facade.flow('processDefine/upAndDown', args)
+      assert.equal(r.code, 99999999, `${label} 应报错: ${JSON.stringify(r)}`)
+      assert.ok(String(r.msg).includes('id 缺失或非法'), `${label} msg=${r.msg}`)
+    }
+
+    // 态 1：{ids:[a,b], opType:0} 批量停用
+    const a = await deployDefine('A')
+    const b = await deployDefine('B')
+    const r1 = await facade.flow('processDefine/upAndDown', { ids: [a, b], opType: 0 })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    assert.equal(await stateOf(a), 0, '批量 a 应已停用')
+    assert.equal(await stateOf(b), 0, '批量 b 应已停用')
+
+    // 态 2：{id:c, state:0} 单数 + state 别名回归
+    const c = await deployDefine('C')
+    const r2 = await facade.flow('processDefine/upAndDown', { id: c, state: 0 })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    assert.equal(await stateOf(c), 0, '单 id c 应已停用')
+    // 反向：单 id 启用回 1
+    assert.equal((await facade.flow('processDefine/upAndDown', { id: c, opType: 1 })).code, 0)
+    assert.equal(await stateOf(c), 1, '单 id c 应已启用')
+
+    // 关键坑自证：upAndDown 先校验 state/opType，不带 state 的空 ids 用例会把
+    // 「空 ids 报错」变成恒真断言（撞的是 state 校验）。故显式钉住两种 msg 可区分。
+    const noState = await facade.flow('processDefine/upAndDown', { ids: [] })
+    assert.equal(noState.code, 99999999, JSON.stringify(noState))
+    assert.ok(!String(noState.msg).includes('id 缺失或非法'),
+      `缺 state 时应先撞 state 校验，实际 msg=${noState.msg}`)
+
+    // 态 3：{ids:[], opType:0} —— 带合法 state，报的必须是 id 缺失
+    await rejected({ ids: [], opType: 0 }, '空数组+opType')
+    await rejected({ ids: [], state: 0 }, '空数组+state')
+    // 态 4：含空串 / 含 null，同样带合法 opType
+    await rejected({ ids: [''], opType: 0 }, '含空串+opType')
+    await rejected({ ids: ['123', null], opType: 0 }, '含 null+opType')
+
+    // 副作用检查：负向请求不应改动已有定义状态
+    assert.equal(await stateOf(a), 0, '负向请求不应改 a 的状态')
+    assert.equal(await stateOf(c), 1, '负向请求不应改 c 的状态')
+  })
+
   it('委托分页 m_ 条件（issues/82-7 五语言基准）：m_IN_processName / m_EQ_enabled', async () => {
     const { engine, repo } = setup()
     const extRepo = new MemoryExtRepository()
