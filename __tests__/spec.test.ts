@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { EngineImpl, KeyAutoGenTitle } from '../src/engine.js'
+import { EngineImpl, KeyAutoGenTitle, KeyRealName, KeyUserID } from '../src/engine.js'
 import { HandlerRegistry, registerBuiltinAssignments } from '../src/index.js'
 import { MemoryRepository } from '../src/memory.js'
 import { MemoryExtRepository } from '../src/memory-ext.js'
@@ -98,6 +98,39 @@ describe('jeeflow compliance tests', () => {
     doing[0].actorIds.push('userC')
     const result = await engine.executeProcessTask(doing[0].id, 'userC')
     await assertDone(result, 'multi: expected done')
+  })
+
+  it('02B issues/97 实例 u_realName 恒为发起人（execute 不覆盖实例 u_*，对齐 Java）', async () => {
+    const { engine, repo } = setup()
+    const def = loadFlow(repo, '02-multi-task.json')
+    // 发起人 alice 发起并自动完成 apply
+    const inst = await startAndExecute(engine, repo, def.id, 'alice')
+    assert.equal(inst.variables[KeyRealName], '用户alice', 'start: 实例 u_realName=发起人 alice')
+
+    // 第一审批节点 bob 办理
+    let doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing[0].taskName, 'task1')
+    await repo.addTaskActor(doing[0].id, ['bob'])
+    doing[0].actorIds.push('bob')
+    const doneTaskId = doing[0].id
+    const instAfter = await engine.executeProcessTask(doneTaskId, 'bob')
+
+    // 核心：实例 u_realName 不被操作人 bob 覆盖，恒为发起人 alice
+    assert.equal(instAfter.variables[KeyRealName], '用户alice', `issues/97: 实例 u_realName 漂移为 ${instAfter.variables[KeyRealName]}`)
+    assert.equal(instAfter.variables[KeyUserID], 'alice', `issues/97: 实例 u_userId 漂移为 ${instAfter.variables[KeyUserID]}`)
+    // autoGenTitle 前缀（发起人）与实例 u_realName 一致
+    assert.ok(String(instAfter.variables[KeyAutoGenTitle]).startsWith('用户alice的'), `autoGenTitle 前缀应为发起人: ${instAfter.variables[KeyAutoGenTitle]}`)
+    // 任务行 ext（facade 操作人来源）保留操作人 bob 的 u_*
+    const doneTask = await repo.findTaskById(doneTaskId)
+    assert.equal(doneTask?.variables[KeyRealName], '用户bob', `issues/97: 任务行 u_realName 应为操作人 bob, got ${doneTask?.variables[KeyRealName]}`)
+
+    // 深层节点再办一次（userB 办 task2），实例 u_realName 仍为 alice
+    doing = await repo.findDoingTasks(instAfter.id)
+    assert.equal(doing[0].taskName, 'task2')
+    await repo.addTaskActor(doing[0].id, ['userB'])
+    doing[0].actorIds.push('userB')
+    const instDeep = await engine.executeProcessTask(doing[0].id, 'userB')
+    assert.equal(instDeep.variables[KeyRealName], '用户alice', `issues/97: 深层节点后实例 u_realName 应仍为 alice, got ${instDeep.variables[KeyRealName]}`)
   })
 
   it('03 decision', async () => {

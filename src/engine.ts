@@ -269,7 +269,10 @@ export class EngineImpl implements Engine {
     const def = await this.repo.findDefineById(inst.defineId)
     const flow: FlowModel = JSON.parse(typeof def!.content === 'string' ? def!.content : new TextDecoder().decode(def!.content as Uint8Array))
     args = filterFieldByPerm(args, findNode(flow, task.taskName))
-    const vars = { ...inst.variables, ...task.variables, ...args }
+    // issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
+    // 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。
+    const baseVars = inst.variables
+    const vars = { ...baseVars, ...task.variables, ...args }
     await this.addUserInfo(operator, vars)
 
     const now = new Date()
@@ -281,7 +284,8 @@ export class EngineImpl implements Engine {
     syncTaskToAggregate(inst, task)
     await this.fireEvent({ type: EventType.TaskComplete, instanceId: inst.id, taskId: task.id, nodeId: task.taskName, operator })
 
-    inst.variables = vars
+    // issues/97：实例变量写回排除操作人 u_*，保留 start 注入的发起人 u_*（u_realName 恒为发起人）
+    inst.variables = mergeExecIntoInstance(baseVars, vars)
     await this.repo.updateInstance(inst)
     return { task, inst, flow, vars }
   }
@@ -409,7 +413,8 @@ export class EngineImpl implements Engine {
         } else {
           inst.finish(new Date())
         }
-        inst.variables = vars
+        // issues/97：结束节点写回同样排除操作人 u_*（保留发起人 u_*，与 prepareExecuteTask 一致）
+        inst.variables = mergeExecIntoInstance(inst.variables, vars)
         await this.repo.updateInstance(inst)
         await this.fireEvent({ type: EventType.ProcessFinish, instanceId: inst.id, operator })
         return
@@ -625,6 +630,19 @@ function syncTaskToAggregate(inst: ProcessInstance, task: ProcessTask): void {
       return
     }
   }
+}
+
+/** 实例变量写回合并（issues/97 对齐 Java）：以 base（start 注入的发起人 u_*）为底，
+ *  并入执行上下文中**非 u_*** 键（f_ 表单字段 / submitType 等流转数据）。
+ *  addUserInfo 生成的操作人 u_* 只属于当次执行上下文与任务行 ext，不整体写回实例——
+ *  实例 u_realName 语义是「发起人」（与 autoGenTitle 一致），不随审批节点漂移。 */
+function mergeExecIntoInstance(base: Record<string, any>, execVars: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = { ...base }
+  for (const [k, v] of Object.entries(execVars)) {
+    if (k.startsWith('u_')) continue
+    out[k] = v
+  }
+  return out
 }
 
 function isTruthy(v: any): boolean {
