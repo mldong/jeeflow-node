@@ -167,6 +167,8 @@ export class EngineImpl implements Engine {
               [`operatorList_${curNode.id}`]: actors,
             }
             await this.repo.saveTask(nt)
+            // TASK_CREATE：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler / Rust）
+            await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: curNode.id, operator })
             return (await this.repo.findInstanceById(inst.id))!
           }
         } else {
@@ -350,7 +352,11 @@ export class EngineImpl implements Engine {
       switch (ct) {
         case 'PARALLEL':
         case '':
-          for (const actor of actors) await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1))
+          for (const actor of actors) {
+            const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1)
+            await this.repo.saveTask(nt)
+            await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
+          }
           return
         case 'SEQUENTIAL': {
           const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now, 1)
@@ -360,16 +366,22 @@ export class EngineImpl implements Engine {
             [`operatorList_${node.id}`]: actors,
           }
           await this.repo.saveTask(nt)
+          await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
           return
         }
         default:
-          for (const actor of actors) await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1))
+          for (const actor of actors) {
+            const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1)
+            await this.repo.saveTask(nt)
+            await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
+          }
           return
       }
     }
     const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now)
     if (actors.length > 1) nt.actorIds = actors
     await this.repo.saveTask(nt)
+    await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -485,7 +497,12 @@ export class EngineImpl implements Engine {
     if (isCountersign(node.properties?.performType) && ct) {
       switch (ct) {
         case 'PARALLEL':
-          for (const actor of actors) await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1))
+          for (const actor of actors) {
+            const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1)
+            await this.repo.saveTask(nt)
+            // TASK_CREATE：任务落库后逐个 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
+            await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
+          }
           return
         case 'SEQUENTIAL': {
           // 顺序会签任务也是会签任务（issues/57 E29 修正：仅普通分支默认 0）
@@ -496,10 +513,15 @@ export class EngineImpl implements Engine {
             [`operatorList_${node.id}`]: actors,
           }
           await this.repo.saveTask(nt)
+          await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
           return
         }
         default:
-          for (const actor of actors) await this.repo.saveTask(inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1))
+          for (const actor of actors) {
+            const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1)
+            await this.repo.saveTask(nt)
+            await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
+          }
           return
       }
     }
@@ -507,6 +529,7 @@ export class EngineImpl implements Engine {
     const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now)
     if (actors.length > 1) nt.actorIds = actors
     await this.repo.saveTask(nt)
+    await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
   }
 
   private async resolveActors(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>): Promise<string[]> {

@@ -315,6 +315,37 @@ describe('jeeflow compliance tests', () => {
     assert.deepStrictEqual(events, ['start', 'taskDone', 'taskDone', 'finish'])
   })
 
+  it('10b TASK_CREATE 事件（落库后 fire / 会签逐任务，对齐 Java CreateTaskHandler / Rust）', async () => {
+    const creates: Array<{ taskId?: string; nodeId?: string; instanceId: string; operator: string }> = []
+    const { engine, repo } = setup()
+    engine.setExtensions({
+      listeners: [(e) => { if (e.type === EventType.TaskCreate) creates.push(e) }],
+    })
+    // ① 普通任务：01-simple startAndExecute → apply 完成 → task1 创建（共 2 个）
+    const def = loadFlow(repo, '01-simple.json')
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
+    assert.strictEqual(creates.length, 2, `want 2 TASK_CREATE (apply+task1), got ${creates.length}`)
+    for (const c of creates) {
+      const t = await repo.findTaskById(c.taskId!)
+      assert.ok(t, `TASK_CREATE taskId=${c.taskId} 落库后可反查（fire 时机过早）`)
+      assert.ok(c.instanceId === inst.id && c.nodeId && c.operator, `事件字段齐全: ${JSON.stringify(c)}`)
+      assert.ok(t.actorIds.length > 0, `任务 actor 非空: ${t.actorIds}`)
+    }
+    creates.length = 0
+    // ② 并行会签：userA/userB/userC 三人逐任务 fire（apply + 3 会签 = 4）
+    const defPar = loadFlow(repo, '05-countersign-parallel.json')
+    await startAndExecute(engine, repo, defPar.id, 'applicant')
+    assert.strictEqual(creates.length, 4, `want 4 TASK_CREATE (apply+3会签), got ${creates.length}`)
+    const seen = new Set<string>()
+    for (const c of creates.slice(1)) {
+      const t = await repo.findTaskById(c.taskId!)
+      assert.ok(t, `会签 TASK_CREATE taskId=${c.taskId} 落库后可反查`)
+      assert.ok(c.nodeId, `会签事件 nodeId 非空`)
+      seen.add(c.taskId!)
+    }
+    assert.strictEqual(seen.size, 3, `会签 TaskID 互不相同（逐任务 fire）: ${[...seen]}`)
+  })
+
   it('11 assignee 变量解析（v1.0.1，集成反馈③）', async () => {
     const { engine, repo } = setup()
     let def = loadFlow(repo, '11-assignee-vars.json')
