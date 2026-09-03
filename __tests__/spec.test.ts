@@ -2383,6 +2383,27 @@ describe('jeeflow compliance tests', () => {
     })
   })
 
+  it('监听器异常兜底：单监听器抛错不影响后续监听器与主流程（issues/104 P2）', async () => {
+    const { engine, repo } = setup()
+    const seen: string[] = []
+    engine.setExtensions({
+      listeners: [
+        () => { throw new Error('boom') },
+        async () => { seen.push('second') },
+      ],
+    })
+    const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const r0 = await facade.flow('processDefine/deploy', { content })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const r1 = await facade.flow('processInstance/startAndExecute', {
+      processDefineId: r0.data.processDefineId, operator: 'alice',
+    })
+    assert.equal(r1.code, 0, '监听器异常不应影响发起主流程')
+    // 流程全程 fire 多次事件（ProcessStart/TaskCreate/...），每次后续监听器都应被调
+    assert.ok(seen.length >= 1 && seen.every(x => x === 'second'), `后续监听器应仍被调用：${seen}`)
+  })
+
   describe('stats regression', () => {
     it('既有 action 不受 stats 影响', async () => {
       const { engine, repo } = setup()

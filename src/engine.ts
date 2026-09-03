@@ -111,7 +111,15 @@ export class EngineImpl implements Engine {
   }
   async #fireEvent(evt: ProcessEvent) {
     if (!this.ext?.listeners) return
-    for (const l of this.ext.listeners) await l(evt)
+    // 兜底语义（issues/104 P2 统一口径）：单监听器异常只记录不传播——
+    // 不得影响引擎主流程，也不得中断后续监听器（对齐 PHP per-listener catch）
+    for (const l of this.ext.listeners) {
+      try {
+        await l(evt)
+      } catch (e) {
+        console.error(`[jeeflow] process event listener error: type=${evt.type} instanceId=${evt.instanceId}`, e)
+      }
+    }
   }
 
   // ─── Start ─────────────────────────────────────────────────────────────────
