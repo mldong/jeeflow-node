@@ -104,7 +104,12 @@ export class EngineImpl implements Engine {
     if (!this.ext?.interceptors && !this.ext?.interceptorRegistry) return
     for (const ic of await this.resolveInterceptors(inst)) await ic.postHandle(node, inst)
   }
-  private async fireEvent(evt: ProcessEvent) {
+  async fireEvent(evt: ProcessEvent) {
+    // 公开事件发布入口（issues/102 CC_CREATE）：facade 层 CC 实例创建后逐抄送人 fire；
+    // 无监听器（ext/listeners 为空）时零副作用，与上一版逐字节一致
+    await this.#fireEvent(evt)
+  }
+  async #fireEvent(evt: ProcessEvent) {
     if (!this.ext?.listeners) return
     for (const l of this.ext.listeners) await l(evt)
   }

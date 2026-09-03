@@ -1949,4 +1949,55 @@ describe('jeeflow compliance tests', () => {
     }
     assert.equal(active[0].taskName, 'apply')
   })
+
+  it('10c CcCreate 事件：逐抄送人 fire + ccActorId 直传（issues/102）', async () => {
+    const ccs: Array<{ instanceId: string; ccActorId?: string }> = []
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    engine.setExtensions({
+      listeners: [(e) => { if (e.type === EventType.CcCreate) ccs.push(e) }],
+    })
+    const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    const r0 = await facade.flow('processDefine/deploy', { content })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const defineId = r0.data.processDefineId
+
+    // ① 发起带 f_ccActors（字符串逗号分隔）→ 逐抄送人 fire，ccActorId 顺序保真
+    const r1 = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: defineId, operator: 'zhangsan', f_ccActors: 'alice,bob' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const instanceId = r1.data.processInstanceId
+    assert.strictEqual(ccs.length, 2, `want 2 CcCreate (alice,bob), got ${ccs.length}: ${JSON.stringify(ccs)}`)
+    assert.deepStrictEqual(ccs.map((e) => e.ccActorId), ['alice', 'bob'], 'ccActorId 逐抄送人直传且顺序保真')
+    for (const e of ccs) assert.ok(e.instanceId === instanceId, `instanceId 精确: ${JSON.stringify(e)}`)
+
+    // ② 手动补抄送 → 第 3 个事件
+    const r2 = await facade.flow('processInstance/createCCInstance',
+      { processInstanceId: instanceId, operator: 'zhangsan', actorIds: 'carol' })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    assert.strictEqual(ccs.length, 3, `want 3rd CcCreate (carol), got ${ccs.length}`)
+    assert.equal(ccs[2].ccActorId, 'carol')
+
+    // ③ cc 实例确实落库（事件 fire 时机不早于落库）
+    const ccA = await repo.pageCcInstances(1, 10, 'alice')
+    assert.equal(ccA.total, 1, 'alice 的 cc 行存在')
+  })
+
+  it('10d CcCreate 无监听器零副作用（纯增量，issues/102）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    // 不 setExtensions：ext/listeners 全空 → fireEvent 零副作用，与上一版行为逐字节一致
+    const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    const r0 = await facade.flow('processDefine/deploy', { content })
+    const r1 = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: r0.data.processDefineId, operator: 'zhangsan', f_ccActors: 'alice,bob' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const r2 = await facade.flow('processInstance/createCCInstance',
+      { processInstanceId: r1.data.processInstanceId, operator: 'zhangsan', actorIds: 'carol' })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    for (const actor of ['alice', 'bob', 'carol']) {
+      const cc = await repo.pageCcInstances(1, 10, actor)
+      assert.equal(cc.total, 1, `${actor} 的 cc 行存在（无监听器不影响落库）`)
+    }
+  })
 })

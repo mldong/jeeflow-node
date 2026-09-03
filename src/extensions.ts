@@ -27,6 +27,9 @@ export enum EventType {
   ProcessReject = 2,
   TaskCreate    = 3,
   TaskComplete  = 4,
+  // issues/102：抄送知会（对齐 Java CC_CREATE / Go EventCCCreate / Python CC_CREATE / PHP CC_CREATE；
+  // 4 号位是活码 TaskComplete，0/1/2/3/4 不重排——码值契约 Go/Node=5）
+  CcCreate      = 5,
 }
 
 export interface ProcessEvent {
@@ -35,6 +38,8 @@ export interface ProcessEvent {
   taskId?: string
   nodeId?: string
   operator: string
+  /** 抄送人 id 直传事件体，监听器免反查 cc 表（issues/102；对齐 Java ccActorId / Go CcActorID） */
+  ccActorId?: string
 }
 
 export type ProcessEventListener = (event: ProcessEvent) => void | Promise<void>

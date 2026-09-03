@@ -11,6 +11,7 @@ import {
 import type { OrgUserProvider, ProcessExtRepository, ProcessRepository, QueryCondition } from './spi.js'
 import type { EngineImpl } from './engine.js'
 import { KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign } from './engine.js'
+import { EventType, type ProcessEvent } from './extensions.js'
 
 // submitType 枚举（对齐 boot3）
 const SUBMIT_APPLY = 0
@@ -167,6 +168,11 @@ export class JeeflowFacade {
         ? flowArgs.f_ccActors.split(',').map((x: string) => x.trim()).filter(Boolean) : []
     if (ccList.length > 0) {
       await this.repo.createCcInstance(inst.id, operator, ...ccList)
+      // issues/102：CC 实例落库后逐抄送人 fire CcCreate（ccActorId 直传事件体，
+      // 对齐 Go startAndExecute / Python _startAndExecute；监听器据此落抄送知会 NOTICE）
+      for (const actor of ccList) {
+        await this.engine.fireEvent({ type: EventType.CcCreate, instanceId: inst.id, operator, ccActorId: actor })
+      }
     }
     // startAndExecute：自动完成申请节点（assignee="applicant" → 发起人）
     const doing = await this.repo.findDoingTasks(inst.id)
@@ -778,6 +784,10 @@ export class JeeflowFacade {
     const actors = toStringList2(args.actorIds)
     if (actors.length === 0) throw new Error('actorIds 缺失')
     await this.repo.createCcInstance(instanceId, operator, ...actors)
+    // issues/102：手动 CC 与发起路径同语义——逐抄送人 fire CcCreate
+    for (const actor of actors) {
+      await this.engine.fireEvent({ type: EventType.CcCreate, instanceId, operator, ccActorId: actor })
+    }
   }
 
   private async updateCCStatus(args: Record<string, any>): Promise<void> {
