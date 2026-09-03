@@ -698,10 +698,11 @@ export class JdbcRepository implements ProcessRepository {
 
   // ── Stats（issues/103：统计接口契约） ─────────────────────────────────────
 
-  async queryInstancesForStats(stateIn: number[], start?: Date | null, end?: Date | null): Promise<InstanceStatsRow[]> {
-    if (!stateIn.length) return []
-    let sql = `SELECT process_define_id, state, operator, create_time FROM wf_process_instance WHERE state IN (${repeatPh(stateIn.length)})`
-    const args: any[] = [...stateIn]
+  async queryInstancesForStats(stateIn?: number[] | null, start?: Date | null, end?: Date | null): Promise<InstanceStatsRow[]> {
+    // stateIn 空 = 无 state 过滤（对齐内置线：仅 overview 六计数用 stateIn）
+    let sql = 'SELECT process_define_id, state, operator, create_time FROM wf_process_instance WHERE 1=1'
+    const args: any[] = []
+    if (stateIn && stateIn.length) { sql += ` AND state IN (${repeatPh(stateIn.length)})`; args.push(...stateIn) }
     if (start) { sql += ' AND create_time >= ?'; args.push(start) }
     if (end) { sql += ' AND create_time < DATE_ADD(?, INTERVAL 1 SECOND)'; args.push(end) }
     sql += ' ORDER BY create_time'
@@ -794,23 +795,27 @@ export class JdbcRepository implements ProcessRepository {
   }
 
   async statsDefineGroup(start?: Date | null, end?: Date | null, limit = 10): Promise<Record<string, any>[]> {
-    let sql = 'SELECT i.process_define_id, pd.name, pd.display_name, COUNT(*) AS cnt, ' +
-      'AVG(TIMESTAMPDIFF(SECOND, i.create_time, (' +
-      'SELECT MAX(t.finish_time) FROM wf_process_task t WHERE t.process_instance_id = i.id AND t.finish_time IS NOT NULL' +
-      '))) AS avg_dur ' +
+    // 对齐内置线 mapper：count 全实例（无 state 过滤）、inner join define、
+    // avg 仅对 state=20 且有 finish 的实例聚合（MAX(task.finish_time) - create_time）
+    let sql = 'SELECT pd.name, pd.display_name, COUNT(*) AS cnt, ' +
+      'ROUND(AVG(CASE WHEN i.state = 20 AND sub.maxft IS NOT NULL ' +
+      'THEN TIMESTAMPDIFF(SECOND, i.create_time, sub.maxft) END)) AS avg_dur ' +
       'FROM wf_process_instance i ' +
-      'LEFT JOIN wf_process_define pd ON i.process_define_id = pd.id ' +
+      'JOIN wf_process_define pd ON i.process_define_id = pd.id ' +
+      'LEFT JOIN (SELECT process_instance_id, MAX(finish_time) AS maxft ' +
+      'FROM wf_process_task GROUP BY process_instance_id) sub ' +
+      'ON sub.process_instance_id = i.id ' +
       'WHERE 1=1'
     const args: any[] = []
     if (start) { sql += ' AND i.create_time >= ?'; args.push(start) }
     if (end) { sql += ' AND i.create_time < DATE_ADD(?, INTERVAL 1 SECOND)'; args.push(end) }
-    sql += ' GROUP BY i.process_define_id, pd.name, pd.display_name ORDER BY cnt DESC LIMIT ?'
+    sql += ' GROUP BY pd.id, pd.name, pd.display_name ORDER BY cnt DESC LIMIT ?'
     args.push(limit)
     const conn = await this.c()
     try {
       const rows = await conn.fetchAll(this.sql(sql), args)
       return rows.map((r: any) => ({
-        key: rowId(r.process_define_id), label: r.display_name || r.name || null,
+        key: r.name ?? null, label: r.display_name ?? null,
         count: Number(r.cnt ?? 0),
         avgDurationSeconds: r.avg_dur != null ? Math.round(Number(r.avg_dur)) : null,
       }))

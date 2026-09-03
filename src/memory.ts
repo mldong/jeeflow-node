@@ -341,12 +341,13 @@ export class MemoryRepository implements ProcessRepository {
     return isNaN(d.getTime()) ? undefined : d
   }
 
-  async queryInstancesForStats(stateIn: number[], start?: Date | null, end?: Date | null) {
+  async queryInstancesForStats(stateIn?: number[] | null, start?: Date | null, end?: Date | null) {
     const sd = this.toDt(start); const ed = this.toDt(end)
     const rows: { defineId: string; state: number; operator: string; createTime: Date | string | null }[] = []
     for (const inst of this.instances.values()) {
       const sv = Number(inst.state)
-      if (!stateIn.includes(sv)) continue
+      // stateIn 空 = 无 state 过滤（对齐内置线：仅 overview 六计数用 stateIn）
+      if (stateIn && stateIn.length && !stateIn.includes(sv)) continue
       const ct = this.toDt(inst.createTime)
       if (sd && ct && ct < sd) continue
       if (ed && ct && ct > ed) continue

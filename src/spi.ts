@@ -63,7 +63,7 @@ export interface ProcessRepository {
   pageDoneTasks(pageNum: number, pageSize: number, operator: string, conditions?: QueryCondition[]): Promise<{ rows: TaskRow[]; total: number }>
 
   // ── 统计查询（v1.8.25，issues/103）──
-  queryInstancesForStats(stateIn: number[], start?: Date | null, end?: Date | null): Promise<InstanceStatsRow[]>
+  queryInstancesForStats(stateIn?: number[] | null, start?: Date | null, end?: Date | null): Promise<InstanceStatsRow[]>
   queryTasksForStats(taskState?: number, start?: Date | null, end?: Date | null): Promise<TaskStatsRow[]>
   statsPendingAndOverdueCount(): Promise<[number, number]>
   statsCompletedTaskAggregate(): Promise<[number, number, number, number]>

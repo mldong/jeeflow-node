@@ -1101,7 +1101,8 @@ export class JeeflowFacade {
     const now = new Date()
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate())
     const todayEnd = new Date(todayStart.getTime() + 86400000)
-    const todayInsts = await this.repo.queryInstancesForStats(JeeflowFacade.DEFAULT_STATE_IN, todayStart, todayEnd)
+    // E：todayNew 恒按服务器当日、不过滤 state / 不受 stateIn 影响（对齐内置线 countTodayNew）
+    const todayInsts = await this.repo.queryInstancesForStats(null, todayStart, todayEnd)
     const todayNew = todayInsts.length
 
     const [pending, overdue] = await this.repo.statsPendingAndOverdueCount()
@@ -1120,15 +1121,20 @@ export class JeeflowFacade {
     }
   }
 
-  private async statsTrend(args: Record<string, any>): Promise<Record<string, any>> {
+  private async statsTrend(args: Record<string, any>): Promise<any> {
     const granularity = String(args.granularity ?? '')
     if (!JeeflowFacade.VALID_GRANULARITY.has(granularity)) {
       throw new Error(`不支持的 granularity: ${granularity}`)
     }
     const start = parseSurrogateTime(args.start)
     const end = parseSurrogateTime(args.end)
+    // C：start/end 必填（对齐内置线 20010012 缺参语义），不静默回退不限时间
+    if (!start || !end) {
+      throw new Error('trend 缺少必填参数：start/end/granularity')
+    }
 
-    const insts = await this.repo.queryInstancesForStats(JeeflowFacade.DEFAULT_STATE_IN, start, end)
+    // 实例侧无 state 过滤（对齐内置线 countInstanceStartedByBucket）
+    const insts = await this.repo.queryInstancesForStats(null, start, end)
     const doneTasks = await this.repo.queryTasksForStats(20 /* TaskState.Done */, start, end)
 
     const buckets = statsEnumerateBuckets(start, end, granularity)
@@ -1152,10 +1158,11 @@ export class JeeflowFacade {
     const series = buckets.map(b => ({
       bucket: b, started: startedMap.get(b) ?? 0, finished: finishedMap.get(b) ?? 0,
     }))
-    return { granularity, series }
+    // A：data 本体为裸数组（去掉 {granularity, series} 包装，对齐契约 spec 06 §4.2 / 内置线）
+    return series
   }
 
-  private async statsGroup(args: Record<string, any>): Promise<Record<string, any>> {
+  private async statsGroup(args: Record<string, any>): Promise<any> {
     const dimension = String(args.dimension ?? '')
     if (!JeeflowFacade.VALID_DIMENSION.has(dimension)) {
       throw new Error(`不支持的 dimension: ${dimension}`)
@@ -1171,7 +1178,8 @@ export class JeeflowFacade {
       rows = raw.map(r => ({ key: r.key, label: r.label ?? null, count: r.count, avgDurationSeconds: r.avgDurationSeconds ?? null }))
 
     } else if (dimension === 'state') {
-      const insts = await this.repo.queryInstancesForStats(JeeflowFacade.DEFAULT_STATE_IN, start, end)
+      // 无 state 过滤（对齐内置线 groupByDimension：仅按时间限定，契约 group 无 stateIn 入参）
+      const insts = await this.repo.queryInstancesForStats(null, start, end)
       const grouped = new Map<string, number>()
       for (const r of insts) {
         const k = String(r.state)
@@ -1181,7 +1189,7 @@ export class JeeflowFacade {
       rows = entries.map(([k, c]) => ({ key: k, label: null, count: c, avgDurationSeconds: null }))
 
     } else if (dimension === 'category') {
-      const insts = await this.repo.queryInstancesForStats(JeeflowFacade.DEFAULT_STATE_IN, start, end)
+      const insts = await this.repo.queryInstancesForStats(null, start, end)
       const defineTypes = new Map<string, string>()
       for (const r of insts) {
         if (!defineTypes.has(r.defineId)) {
@@ -1208,7 +1216,7 @@ export class JeeflowFacade {
       rows = entries.map(([k, c]) => ({ key: k, label: null, count: c, avgDurationSeconds: null }))
 
     } else if (dimension === 'applicant') {
-      const insts = await this.repo.queryInstancesForStats(JeeflowFacade.DEFAULT_STATE_IN, start, end)
+      const insts = await this.repo.queryInstancesForStats(null, start, end)
       const grouped = new Map<string, number>()
       for (const r of insts) {
         if (!r.operator) continue
@@ -1262,7 +1270,8 @@ export class JeeflowFacade {
       rows = []
     }
 
-    return { dimension, rows }
+    // A：data 本体为裸数组（去掉 {dimension, rows} 包装，对齐契约 spec 06 §4.2 / 内置线）
+    return rows
   }
 
 }

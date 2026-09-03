@@ -2081,7 +2081,7 @@ describe('jeeflow compliance tests', () => {
     it('有数据 overview 13 字段', async () => {
       const { repo } = setup()
       const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
-      seedStats(repo)
+      const seeded = seedStats(repo)
       const r = await facade.flow('processInstance/stats/overview', {})
       assert.equal(r.code, 0, JSON.stringify(r))
       const d = r.data
@@ -2091,7 +2091,10 @@ describe('jeeflow compliance tests', () => {
       assert.equal(d.rejected, 1)
       assert.equal(d.withdrawn, 0)
       assert.equal(d.suspended, 0)
-      assert.equal(d.todayNew, 2, 'only inst100 and inst101 created today')
+      // 种子用 now-2h/now-1h 相对时间，跨午夜运行时部分实例落在昨日 → 按种子动态算
+      const sameDay = (a: Date, b: Date) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
+      const todayCnt = [seeded.inst100, seeded.inst101, seeded.inst102, seeded.inst103].filter(i => sameDay(i.createTime, seeded.now)).length
+      assert.equal(d.todayNew, todayCnt, `created-today instances = ${todayCnt}`)
       // avgDurationSeconds: inst100→3600s, inst103→10800s → avg=7200
       assert.equal(d.avgDurationSeconds, 7200)
       // rejectRate: 1/max(1,2+1) = 0.3333
@@ -2102,6 +2105,21 @@ describe('jeeflow compliance tests', () => {
       assert.equal(d.countersignRate, 0.5)
       // onTimeRate: no task has expireTime set AND finished → 0
       assert.equal(d.onTimeRate, 0)
+    })
+
+    it('stateIn 入参生效（B 自证），todayNew 不受影响', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      const seeded = seedStats(repo)
+      const r = await facade.flow('processInstance/stats/overview', { stateIn: [10] })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      const d = r.data
+      assert.equal(d.total, 1, 'only inst101 (Doing) matches stateIn=[10]')
+      assert.equal(d.inProgress, 1)
+      assert.equal(d.completed, 0)
+      const sameDay = (a: Date, b: Date) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
+      const todayCnt = [seeded.inst100, seeded.inst101, seeded.inst102, seeded.inst103].filter(i => sameDay(i.createTime, seeded.now)).length
+      assert.equal(d.todayNew, todayCnt, 'todayNew ignores stateIn (E)')
     })
 
     it('start/end 过滤 overview', async () => {
@@ -2133,9 +2151,10 @@ describe('jeeflow compliance tests', () => {
         end: fmtDt(now),
       })
       assert.equal(r.code, 0, JSON.stringify(r))
-      assert.equal(r.data.granularity, 'day')
-      assert.ok(r.data.series.length >= 2)
-      for (const s of r.data.series) {
+      // A：data 本体为裸数组（无 {granularity, series} 包装）
+      assert.ok(Array.isArray(r.data), `data should be a bare array, got ${typeof r.data}`)
+      assert.ok(r.data.length >= 2)
+      for (const s of r.data) {
         assert.equal(s.started, 0)
         assert.equal(s.finished, 0)
       }
@@ -2152,7 +2171,8 @@ describe('jeeflow compliance tests', () => {
         end: fmtDt(now),
       })
       assert.equal(r.code, 0, JSON.stringify(r))
-      const series = r.data.series
+      const series = r.data
+      assert.ok(Array.isArray(series), 'data should be a bare array')
       assert.ok(series.length >= 3, `expected >=3 day buckets, got ${series.length}`)
       const totalStarted = series.reduce((s: number, b: any) => s + b.started, 0)
       assert.equal(totalStarted, 4, 'all 4 instances started')
@@ -2172,7 +2192,7 @@ describe('jeeflow compliance tests', () => {
           end: fmtDt(now),
         })
         assert.equal(r.code, 0, `${g} should succeed: ${JSON.stringify(r)}`)
-        assert.ok(r.data.series.length > 0, `${g} should have buckets`)
+        assert.ok(Array.isArray(r.data) && r.data.length > 0, `${g} should have buckets`)
       }
     })
 
@@ -2183,6 +2203,15 @@ describe('jeeflow compliance tests', () => {
       assert.notEqual(r.code, 0, 'should fail on invalid granularity')
       assert.ok(r.msg.includes('granularity'), `msg should mention granularity: ${r.msg}`)
     })
+
+    it('缺 start / 缺 end → 错误码（C 自证，不静默回退不限时间）', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      const r1 = await facade.flow('processInstance/stats/trend', { granularity: 'day', end: '2026-08-02 00:00:00' })
+      assert.notEqual(r1.code, 0, 'missing start should fail')
+      const r2 = await facade.flow('processInstance/stats/trend', { granularity: 'day', start: '2026-08-01 00:00:00' })
+      assert.notEqual(r2.code, 0, 'missing end should fail')
+    })
   })
 
   describe('stats group', () => {
@@ -2192,12 +2221,13 @@ describe('jeeflow compliance tests', () => {
       for (const dim of ['state', 'define', 'category', 'approver', 'applicant', 'node', 'stuckNode', 'stuckApprover', 'durationBucket']) {
         const r = await facade.flow('processInstance/stats/group', { dimension: dim })
         assert.equal(r.code, 0, `${dim} on empty: ${JSON.stringify(r)}`)
-        assert.equal(r.data.dimension, dim)
+        // A：data 本体为裸数组（无 {dimension, rows} 包装）
+        assert.ok(Array.isArray(r.data), `${dim} data should be a bare array`)
         if (dim === 'durationBucket') {
-          assert.equal(r.data.rows.length, 4, 'durationBucket always has 4 rows')
-          for (const row of r.data.rows) assert.equal(row.count, 0)
+          assert.equal(r.data.length, 4, 'durationBucket always has 4 rows')
+          for (const row of r.data) assert.equal(row.count, 0)
         } else {
-          assert.equal(r.data.rows.length, 0, `${dim} should be empty`)
+          assert.equal(r.data.length, 0, `${dim} should be empty`)
         }
       }
     })
@@ -2208,7 +2238,7 @@ describe('jeeflow compliance tests', () => {
       seedStats(repo)
       const r = await facade.flow('processInstance/stats/group', { dimension: 'state' })
       assert.equal(r.code, 0, JSON.stringify(r))
-      const rows = r.data.rows
+      const rows = r.data
       // 2 Done(20), 1 Doing(10), 1 Reject(45) → sorted by count desc
       assert.ok(rows.length >= 2)
       assert.equal(rows[0].key, '20')
@@ -2222,7 +2252,7 @@ describe('jeeflow compliance tests', () => {
       seedStats(repo)
       const r = await facade.flow('processInstance/stats/group', { dimension: 'define' })
       assert.equal(r.code, 0, JSON.stringify(r))
-      const rows = r.data.rows
+      const rows = r.data
       assert.equal(rows.length, 1)
       assert.equal(rows[0].key, 'stats-flow')
       assert.equal(rows[0].label, '统计测试流程')
@@ -2236,7 +2266,7 @@ describe('jeeflow compliance tests', () => {
       seedStats(repo)
       const r = await facade.flow('processInstance/stats/group', { dimension: 'category' })
       assert.equal(r.code, 0, JSON.stringify(r))
-      const rows = r.data.rows
+      const rows = r.data
       assert.equal(rows.length, 1)
       assert.equal(rows[0].key, 'oa')
       assert.equal(rows[0].count, 4)
@@ -2248,7 +2278,7 @@ describe('jeeflow compliance tests', () => {
       seedStats(repo)
       const r = await facade.flow('processInstance/stats/group', { dimension: 'approver' })
       assert.equal(r.code, 0, JSON.stringify(r))
-      const rows = r.data.rows
+      const rows = r.data
       // task1000: bob (Done), task1003: gina (Done) → 2 approvers each with count 1
       assert.equal(rows.length, 2)
       for (const row of rows) {
@@ -2263,7 +2293,7 @@ describe('jeeflow compliance tests', () => {
       seedStats(repo)
       const r = await facade.flow('processInstance/stats/group', { dimension: 'applicant' })
       assert.equal(r.code, 0, JSON.stringify(r))
-      const rows = r.data.rows
+      const rows = r.data
       // alice: 2 (inst100, inst102), charlie: 1, frank: 1 → sorted desc
       assert.equal(rows[0].key, 'alice')
       assert.equal(rows[0].count, 2)
@@ -2275,7 +2305,7 @@ describe('jeeflow compliance tests', () => {
       seedStats(repo)
       const r = await facade.flow('processInstance/stats/group', { dimension: 'node' })
       assert.equal(r.code, 0, JSON.stringify(r))
-      const rows = r.data.rows
+      const rows = r.data
       // task1000: 审批节点A Done, task1003: 会签节点 Done → each count 1
       assert.equal(rows.length, 2)
       for (const row of rows) {
@@ -2296,7 +2326,7 @@ describe('jeeflow compliance tests', () => {
       seedStats(repo)
       const r = await facade.flow('processInstance/stats/group', { dimension: 'stuckNode' })
       assert.equal(r.code, 0, JSON.stringify(r))
-      const rows = r.data.rows
+      const rows = r.data
       assert.equal(rows.length, 1)
       assert.equal(rows[0].key, '审批节点B')
       assert.equal(rows[0].count, 1)
@@ -2308,7 +2338,7 @@ describe('jeeflow compliance tests', () => {
       seedStats(repo)
       const r = await facade.flow('processInstance/stats/group', { dimension: 'stuckApprover' })
       assert.equal(r.code, 0, JSON.stringify(r))
-      const rows = r.data.rows
+      const rows = r.data
       // task1001 has actors [dave, eve], both Doing → 2 rows each count 1
       assert.equal(rows.length, 2)
       const keys = rows.map((r: any) => r.key).sort()
@@ -2322,7 +2352,7 @@ describe('jeeflow compliance tests', () => {
       seedStats(repo)
       const r = await facade.flow('processInstance/stats/group', { dimension: 'durationBucket' })
       assert.equal(r.code, 0, JSON.stringify(r))
-      const rows = r.data.rows
+      const rows = r.data
       assert.equal(rows.length, 4)
       assert.equal(rows[0].key, 'sameDay')
       assert.equal(rows[1].key, '1to3d')
@@ -2349,7 +2379,7 @@ describe('jeeflow compliance tests', () => {
       seedStats(repo)
       const r = await facade.flow('processInstance/stats/group', { dimension: 'applicant', limit: 2 })
       assert.equal(r.code, 0, JSON.stringify(r))
-      assert.equal(r.data.rows.length, 2, 'limit=2 should return only top 2')
+      assert.equal(r.data.length, 2, 'limit=2 should return only top 2')
     })
   })
 
