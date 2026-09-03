@@ -12,7 +12,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { ProcessInstance, ProcessTask, type ProcessDefine, type CcInstanceRow, type DefineRow, type InstanceRow, type TaskRow } from '../model.js'
 import { InstanceState, TaskState } from '../model.js'
-import type { IDGenerator, ProcessRepository, QueryCondition } from '../spi.js'
+import type { IDGenerator, ProcessRepository, QueryCondition, InstanceStatsRow, TaskStatsRow } from '../spi.js'
 
 // ═══ 列白名单（issues/05-5，与 mldong-boot2 别名一致） ═══
 
@@ -693,6 +693,176 @@ export class JdbcRepository implements ProcessRepository {
       updateTime: r.update_time, updateUser: rowId(r.update_user),
       defineName: r.name ?? '', defineDisplayName: r.display_name ?? '',
       defineVersion: Number(r.version ?? 0),
+    }
+  }
+
+  // ── Stats（issues/103：统计接口契约） ─────────────────────────────────────
+
+  async queryInstancesForStats(stateIn: number[], start?: Date | null, end?: Date | null): Promise<InstanceStatsRow[]> {
+    if (!stateIn.length) return []
+    let sql = `SELECT process_define_id, state, operator, create_time FROM wf_process_instance WHERE state IN (${repeatPh(stateIn.length)})`
+    const args: any[] = [...stateIn]
+    if (start) { sql += ' AND create_time >= ?'; args.push(start) }
+    if (end) { sql += ' AND create_time < DATE_ADD(?, INTERVAL 1 SECOND)'; args.push(end) }
+    sql += ' ORDER BY create_time'
+    const conn = await this.c()
+    try {
+      const rows = await conn.fetchAll(this.sql(sql), args)
+      return rows.map((r: any) => ({
+        defineId: rowId(r.process_define_id), state: r.state,
+        operator: r.operator ?? '', createTime: r.create_time,
+      }))
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async queryTasksForStats(taskState?: number, start?: Date | null, end?: Date | null): Promise<TaskStatsRow[]> {
+    let sql = 'SELECT operator, display_name, perform_type, create_time, finish_time, expire_time FROM wf_process_task WHERE 1=1'
+    const args: any[] = []
+    if (taskState != null) { sql += ' AND task_state = ?'; args.push(taskState) }
+    if (start) { sql += ' AND finish_time >= ?'; args.push(start) }
+    if (end) { sql += ' AND finish_time < DATE_ADD(?, INTERVAL 1 SECOND)'; args.push(end) }
+    const conn = await this.c()
+    try {
+      const rows = await conn.fetchAll(this.sql(sql), args)
+      return rows.map((r: any) => ({
+        operator: r.operator ?? '', displayName: r.display_name ?? '',
+        performType: r.perform_type ?? 0, createTime: r.create_time,
+        finishTime: r.finish_time, expireTime: r.expire_time,
+      }))
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async statsPendingAndOverdueCount(): Promise<[number, number]> {
+    const conn = await this.c()
+    try {
+      const r1 = await conn.fetchOne(this.sql(
+        'SELECT COUNT(*) FROM wf_process_task WHERE task_state = 10'), [])
+      const pending = r1 ? Number(Object.values(r1)[0] ?? 0) : 0
+      const now = new Date()
+      const r2 = await conn.fetchOne(this.sql(
+        'SELECT COUNT(*) FROM wf_process_task WHERE task_state = 10 AND expire_time IS NOT NULL AND expire_time < ?'),
+        [now])
+      const overdue = r2 ? Number(Object.values(r2)[0] ?? 0) : 0
+      return [pending, overdue]
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async statsCompletedTaskAggregate(): Promise<[number, number, number, number]> {
+    const conn = await this.c()
+    try {
+      const r = await conn.fetchOne(this.sql(
+        'SELECT COUNT(*) AS total, ' +
+        'SUM(CASE WHEN perform_type = 1 THEN 1 ELSE 0 END) AS countersign, ' +
+        'SUM(CASE WHEN expire_time IS NOT NULL AND finish_time IS NOT NULL AND finish_time <= expire_time THEN 1 ELSE 0 END) AS on_time, ' +
+        'SUM(CASE WHEN expire_time IS NOT NULL THEN 1 ELSE 0 END) AS on_time_denom ' +
+        'FROM wf_process_task WHERE task_state = 20'), [])
+      if (!r) return [0, 0, 0, 0]
+      return [
+        Number(r.total ?? 0),
+        Number(r.countersign ?? 0),
+        Number(r.on_time ?? 0),
+        Number(r.on_time_denom ?? 0),
+      ]
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async statsAvgCompletedDurationSeconds(start?: Date | null, end?: Date | null): Promise<number> {
+    let sql = `SELECT COALESCE(ROUND(AVG(
+        TIMESTAMPDIFF(SECOND, i.create_time, (
+          SELECT MAX(t.finish_time) FROM wf_process_task t WHERE t.process_instance_id = i.id AND t.finish_time IS NOT NULL
+        ))
+      )), 0) AS avg_sec FROM wf_process_instance i WHERE i.state = 20`
+    const args: any[] = []
+    if (start) { sql += ' AND i.create_time >= ?'; args.push(start) }
+    if (end) { sql += ' AND i.create_time < DATE_ADD(?, INTERVAL 1 SECOND)'; args.push(end) }
+    const conn = await this.c()
+    try {
+      const r = await conn.fetchOne(this.sql(sql), args)
+      if (!r) return 0
+      return Number(Object.values(r)[0] ?? 0)
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async statsDefineGroup(start?: Date | null, end?: Date | null, limit = 10): Promise<Record<string, any>[]> {
+    let sql = 'SELECT i.process_define_id, pd.name, pd.display_name, COUNT(*) AS cnt, ' +
+      'AVG(TIMESTAMPDIFF(SECOND, i.create_time, (' +
+      'SELECT MAX(t.finish_time) FROM wf_process_task t WHERE t.process_instance_id = i.id AND t.finish_time IS NOT NULL' +
+      '))) AS avg_dur ' +
+      'FROM wf_process_instance i ' +
+      'LEFT JOIN wf_process_define pd ON i.process_define_id = pd.id ' +
+      'WHERE 1=1'
+    const args: any[] = []
+    if (start) { sql += ' AND i.create_time >= ?'; args.push(start) }
+    if (end) { sql += ' AND i.create_time < DATE_ADD(?, INTERVAL 1 SECOND)'; args.push(end) }
+    sql += ' GROUP BY i.process_define_id, pd.name, pd.display_name ORDER BY cnt DESC LIMIT ?'
+    args.push(limit)
+    const conn = await this.c()
+    try {
+      const rows = await conn.fetchAll(this.sql(sql), args)
+      return rows.map((r: any) => ({
+        key: rowId(r.process_define_id), label: r.display_name || r.name || null,
+        count: Number(r.cnt ?? 0),
+        avgDurationSeconds: r.avg_dur != null ? Math.round(Number(r.avg_dur)) : null,
+      }))
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async statsStuckNodeGroup(limit = 10): Promise<Record<string, any>[]> {
+    const conn = await this.c()
+    try {
+      const rows = await conn.fetchAll(this.sql(
+        'SELECT display_name, COUNT(*) AS cnt FROM wf_process_task ' +
+        'WHERE task_state = 10 GROUP BY display_name ORDER BY cnt DESC LIMIT ?'),
+        [limit])
+      return rows.map((r: any) => ({
+        key: r.display_name ?? '', label: null, count: Number(r.cnt ?? 0), avgDurationSeconds: null,
+      }))
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async statsStuckApproverGroup(limit = 10): Promise<Record<string, any>[]> {
+    const conn = await this.c()
+    try {
+      const rows = await conn.fetchAll(this.sql(
+        'SELECT ta.actor_id, COUNT(DISTINCT t.id) AS cnt FROM wf_process_task_actor ta ' +
+        'INNER JOIN wf_process_task t ON ta.process_task_id = t.id ' +
+        'WHERE t.task_state = 10 GROUP BY ta.actor_id ORDER BY cnt DESC LIMIT ?'),
+        [limit])
+      return rows.map((r: any) => ({
+        key: rowId(r.actor_id), label: null, count: Number(r.cnt ?? 0), avgDurationSeconds: null,
+      }))
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async statsCompletedInstanceDurations(start?: Date | null, end?: Date | null): Promise<number[]> {
+    let sql = `SELECT TIMESTAMPDIFF(SECOND, i.create_time, (
+        SELECT MAX(t.finish_time) FROM wf_process_task t WHERE t.process_instance_id = i.id AND t.finish_time IS NOT NULL
+      )) AS dur FROM wf_process_instance i WHERE i.state = 20`
+    const args: any[] = []
+    if (start) { sql += ' AND i.create_time >= ?'; args.push(start) }
+    if (end) { sql += ' AND i.create_time < DATE_ADD(?, INTERVAL 1 SECOND)'; args.push(end) }
+    const conn = await this.c()
+    try {
+      const rows = await conn.fetchAll(this.sql(sql), args)
+      return rows.map((r: any) => Number(r.dur)).filter((v: number) => v != null && !isNaN(v))
+    } finally {
+      await this.done(conn)
     }
   }
 }

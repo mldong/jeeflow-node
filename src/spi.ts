@@ -7,6 +7,24 @@ export interface QueryCondition {
   value: any
 }
 
+// ── 统计行类型（v1.8.25，issues/103）──
+
+export interface InstanceStatsRow {
+  defineId: string
+  state: number
+  operator: string
+  createTime: Date | string | null
+}
+
+export interface TaskStatsRow {
+  operator: string
+  displayName: string
+  performType: number
+  createTime: Date | string | null
+  finishTime: Date | string | null
+  expireTime: Date | string | null
+}
+
 export interface ProcessRepository {
   findDefineById(id: string): Promise<ProcessDefine | null>
   // findDefineByName 按流程编码查最新一条定义（v1.1.0，Facade deploy 版本管理用）
@@ -43,6 +61,17 @@ export interface ProcessRepository {
   pageInstances(pageNum: number, pageSize: number, operator: string, conditions?: QueryCondition[]): Promise<{ rows: InstanceRow[]; total: number }>
   pageTodoTasks(pageNum: number, pageSize: number, actorId: string, conditions?: QueryCondition[]): Promise<{ rows: TaskRow[]; total: number }>
   pageDoneTasks(pageNum: number, pageSize: number, operator: string, conditions?: QueryCondition[]): Promise<{ rows: TaskRow[]; total: number }>
+
+  // ── 统计查询（v1.8.25，issues/103）──
+  queryInstancesForStats(stateIn: number[], start?: Date | null, end?: Date | null): Promise<InstanceStatsRow[]>
+  queryTasksForStats(taskState?: number, start?: Date | null, end?: Date | null): Promise<TaskStatsRow[]>
+  statsPendingAndOverdueCount(): Promise<[number, number]>
+  statsCompletedTaskAggregate(): Promise<[number, number, number, number]>
+  statsAvgCompletedDurationSeconds(start?: Date | null, end?: Date | null): Promise<number>
+  statsDefineGroup(start?: Date | null, end?: Date | null, limit?: number): Promise<Record<string, any>[]>
+  statsStuckNodeGroup(limit?: number): Promise<Record<string, any>[]>
+  statsStuckApproverGroup(limit?: number): Promise<Record<string, any>[]>
+  statsCompletedInstanceDurations(start?: Date | null, end?: Date | null): Promise<number[]>
 }
 
 export interface UserProvider {

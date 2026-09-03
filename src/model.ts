@@ -323,7 +323,7 @@ export class ProcessTask {
 
 export function cloneInstance(inst: ProcessInstance): ProcessInstance {
   return Object.assign(Object.create(ProcessInstance.prototype), inst, {
-    tasks: inst.tasks.map(cloneTask),
+    tasks: (inst.tasks ?? []).map(cloneTask),
   })
 }
 

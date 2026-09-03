@@ -120,12 +120,12 @@ export class MemoryRepository implements ProcessRepository {
     cp.tasks = []
     this.instances.set(inst.id, cp)
     // v1.0.1：级联保存聚合根内任务状态变更
-    for (const t of inst.tasks) {
+    for (const t of (inst.tasks ?? [])) {
       if (!t.id) continue
       const tc = cloneTask(t)
       tc.actorIds = []
       this.tasks.set(t.id, tc)
-      if (t.actorIds.length) this.actors.set(t.id, [...t.actorIds])
+      if (t.actorIds?.length) this.actors.set(t.id, [...t.actorIds])
     }
   }
   async findInstanceById(id: string) {
@@ -155,13 +155,13 @@ export class MemoryRepository implements ProcessRepository {
     const cp = cloneTask(task)
     cp.actorIds = []
     this.tasks.set(task.id, cp)
-    if (task.actorIds.length) this.actors.set(task.id, [...task.actorIds])
+    if (task.actorIds?.length) this.actors.set(task.id, [...task.actorIds])
   }
   async updateTask(task: ProcessTask) {
     const cp = cloneTask(task)
     cp.actorIds = []
     this.tasks.set(task.id, cp)
-    if (task.actorIds.length) this.actors.set(task.id, [...task.actorIds])
+    if (task.actorIds?.length) this.actors.set(task.id, [...task.actorIds])
   }
   async findDoingTasks(instanceId: string, taskNames?: string[]) {
     const result: ProcessTask[] = []
@@ -330,5 +330,173 @@ export class MemoryRepository implements ProcessRepository {
       cp.actorIds = this.actors.get(t.id) ?? t.actorIds
       return cp
     })
+  }
+
+  // ── 统计（v1.8.25，issues/103） ──────────────────────────────────────────
+
+  private toDt(v: Date | string | null | undefined): Date | undefined {
+    if (v == null) return undefined
+    if (v instanceof Date) return isNaN(v.getTime()) ? undefined : v
+    const d = new Date(String(v).replace(' ', 'T'))
+    return isNaN(d.getTime()) ? undefined : d
+  }
+
+  async queryInstancesForStats(stateIn: number[], start?: Date | null, end?: Date | null) {
+    const sd = this.toDt(start); const ed = this.toDt(end)
+    const rows: { defineId: string; state: number; operator: string; createTime: Date | string | null }[] = []
+    for (const inst of this.instances.values()) {
+      const sv = Number(inst.state)
+      if (!stateIn.includes(sv)) continue
+      const ct = this.toDt(inst.createTime)
+      if (sd && ct && ct < sd) continue
+      if (ed && ct && ct > ed) continue
+      rows.push({ defineId: String(inst.defineId), state: sv, operator: inst.operator ?? '', createTime: inst.createTime ?? null })
+    }
+    return rows
+  }
+
+  async queryTasksForStats(taskState?: number, start?: Date | null, end?: Date | null) {
+    const sd = this.toDt(start); const ed = this.toDt(end)
+    const rows: { operator: string; displayName: string; performType: number; createTime: Date | string | null; finishTime: Date | string | null; expireTime: Date | string | null }[] = []
+    for (const t of this.tasks.values()) {
+      if (taskState != null && Number(t.taskState) !== taskState) continue
+      const ft = this.toDt(t.finishTime)
+      if (sd && ft && ft < sd) continue
+      if (ed && ft && ft > ed) continue
+      rows.push({
+        operator: t.actorId ?? '', displayName: t.displayName ?? '',
+        performType: t.performType ?? 0,
+        createTime: t.createTime ?? null, finishTime: t.finishTime ?? null, expireTime: t.expireTime ?? null,
+      })
+    }
+    return rows
+  }
+
+  async statsPendingAndOverdueCount(): Promise<[number, number]> {
+    const now = new Date()
+    let pending = 0, overdue = 0
+    for (const t of this.tasks.values()) {
+      if (Number(t.taskState) !== TaskState.Doing) continue
+      pending++
+      const exp = this.toDt(t.expireTime)
+      if (exp && exp < now) overdue++
+    }
+    return [pending, overdue]
+  }
+
+  async statsCompletedTaskAggregate(): Promise<[number, number, number, number]> {
+    let total = 0, countersign = 0, onTime = 0, onTimeDenom = 0
+    for (const t of this.tasks.values()) {
+      if (Number(t.taskState) !== TaskState.Done) continue
+      total++
+      if (t.performType === 1) countersign++
+      const ft = this.toDt(t.finishTime)
+      const exp = this.toDt(t.expireTime)
+      if (exp != null) {
+        onTimeDenom++
+        if (ft && ft <= exp) onTime++
+      }
+    }
+    return [total, countersign, onTime, onTimeDenom]
+  }
+
+  async statsAvgCompletedDurationSeconds(start?: Date | null, end?: Date | null): Promise<number> {
+    const sd = this.toDt(start); const ed = this.toDt(end)
+    let totalSec = 0, count = 0
+    for (const inst of this.instances.values()) {
+      if (Number(inst.state) !== 20) continue
+      const ct = this.toDt(inst.createTime)
+      if (sd && ct && ct < sd) continue
+      if (ed && ct && ct > ed) continue
+      let maxFt: Date | undefined
+      for (const t of this.tasks.values()) {
+        if (t.processInstanceId !== inst.id) continue
+        const ft = this.toDt(t.finishTime)
+        if (ft && (!maxFt || ft > maxFt)) maxFt = ft
+      }
+      if (maxFt && ct) {
+        totalSec += Math.floor((maxFt.getTime() - ct.getTime()) / 1000)
+        count++
+      }
+    }
+    return count > 0 ? Math.floor(totalSec / count) : 0
+  }
+
+  async statsDefineGroup(start?: Date | null, end?: Date | null, limit = 10) {
+    const sd = this.toDt(start); const ed = this.toDt(end)
+    const grouped = new Map<string, { key: string; label: string | null; count: number; totalDur: number; durCount: number }>()
+    for (const inst of this.instances.values()) {
+      const ct = this.toDt(inst.createTime)
+      if (sd && ct && ct < sd) continue
+      if (ed && ct && ct > ed) continue
+      const did = String(inst.defineId)
+      if (!grouped.has(did)) {
+        const defn = this.defines.get(did)
+        grouped.set(did, { key: defn?.name ?? '', label: defn?.displayName ?? null, count: 0, totalDur: 0, durCount: 0 })
+      }
+      const g = grouped.get(did)!
+      g.count++
+      if (Number(inst.state) === 20) {
+        let maxFt: Date | undefined
+        for (const t of this.tasks.values()) {
+          if (t.processInstanceId !== inst.id) continue
+          const ft = this.toDt(t.finishTime)
+          if (ft && (!maxFt || ft > maxFt)) maxFt = ft
+        }
+        if (maxFt && ct) {
+          g.totalDur += Math.floor((maxFt.getTime() - ct.getTime()) / 1000)
+          g.durCount++
+        }
+      }
+    }
+    const entries = [...grouped.values()].sort((a, b) => b.count - a.count).slice(0, limit)
+    return entries.map(e => ({ key: e.key, label: e.label, count: e.count, avgDurationSeconds: e.durCount > 0 ? Math.floor(e.totalDur / e.durCount) : null }))
+  }
+
+  async statsStuckNodeGroup(limit = 10) {
+    const grouped = new Map<string, number>()
+    for (const t of this.tasks.values()) {
+      if (Number(t.taskState) !== TaskState.Doing) continue
+      const dn = t.displayName
+      if (!dn) continue
+      grouped.set(dn, (grouped.get(dn) ?? 0) + 1)
+    }
+    const entries = [...grouped.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit)
+    return entries.map(([k, c]) => ({ key: k, count: c }))
+  }
+
+  async statsStuckApproverGroup(limit = 10) {
+    const grouped = new Map<string, number>()
+    for (const t of this.tasks.values()) {
+      if (Number(t.taskState) !== TaskState.Doing) continue
+      const actors = this.actors.get(t.id) ?? []
+      for (const aid of actors) {
+        if (!aid) continue
+        grouped.set(aid, (grouped.get(aid) ?? 0) + 1)
+      }
+    }
+    const entries = [...grouped.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit)
+    return entries.map(([k, c]) => ({ key: k, count: c }))
+  }
+
+  async statsCompletedInstanceDurations(start?: Date | null, end?: Date | null): Promise<number[]> {
+    const sd = this.toDt(start); const ed = this.toDt(end)
+    const durations: number[] = []
+    for (const inst of this.instances.values()) {
+      if (Number(inst.state) !== 20) continue
+      const ct = this.toDt(inst.createTime)
+      if (sd && ct && ct < sd) continue
+      if (ed && ct && ct > ed) continue
+      let maxFt: Date | undefined
+      for (const t of this.tasks.values()) {
+        if (t.processInstanceId !== inst.id) continue
+        const ft = this.toDt(t.finishTime)
+        if (ft && (!maxFt || ft > maxFt)) maxFt = ft
+      }
+      if (maxFt && ct) {
+        durations.push(Math.floor((maxFt.getTime() - ct.getTime()) / 1000))
+      }
+    }
+    return durations
   }
 }

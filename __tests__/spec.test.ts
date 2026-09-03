@@ -6,7 +6,7 @@ import { HandlerRegistry, registerBuiltinAssignments } from '../src/index.js'
 import { MemoryRepository } from '../src/memory.js'
 import { MemoryExtRepository } from '../src/memory-ext.js'
 import { JeeflowFacade } from '../src/facade.js'
-import { InstanceState, TaskState, type ProcessDefine, type ProcessInstance, type ProcessTask } from '../src/model.js'
+import { InstanceState, TaskState, type ProcessDefine, ProcessInstance, ProcessTask } from '../src/model.js'
 import type { ExpressionEvaluator, UserProvider } from '../src/spi.js'
 import { type FlowInterceptor, EventType, type EngineExtensions } from '../src/extensions.js'
 import { dir as flowsResolverDir } from '../flows-resolver.js'
@@ -2000,4 +2000,378 @@ describe('jeeflow compliance tests', () => {
       assert.equal(cc.total, 1, `${actor} 的 cc 行存在（无监听器不影响落库）`)
     }
   })
+
+  // ── 统计三 action（v1.8.25，issues/103） ──────────────────────────────────
+
+  function seedStats(repo: MemoryRepository, now_?: Date) {
+    const now = now_ ?? new Date()
+    const def: ProcessDefine = {
+      id: '100', name: 'stats-flow', displayName: '统计测试流程', type: 'oa',
+      state: 1, content: '', version: 1,
+      createTime: now, updateTime: now, createUser: '', updateUser: '',
+    }
+    repo.addDefine(def)
+
+    const inst100 = new ProcessInstance({
+      id: '100', defineId: '100', state: InstanceState.Done, operator: 'alice',
+      parentNodeName: '', businessNo: '', variables: {},
+      createTime: new Date(now.getTime() - 2 * 3600_000),
+      updateTime: now, createUser: 'alice', updateUser: 'alice',
+    })
+    const inst101 = new ProcessInstance({
+      id: '101', defineId: '100', state: InstanceState.Doing, operator: 'charlie',
+      parentNodeName: '', businessNo: '', variables: {},
+      createTime: new Date(now.getTime() - 1 * 3600_000),
+      updateTime: now, createUser: 'charlie', updateUser: 'charlie',
+    })
+    const inst102 = new ProcessInstance({
+      id: '102', defineId: '100', state: InstanceState.Reject, operator: 'alice',
+      parentNodeName: '', businessNo: '', variables: {},
+      createTime: new Date(now.getTime() - 24 * 3600_000),
+      updateTime: now, createUser: 'alice', updateUser: 'alice',
+    })
+    const inst103 = new ProcessInstance({
+      id: '103', defineId: '100', state: InstanceState.Done, operator: 'frank',
+      parentNodeName: '', businessNo: '', variables: {},
+      createTime: new Date(now.getTime() - 2 * 24 * 3600_000),
+      updateTime: now, createUser: 'frank', updateUser: 'frank',
+    })
+    for (const inst of [inst100, inst101, inst102, inst103]) repo.saveInstance(inst)
+
+    const task1000 = new ProcessTask({
+      id: '1000', processInstanceId: '100', taskName: 'approve', displayName: '审批节点A',
+      taskType: 0, performType: 0, taskState: TaskState.Done, actorId: 'bob',
+      finishTime: new Date(inst100.createTime.getTime() + 3600_000),
+      createTime: inst100.createTime, updateTime: now, createUser: 'bob', updateUser: 'bob',
+    })
+    const task1001 = new ProcessTask({
+      id: '1001', processInstanceId: '101', taskName: 'approve', displayName: '审批节点B',
+      taskType: 0, performType: 0, taskState: TaskState.Doing, actorId: '',
+      expireTime: new Date(now.getTime() - 1 * 3600_000),
+      createTime: inst101.createTime, updateTime: now, createUser: 'charlie', updateUser: 'charlie',
+    })
+    const task1003 = new ProcessTask({
+      id: '1003', processInstanceId: '103', taskName: 'countersign', displayName: '会签节点',
+      taskType: 0, performType: 1, taskState: TaskState.Done, actorId: 'gina',
+      finishTime: new Date(inst103.createTime.getTime() + 10800_000),
+      createTime: inst103.createTime, updateTime: now, createUser: 'gina', updateUser: 'gina',
+    })
+    for (const t of [task1000, task1001, task1003]) repo.saveTask(t)
+    repo.addTaskActor('1001', ['dave', 'eve'])
+
+    return { now, def, inst100, inst101, inst102, inst103, task1000, task1001, task1003 }
+  }
+
+  describe('stats overview', () => {
+    it('空库 overview 全 0', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      const r = await facade.flow('processInstance/stats/overview', {})
+      assert.equal(r.code, 0, JSON.stringify(r))
+      const d = r.data
+      for (const k of ['total', 'inProgress', 'completed', 'rejected', 'withdrawn', 'suspended', 'todayNew', 'pendingTaskCount', 'overdueTaskCount']) {
+        assert.equal(d[k], 0, `${k} should be 0`)
+      }
+      assert.equal(d.avgDurationSeconds, 0)
+      assert.equal(d.rejectRate, 0)
+      assert.equal(d.countersignRate, 0)
+      assert.equal(d.onTimeRate, 0)
+    })
+
+    it('有数据 overview 13 字段', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      seedStats(repo)
+      const r = await facade.flow('processInstance/stats/overview', {})
+      assert.equal(r.code, 0, JSON.stringify(r))
+      const d = r.data
+      assert.equal(d.total, 4)
+      assert.equal(d.inProgress, 1)
+      assert.equal(d.completed, 2)
+      assert.equal(d.rejected, 1)
+      assert.equal(d.withdrawn, 0)
+      assert.equal(d.suspended, 0)
+      assert.equal(d.todayNew, 2, 'only inst100 and inst101 created today')
+      // avgDurationSeconds: inst100→3600s, inst103→10800s → avg=7200
+      assert.equal(d.avgDurationSeconds, 7200)
+      // rejectRate: 1/max(1,2+1) = 0.3333
+      assert.equal(d.rejectRate, 0.3333)
+      assert.equal(d.pendingTaskCount, 1)
+      assert.equal(d.overdueTaskCount, 1)
+      // countersignRate: 1 countersign(task1003) / 2 completed tasks = 0.5
+      assert.equal(d.countersignRate, 0.5)
+      // onTimeRate: no task has expireTime set AND finished → 0
+      assert.equal(d.onTimeRate, 0)
+    })
+
+    it('start/end 过滤 overview', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      const now = new Date()
+      seedStats(repo, now)
+      // filter: only instances created 2.5h–0.5h ago → inst100(2h ago) and inst101(1h ago)
+      const start = new Date(now.getTime() - 2.5 * 3600_000)
+      const end = new Date(now.getTime() - 0.5 * 3600_000)
+      const r = await facade.flow('processInstance/stats/overview', { start: fmtDt(start), end: fmtDt(end) })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      const d = r.data
+      assert.equal(d.total, 2, 'inst100 + inst101 in window')
+      assert.equal(d.completed, 1, 'only inst100 is Done in window')
+      assert.equal(d.inProgress, 1, 'inst101 is Doing in window')
+    })
+  })
+
+  describe('stats trend', () => {
+    it('空库 trend 全 0 桶', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      const now = new Date()
+      const start = new Date(now.getTime() - 2 * 86400_000)
+      const r = await facade.flow('processInstance/stats/trend', {
+        granularity: 'day',
+        start: fmtDt(start),
+        end: fmtDt(now),
+      })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      assert.equal(r.data.granularity, 'day')
+      assert.ok(r.data.series.length >= 2)
+      for (const s of r.data.series) {
+        assert.equal(s.started, 0)
+        assert.equal(s.finished, 0)
+      }
+    })
+
+    it('day 粒度 trend 有数据', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      const { now } = seedStats(repo)
+      const start = new Date(now.getTime() - 3 * 86400_000)
+      const r = await facade.flow('processInstance/stats/trend', {
+        granularity: 'day',
+        start: fmtDt(start),
+        end: fmtDt(now),
+      })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      const series = r.data.series
+      assert.ok(series.length >= 3, `expected >=3 day buckets, got ${series.length}`)
+      const totalStarted = series.reduce((s: number, b: any) => s + b.started, 0)
+      assert.equal(totalStarted, 4, 'all 4 instances started')
+      const totalFinished = series.reduce((s: number, b: any) => s + b.finished, 0)
+      assert.equal(totalFinished, 2, '2 tasks finished (task1000 + task1003)')
+    })
+
+    it('四种粒度均不报错', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      const { now } = seedStats(repo)
+      const start = new Date(now.getTime() - 30 * 86400_000)
+      for (const g of ['hour', 'day', 'week', 'month']) {
+        const r = await facade.flow('processInstance/stats/trend', {
+          granularity: g,
+          start: fmtDt(start),
+          end: fmtDt(now),
+        })
+        assert.equal(r.code, 0, `${g} should succeed: ${JSON.stringify(r)}`)
+        assert.ok(r.data.series.length > 0, `${g} should have buckets`)
+      }
+    })
+
+    it('非法 granularity → 错误码', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      const r = await facade.flow('processInstance/stats/trend', { granularity: 'abc' })
+      assert.notEqual(r.code, 0, 'should fail on invalid granularity')
+      assert.ok(r.msg.includes('granularity'), `msg should mention granularity: ${r.msg}`)
+    })
+  })
+
+  describe('stats group', () => {
+    it('空库 group 各维度空数组', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      for (const dim of ['state', 'define', 'category', 'approver', 'applicant', 'node', 'stuckNode', 'stuckApprover', 'durationBucket']) {
+        const r = await facade.flow('processInstance/stats/group', { dimension: dim })
+        assert.equal(r.code, 0, `${dim} on empty: ${JSON.stringify(r)}`)
+        assert.equal(r.data.dimension, dim)
+        if (dim === 'durationBucket') {
+          assert.equal(r.data.rows.length, 4, 'durationBucket always has 4 rows')
+          for (const row of r.data.rows) assert.equal(row.count, 0)
+        } else {
+          assert.equal(r.data.rows.length, 0, `${dim} should be empty`)
+        }
+      }
+    })
+
+    it('state 维度', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      seedStats(repo)
+      const r = await facade.flow('processInstance/stats/group', { dimension: 'state' })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      const rows = r.data.rows
+      // 2 Done(20), 1 Doing(10), 1 Reject(45) → sorted by count desc
+      assert.ok(rows.length >= 2)
+      assert.equal(rows[0].key, '20')
+      assert.equal(rows[0].count, 2)
+      assert.equal(rows[0].avgDurationSeconds, null)
+    })
+
+    it('define 维度', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      seedStats(repo)
+      const r = await facade.flow('processInstance/stats/group', { dimension: 'define' })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      const rows = r.data.rows
+      assert.equal(rows.length, 1)
+      assert.equal(rows[0].key, 'stats-flow')
+      assert.equal(rows[0].label, '统计测试流程')
+      assert.equal(rows[0].count, 4)
+      assert.ok(rows[0].avgDurationSeconds != null, 'define should have avgDurationSeconds')
+    })
+
+    it('category 维度', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      seedStats(repo)
+      const r = await facade.flow('processInstance/stats/group', { dimension: 'category' })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      const rows = r.data.rows
+      assert.equal(rows.length, 1)
+      assert.equal(rows[0].key, 'oa')
+      assert.equal(rows[0].count, 4)
+    })
+
+    it('approver 维度', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      seedStats(repo)
+      const r = await facade.flow('processInstance/stats/group', { dimension: 'approver' })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      const rows = r.data.rows
+      // task1000: bob (Done), task1003: gina (Done) → 2 approvers each with count 1
+      assert.equal(rows.length, 2)
+      for (const row of rows) {
+        assert.ok(['bob', 'gina'].includes(row.key))
+        assert.equal(row.count, 1)
+      }
+    })
+
+    it('applicant 维度', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      seedStats(repo)
+      const r = await facade.flow('processInstance/stats/group', { dimension: 'applicant' })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      const rows = r.data.rows
+      // alice: 2 (inst100, inst102), charlie: 1, frank: 1 → sorted desc
+      assert.equal(rows[0].key, 'alice')
+      assert.equal(rows[0].count, 2)
+    })
+
+    it('node 维度', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      seedStats(repo)
+      const r = await facade.flow('processInstance/stats/group', { dimension: 'node' })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      const rows = r.data.rows
+      // task1000: 审批节点A Done, task1003: 会签节点 Done → each count 1
+      assert.equal(rows.length, 2)
+      for (const row of rows) {
+        assert.ok(['审批节点A', '会签节点'].includes(row.key))
+        assert.equal(row.count, 1)
+        assert.ok(row.avgDurationSeconds != null, 'node should have avgDurationSeconds')
+      }
+      // 审批节点A: 3600s, 会签节点: 10800s
+      const nodeA = rows.find((r: any) => r.key === '审批节点A')
+      assert.equal(nodeA.avgDurationSeconds, 3600)
+      const nodeCS = rows.find((r: any) => r.key === '会签节点')
+      assert.equal(nodeCS.avgDurationSeconds, 10800)
+    })
+
+    it('stuckNode 维度', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      seedStats(repo)
+      const r = await facade.flow('processInstance/stats/group', { dimension: 'stuckNode' })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      const rows = r.data.rows
+      assert.equal(rows.length, 1)
+      assert.equal(rows[0].key, '审批节点B')
+      assert.equal(rows[0].count, 1)
+    })
+
+    it('stuckApprover 维度（每 actor 一行）', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      seedStats(repo)
+      const r = await facade.flow('processInstance/stats/group', { dimension: 'stuckApprover' })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      const rows = r.data.rows
+      // task1001 has actors [dave, eve], both Doing → 2 rows each count 1
+      assert.equal(rows.length, 2)
+      const keys = rows.map((r: any) => r.key).sort()
+      assert.deepEqual(keys, ['dave', 'eve'])
+      for (const row of rows) assert.equal(row.count, 1)
+    })
+
+    it('durationBucket 维度（固定 4 桶定序）', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      seedStats(repo)
+      const r = await facade.flow('processInstance/stats/group', { dimension: 'durationBucket' })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      const rows = r.data.rows
+      assert.equal(rows.length, 4)
+      assert.equal(rows[0].key, 'sameDay')
+      assert.equal(rows[1].key, '1to3d')
+      assert.equal(rows[2].key, '3to7d')
+      assert.equal(rows[3].key, 'over7d')
+      // inst100: 3600s (<86400 → sameDay), inst103: 10800s (<86400 → sameDay)
+      assert.equal(rows[0].count, 2, 'both completed instances are sameDay')
+      assert.equal(rows[1].count, 0)
+      assert.equal(rows[2].count, 0)
+      assert.equal(rows[3].count, 0)
+    })
+
+    it('非法 dimension → 错误码', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      const r = await facade.flow('processInstance/stats/group', { dimension: 'bogus' })
+      assert.notEqual(r.code, 0, 'should fail on invalid dimension')
+      assert.ok(r.msg.includes('dimension'), `msg should mention dimension: ${r.msg}`)
+    })
+
+    it('limit 参数生效', async () => {
+      const { repo } = setup()
+      const facade = new JeeflowFacade(null as any, repo, new MemoryExtRepository())
+      seedStats(repo)
+      const r = await facade.flow('processInstance/stats/group', { dimension: 'applicant', limit: 2 })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      assert.equal(r.data.rows.length, 2, 'limit=2 should return only top 2')
+    })
+  })
+
+  describe('stats regression', () => {
+    it('既有 action 不受 stats 影响', async () => {
+      const { engine, repo } = setup()
+      const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+      const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+      const r0 = await facade.flow('processDefine/deploy', { content })
+      assert.equal(r0.code, 0, JSON.stringify(r0))
+      const r1 = await facade.flow('processInstance/startAndExecute', {
+        processDefineId: r0.data.processDefineId, operator: 'alice',
+      })
+      assert.equal(r1.code, 0, JSON.stringify(r1))
+      const r2 = await facade.flow('processInstance/page', { pageNum: 1, pageSize: 10, operator: 'alice' })
+      assert.equal(r2.code, 0, JSON.stringify(r2))
+      assert.ok(r2.data.recordCount >= 1)
+    })
+  })
 })
+
+function fmtDt(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}

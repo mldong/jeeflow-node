@@ -146,6 +146,12 @@ export class JeeflowFacade {
         return this.taskAddActor(args)
       case 'processTask/latest':
         return this.taskLatest(args)
+      case 'processInstance/stats/overview':
+        return this.statsOverview(args)
+      case 'processInstance/stats/trend':
+        return this.statsTrend(args)
+      case 'processInstance/stats/group':
+        return this.statsGroup(args)
       default:
         throw new Error(`未知 action: ${action}`)
     }
@@ -1069,6 +1075,196 @@ export class JeeflowFacade {
     }
   }
 
+  // ── 统计（v1.8.25，issues/103） ──────────────────────────────────────────
+
+  private static readonly DEFAULT_STATE_IN = [10, 20, 30, 40, 45, 50]
+  private static readonly DEFAULT_STATS_LIMIT = 10
+  private static readonly VALID_GRANULARITY = new Set(['hour', 'day', 'week', 'month'])
+  private static readonly VALID_DIMENSION = new Set([
+    'state', 'define', 'category', 'approver', 'applicant',
+    'node', 'stuckNode', 'stuckApprover', 'durationBucket',
+  ])
+
+  private async statsOverview(args: Record<string, any>): Promise<Record<string, any>> {
+    const start = parseSurrogateTime(args.start)
+    const end = parseSurrogateTime(args.end)
+    const stateIn: number[] = args.stateIn?.length ? args.stateIn.map(Number) : JeeflowFacade.DEFAULT_STATE_IN
+
+    const insts = await this.repo.queryInstancesForStats(stateIn, start, end)
+    const total = insts.length
+    const inProgress = insts.filter(r => r.state === 10).length
+    const completed = insts.filter(r => r.state === 20).length
+    const withdrawn = insts.filter(r => r.state === 30).length
+    const rejected = insts.filter(r => r.state === 45).length
+    const suspended = insts.filter(r => r.state === 50).length
+
+    const now = new Date()
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+    const todayEnd = new Date(todayStart.getTime() + 86400000)
+    const todayInsts = await this.repo.queryInstancesForStats(JeeflowFacade.DEFAULT_STATE_IN, todayStart, todayEnd)
+    const todayNew = todayInsts.length
+
+    const [pending, overdue] = await this.repo.statsPendingAndOverdueCount()
+    const avgDur = await this.repo.statsAvgCompletedDurationSeconds(start, end)
+
+    const [csTotal, csCount, onTime, onTimeDenom] = await this.repo.statsCompletedTaskAggregate()
+    const countersignRate = csTotal > 0 ? statsRound4(csCount / csTotal) : 0
+    const onTimeRate = onTimeDenom > 0 ? statsRound4(onTime / onTimeDenom) : 0
+    const rejectRate = statsRound4(rejected / Math.max(1, completed + rejected))
+
+    return {
+      total, inProgress, completed, rejected, withdrawn, suspended,
+      todayNew, avgDurationSeconds: avgDur,
+      rejectRate, pendingTaskCount: pending,
+      overdueTaskCount: overdue, countersignRate, onTimeRate,
+    }
+  }
+
+  private async statsTrend(args: Record<string, any>): Promise<Record<string, any>> {
+    const granularity = String(args.granularity ?? '')
+    if (!JeeflowFacade.VALID_GRANULARITY.has(granularity)) {
+      throw new Error(`不支持的 granularity: ${granularity}`)
+    }
+    const start = parseSurrogateTime(args.start)
+    const end = parseSurrogateTime(args.end)
+
+    const insts = await this.repo.queryInstancesForStats(JeeflowFacade.DEFAULT_STATE_IN, start, end)
+    const doneTasks = await this.repo.queryTasksForStats(20 /* TaskState.Done */, start, end)
+
+    const buckets = statsEnumerateBuckets(start, end, granularity)
+    const startedMap = new Map<string, number>()
+    for (const r of insts) {
+      const ct = parseSurrogateTime(r.createTime)
+      if (ct) {
+        const bk = statsBucketKey(ct, granularity)
+        startedMap.set(bk, (startedMap.get(bk) ?? 0) + 1)
+      }
+    }
+    const finishedMap = new Map<string, number>()
+    for (const r of doneTasks) {
+      const ft = parseSurrogateTime(r.finishTime)
+      if (ft) {
+        const bk = statsBucketKey(ft, granularity)
+        finishedMap.set(bk, (finishedMap.get(bk) ?? 0) + 1)
+      }
+    }
+
+    const series = buckets.map(b => ({
+      bucket: b, started: startedMap.get(b) ?? 0, finished: finishedMap.get(b) ?? 0,
+    }))
+    return { granularity, series }
+  }
+
+  private async statsGroup(args: Record<string, any>): Promise<Record<string, any>> {
+    const dimension = String(args.dimension ?? '')
+    if (!JeeflowFacade.VALID_DIMENSION.has(dimension)) {
+      throw new Error(`不支持的 dimension: ${dimension}`)
+    }
+    const start = parseSurrogateTime(args.start)
+    const end = parseSurrogateTime(args.end)
+    const limit = args.limit ? Number(args.limit) : JeeflowFacade.DEFAULT_STATS_LIMIT
+
+    let rows: Record<string, any>[]
+
+    if (dimension === 'define') {
+      const raw = await this.repo.statsDefineGroup(start, end, limit)
+      rows = raw.map(r => ({ key: r.key, label: r.label ?? null, count: r.count, avgDurationSeconds: r.avgDurationSeconds ?? null }))
+
+    } else if (dimension === 'state') {
+      const insts = await this.repo.queryInstancesForStats(JeeflowFacade.DEFAULT_STATE_IN, start, end)
+      const grouped = new Map<string, number>()
+      for (const r of insts) {
+        const k = String(r.state)
+        grouped.set(k, (grouped.get(k) ?? 0) + 1)
+      }
+      const entries = [...grouped.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit)
+      rows = entries.map(([k, c]) => ({ key: k, label: null, count: c, avgDurationSeconds: null }))
+
+    } else if (dimension === 'category') {
+      const insts = await this.repo.queryInstancesForStats(JeeflowFacade.DEFAULT_STATE_IN, start, end)
+      const defineTypes = new Map<string, string>()
+      for (const r of insts) {
+        if (!defineTypes.has(r.defineId)) {
+          const def = await this.repo.findDefineById(r.defineId)
+          defineTypes.set(r.defineId, def?.type ?? '')
+        }
+      }
+      const grouped = new Map<string, number>()
+      for (const r of insts) {
+        const tp = defineTypes.get(r.defineId) ?? ''
+        grouped.set(tp, (grouped.get(tp) ?? 0) + 1)
+      }
+      const entries = [...grouped.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit)
+      rows = entries.map(([k, c]) => ({ key: k, label: null, count: c, avgDurationSeconds: null }))
+
+    } else if (dimension === 'approver') {
+      const tasks = await this.repo.queryTasksForStats(20, start, end)
+      const grouped = new Map<string, number>()
+      for (const r of tasks) {
+        if (!r.operator) continue
+        grouped.set(r.operator, (grouped.get(r.operator) ?? 0) + 1)
+      }
+      const entries = [...grouped.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit)
+      rows = entries.map(([k, c]) => ({ key: k, label: null, count: c, avgDurationSeconds: null }))
+
+    } else if (dimension === 'applicant') {
+      const insts = await this.repo.queryInstancesForStats(JeeflowFacade.DEFAULT_STATE_IN, start, end)
+      const grouped = new Map<string, number>()
+      for (const r of insts) {
+        if (!r.operator) continue
+        grouped.set(r.operator, (grouped.get(r.operator) ?? 0) + 1)
+      }
+      const entries = [...grouped.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit)
+      rows = entries.map(([k, c]) => ({ key: k, label: null, count: c, avgDurationSeconds: null }))
+
+    } else if (dimension === 'node') {
+      const tasks = await this.repo.queryTasksForStats(20, start, end)
+      const nodeAgg = new Map<string, { count: number; totalDur: number }>()
+      for (const r of tasks) {
+        if (!r.displayName) continue
+        let dur = 0
+        const ft = parseSurrogateTime(r.finishTime)
+        const ct = parseSurrogateTime(r.createTime)
+        if (ft && ct) dur = Math.floor((ft.getTime() - ct.getTime()) / 1000)
+        const agg = nodeAgg.get(r.displayName) ?? { count: 0, totalDur: 0 }
+        agg.count++
+        agg.totalDur += dur
+        nodeAgg.set(r.displayName, agg)
+      }
+      const entries = [...nodeAgg.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, limit)
+      rows = entries.map(([name, agg]) => ({
+        key: name, label: null, count: agg.count,
+        avgDurationSeconds: agg.count > 0 ? Math.round(agg.totalDur / agg.count) : null,
+      }))
+
+    } else if (dimension === 'stuckNode') {
+      const raw = await this.repo.statsStuckNodeGroup(limit)
+      rows = raw.map(r => ({ key: r.key, label: r.label ?? null, count: r.count, avgDurationSeconds: r.avgDurationSeconds ?? null }))
+
+    } else if (dimension === 'stuckApprover') {
+      const raw = await this.repo.statsStuckApproverGroup(limit)
+      rows = raw.map(r => ({ key: r.key, label: r.label ?? null, count: r.count, avgDurationSeconds: r.avgDurationSeconds ?? null }))
+
+    } else if (dimension === 'durationBucket') {
+      const durations = await this.repo.statsCompletedInstanceDurations(start, end)
+      let sameDay = 0, d1to3 = 0, d3to7 = 0, over7d = 0
+      for (const dur of durations) {
+        if (dur < 86400) sameDay++
+        else if (dur < 259200) d1to3++
+        else if (dur < 604800) d3to7++
+        else over7d++
+      }
+      const keys = ['sameDay', '1to3d', '3to7d', 'over7d']
+      const counts = [sameDay, d1to3, d3to7, over7d]
+      rows = keys.map((k, i) => ({ key: k, label: null, count: counts[i], avgDurationSeconds: null }))
+
+    } else {
+      rows = []
+    }
+
+    return { dimension, rows }
+  }
+
 }
 
 // ── 行转 Map（issues/05-2 列表字段契约 + 05-3 时间格式）─────────────────────
@@ -1280,4 +1476,82 @@ function pageData(pageNum: number, pageSize: number, total: number, rows: any): 
   let totalPage = 0
   if (total > 0 && ps > 0) totalPage = Math.ceil(total / ps)
   return { pageNum: pn, pageSize: ps, recordCount: total, totalPage, rows }
+}
+
+// ═══ 统计辅助（v1.8.25，issues/103） ═══
+
+function statsRound4(v: number): number {
+  return Math.round(v * 10000) / 10000
+}
+
+function statsWeekKey(d: Date): string {
+  const iso = isoWeek(d)
+  return `${iso[0]}-W${String(iso[1]).padStart(2, '0')}`
+}
+
+function isoWeek(d: Date): [number, number] {
+  const date = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()))
+  const dayNum = date.getUTCDay() || 7
+  date.setUTCDate(date.getUTCDate() + 4 - dayNum)
+  const yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1))
+  const weekNo = Math.ceil((((date.getTime() - yearStart.getTime()) / 86400000) + 1) / 7)
+  return [date.getUTCFullYear(), weekNo]
+}
+
+function statsEnumerateBuckets(start: Date | undefined, end: Date | undefined, granularity: string): string[] {
+  const now = new Date()
+  const s = start ?? new Date(now.getTime() - 30 * 86400000)
+  const e = end ?? now
+  const buckets: string[] = []
+
+  if (granularity === 'hour') {
+    const cursor = new Date(s.getFullYear(), s.getMonth(), s.getDate(), s.getHours(), 0, 0)
+    while (cursor <= e) {
+      buckets.push(formatHour(cursor))
+      cursor.setHours(cursor.getHours() + 1)
+    }
+  } else if (granularity === 'day') {
+    const cursor = new Date(s.getFullYear(), s.getMonth(), s.getDate())
+    const endDay = new Date(e.getFullYear(), e.getMonth(), e.getDate())
+    while (cursor <= endDay) {
+      buckets.push(formatDay(cursor))
+      cursor.setDate(cursor.getDate() + 1)
+    }
+  } else if (granularity === 'week') {
+    const cursor = new Date(s.getFullYear(), s.getMonth(), s.getDate())
+    const weekday = cursor.getDay() || 7
+    cursor.setDate(cursor.getDate() - (weekday - 1))
+    const endDay = new Date(e.getFullYear(), e.getMonth(), e.getDate())
+    while (cursor <= endDay) {
+      buckets.push(statsWeekKey(cursor))
+      cursor.setDate(cursor.getDate() + 7)
+    }
+  } else if (granularity === 'month') {
+    let year = s.getFullYear()
+    let month = s.getMonth()
+    const endYear = e.getFullYear()
+    const endMonth = e.getMonth()
+    while (year < endYear || (year === endYear && month <= endMonth)) {
+      buckets.push(`${year}-${String(month + 1).padStart(2, '0')}`)
+      month++
+      if (month > 11) { month = 0; year++ }
+    }
+  }
+  return buckets
+}
+
+function statsBucketKey(d: Date, granularity: string): string {
+  if (granularity === 'hour') return formatHour(d)
+  if (granularity === 'day') return formatDay(d)
+  if (granularity === 'week') return statsWeekKey(d)
+  if (granularity === 'month') return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+  return ''
+}
+
+function formatHour(d: Date): string {
+  return `${formatDay(d)} ${String(d.getHours()).padStart(2, '0')}:00`
+}
+
+function formatDay(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
 }
