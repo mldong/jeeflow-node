@@ -18,6 +18,7 @@ import { HandlerRegistry } from '../src/registry.js'
 import { registerBuiltinAssignments } from '../src/builtin.js'
 import { dir as flowsResolverDir } from '../flows-resolver.js'
 import type { ProcessDefine, UserInfo } from '../src/model.js'
+import { seedBusiness } from './seed_business.js'
 import type { UserProvider, OrgUserProvider } from '../src/spi.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -89,7 +90,7 @@ let ext = new MemoryExtRepository()
 let engine: EngineImpl
 let facade: Facade
 
-function buildAll() {
+async function buildAll() {
   repo = new MemoryRepository()
   ext = new MemoryExtRepository()
   engine = new EngineImpl(repo, userProvider, undefined, {
@@ -111,6 +112,8 @@ function buildAll() {
   engine.setRegistry(reg)
   loadSeed()
   facade = new Facade(engine, repo, ext).setUserSearch(userSearch).setOrgProvider(orgProvider)
+  // T003：业务数据种子（引擎真实启动 16 进行中 + 9 已完成 + 8 委托），/api/reset 复跑
+  await seedBusiness(facade)
 }
 
 // 从本仓 flows/ 加载种子流程（flows-resolver 已在维护者机器上把 Java 源精确镜像进来）
@@ -134,8 +137,6 @@ function loadSeed() {
     console.log(`  loaded: ${def.id} ${def.displayName}`)
   })
 }
-
-buildAll()
 
 const app = express()
 app.use(express.json())
@@ -168,9 +169,9 @@ app.get('/api/stats', async (req, res) => {
   res.json({ code: 0, msg: '成功', data: { todoCount, myInstanceCount } })
 })
 
-// 一键重置演示数据（对齐 Python /api/reset）：重建内存库与扩展仓储 + 重载种子流程定义
-app.post('/api/reset', (_req, res) => {
-  buildAll()
+// 一键重置演示数据（对齐 Python /api/reset）：重建内存库与扩展仓储 + 重载种子流程定义 + 复跑业务种子
+app.post('/api/reset', async (_req, res) => {
+  await buildAll()
   res.json({ code: 0, msg: '成功', data: null })
 })
 
@@ -185,4 +186,7 @@ app.post('/wf/*', async (req, res) => {
   }
 })
 
-app.listen(8082, () => console.log('jeeflow-node → http://localhost:8082'))
+// T003：种子（含业务数据 driver）就绪后再监听端口
+buildAll().then(() => {
+  app.listen(8082, () => console.log('jeeflow-node → http://localhost:8082'))
+})
