@@ -263,7 +263,8 @@ export class JeeflowFacade {
     // 撤回：废弃全部 doing 任务 + 实例状态（v1.0.1：updateInstance 级联落库）
     const operator = String(args.operator ?? 'user1')
     const now = new Date()
-    // findInstanceById 不加载 tasks（空），必须按实例查 doing 任务废弃
+    // findInstanceById 现水合 tasks（issues/110），此处仍按实例单独查 doing 任务废弃，
+    // 且必须把聚合副本重置为仅被废弃项（见下方 inst.tasks = abandoned），防级联回写多余任务
     const abandoned: ProcessTask[] = []
     for (const t of await this.repo.findDoingTasks(instanceId)) {
       t.abandon(now)

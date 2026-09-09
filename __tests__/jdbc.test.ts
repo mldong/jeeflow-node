@@ -18,6 +18,7 @@ import { dir as flowsResolverDir } from '../flows-resolver.js'
 import { MysqlAdapter } from '../src/jdbc/mysql.js'
 import { PostgresAdapter } from '../src/jdbc/postgres.js'
 import { InstanceState, TaskState, ProcessInstance, type ProcessDefine } from '../src/model.js'
+import { JeeflowFacade } from '../src/facade.js'
 import type { IDGenerator, UserProvider } from '../src/spi.js'
 
 const dbType = process.env.JEFFLOW_DB ?? 'mysql'
@@ -381,6 +382,36 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
       assert.ok(
         after.every(t => t.taskState === TaskState.Abandoned),
         'updateInstance 级联任务状态落库',
+      )
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('issues/110：SQL 仓 findInstanceById 水合任务 → detail 任务列表非空', async () => {
+    await cleanup()
+    try {
+      await applySchema()
+      await insertDefine()
+      const repo = new JdbcRepository(makeAdapter(pool), new TsIDGenerator())
+      const engine = new EngineImpl(repo, userProv, new SeqIDGen())
+      const inst = await engine.startProcessInstanceById(DEFINE_ID, 'zhangsan', { BUSINESS_NO: `BIZ-${dbType}-110` })
+
+      // ① 仓储层：findInstanceById 水合任务 + actorIds
+      const loaded = await repo.findInstanceById(inst.id)
+      assert.ok(loaded, '实例加载')
+      assert.ok(loaded!.tasks.length > 0, 'findInstanceById 水合任务非空（issues/110）')
+      assert.ok(loaded!.tasks.every(t => t.actorIds.length > 0), '水合任务带参与者 actorIds')
+
+      // ② 门面层：detail 的 tasks / activeTaskList 非空
+      const facade = new JeeflowFacade(engine, repo, undefined)
+      const r = await facade.flow('processInstance/detail', { id: inst.id })
+      assert.equal(r.code, 0, 'detail 调用成功')
+      const data = r.data as Record<string, any>
+      assert.ok(Array.isArray(data.tasks) && data.tasks.length > 0, 'detail tasks 非空')
+      assert.ok(
+        Array.isArray(data.activeTaskList) && data.activeTaskList.length > 0,
+        'detail activeTaskList 非空',
       )
     } finally {
       await cleanup()

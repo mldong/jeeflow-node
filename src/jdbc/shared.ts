@@ -256,7 +256,11 @@ export class JdbcRepository implements ProcessRepository {
         operator: row.operator, expireTime: row.expire_time,
         createTime: row.create_time, createUser: rowId(row.create_user),
         updateTime: row.update_time, updateUser: rowId(row.update_user),
-        tasks: [],
+        // issues/110：聚合水合——二次查 wf_process_task 装任务副本（含 actorIds），
+        // 对齐 Java findTasksByInstanceId / PHP PdoProcessRepository / C# issues/89；
+        // 否则门面 detail 的 tasks/activeTaskList 恒空。
+        // 复用 findHistoryTasks（ORDER BY id ASC + 批查 actor，事务内经 c() 复用连接）
+        tasks: await this.findHistoryTasks(rowId(row.id)),
       })
       inst.variables = row.variable ? JSON.parse(row.variable) : {}
       return inst
