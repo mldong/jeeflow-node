@@ -418,6 +418,36 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
     }
   })
 
+  it('issues/113：门面撤回把全部进行中任务以 30（WITHDRAW）落库', async () => {
+    await cleanup()
+    try {
+      await applySchema()
+      await insertDefine()
+      const repo = new JdbcRepository(makeAdapter(pool), new TsIDGenerator())
+      const engine = new EngineImpl(repo, userProv, new SeqIDGen())
+      const facade = new JeeflowFacade(engine, repo, undefined)
+      const inst = await engine.startProcessInstanceById(DEFINE_ID, 'zhangsan', { BUSINESS_NO: `BIZ-${dbType}-113` })
+
+      const doing = await repo.findDoingTasks(inst.id)
+      assert.ok(doing.length > 0, '撤回前应有 doing 任务')
+
+      const r = await facade.flow('processInstance/withdraw', { id: inst.id, operator: 'zhangsan' })
+      assert.equal(r.code, 0, `withdraw 应成功: ${JSON.stringify(r)}`)
+
+      // 回读库表（findHistoryTasks 不带状态过滤），确证落库值是 30 而非 99
+      const stored = await repo.findHistoryTasks(inst.id)
+      assert.ok(stored.length > 0, '撤回后库里应有任务行')
+      assert.ok(
+        stored.every(t => t.taskState === TaskState.Withdraw),
+        `撤回任务落库应=30(WITHDRAW)，实测 ${stored.map(t => t.taskState)}`,
+      )
+      assert.equal((await repo.findDoingTasks(inst.id)).length, 0, '撤回后无 doing 任务')
+      assert.equal((await repo.findInstanceById(inst.id))?.state, InstanceState.Withdraw, '实例态应=30')
+    } finally {
+      await cleanup()
+    }
+  })
+
   it('pageDefines / pageTodoTasks 不因 LIMIT 占位符抛错（issues/66）', async () => {
     await cleanup()
     try {

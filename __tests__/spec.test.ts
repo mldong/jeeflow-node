@@ -430,14 +430,23 @@ describe('jeeflow compliance tests', () => {
     const inst = await repo.findInstanceById(instanceId)
     assert.equal(inst?.state, InstanceState.Done, '实例应完成')
 
-    // withdraw 级联废弃 doing
+    // withdraw 级联撤回 doing → 任务态 30（WITHDRAW）
     const r3 = await facade.flow('processInstance/startAndExecute',
       { processDefineId: defineId, operator: 'zhangsan' })
     const instanceId2 = r3.data.processInstanceId
+    const beforeWithdraw = await repo.findDoingTasks(instanceId2)
+    assert.ok(beforeWithdraw.length >= 1, '撤回前应有 doing 任务')
     const r4 = await facade.flow('processInstance/withdraw', { id: instanceId2, operator: 'zhangsan' })
     assert.equal(r4.code, 0, JSON.stringify(r4))
     doing = await repo.findDoingTasks(instanceId2)
-    assert.equal(doing.length, 0, '撤回应废弃 doing 任务')
+    assert.equal(doing.length, 0, '撤回应清空 doing 任务')
+    // issues/113：原 doing 任务须落 30，不能落 99——"doing 清空"这一断言两种码值都满足，抓不到缺陷
+    for (const t of beforeWithdraw) {
+      const stored = await repo.findTaskById(t.id)
+      assert.equal(stored?.taskState, TaskState.Withdraw,
+        `撤回任务态应=30(WITHDRAW)，实测 ${stored?.taskState}（99 是废弃码，两码不得混用）`)
+    }
+    assert.equal((await repo.findInstanceById(instanceId2))?.state, InstanceState.Withdraw, '实例态应=30')
   })
 
   it('15 门面路由：设计保存/详情/发布 + 委托增查删', async () => {
@@ -1546,6 +1555,15 @@ describe('jeeflow compliance tests', () => {
     const doing = await repo.findDoingTasks(r3.data.processInstanceId)
     const cs = doing.filter(t => t.taskName === 'task1')
     assert.ok(cs.length === 3 && cs.every(t => t.performType === 1), `会签任务 performType 应=1: ${cs.map(t => t.performType)}`)
+    // issues/113：会签实例整单撤回时，3 条 doing 会签任务同样落 30——99 留给一票否决的废弃路径
+    const csIid = r3.data.processInstanceId
+    const cw = await facade.flow('processInstance/withdraw', { id: csIid, operator: 'user1' })
+    assert.equal(cw.code, 0, JSON.stringify(cw))
+    for (const t of cs) {
+      const stored = await repo.findTaskById(t.id)
+      assert.equal(stored?.taskState, TaskState.Withdraw, `撤回会签任务态应=30，实测 ${stored?.taskState}`)
+    }
+    assert.equal((await repo.findDoingTasks(csIid)).length, 0, '会签实例撤回后应无 doing 任务')
     // 53：撤回状态 30
     const r4 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') })
     const r5 = await facade.flow('processInstance/startAndExecute', { processDefineId: r4.data.processDefineId, operator: 'user1' })

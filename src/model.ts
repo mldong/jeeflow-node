@@ -307,6 +307,12 @@ export class ProcessTask {
     this.updateTime = now
   }
 
+  /** 随实例撤回任务（区别于 abandon：撤回是发起人主动收回，废弃是引擎清理） */
+  withdraw(now: Date): void {
+    this.taskState = TaskState.Withdraw
+    this.updateTime = now
+  }
+
   /** 是否进行中 */
   isDoing(): boolean { return this.taskState === TaskState.Doing }
 

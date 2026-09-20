@@ -260,23 +260,25 @@ export class JeeflowFacade {
     const instanceId = toId(args.id)
     const inst = await this.repo.findInstanceById(instanceId)
     if (!inst) throw new Error('流程实例不存在')
-    // 撤回：废弃全部 doing 任务 + 实例状态（v1.0.1：updateInstance 级联落库）
+    // 撤回：全部 doing 任务置 Withdraw(30) + 实例置 30（v1.0.1：updateInstance 级联落库）
     const operator = String(args.operator ?? 'user1')
     const now = new Date()
-    // findInstanceById 现水合 tasks（issues/110），此处仍按实例单独查 doing 任务废弃，
-    // 且必须把聚合副本重置为仅被废弃项（见下方 inst.tasks = abandoned），防级联回写多余任务
-    const abandoned: ProcessTask[] = []
+    // findInstanceById 现水合 tasks（issues/110），此处仍按实例单独查 doing 任务撤回，
+    // 且必须把聚合副本重置为仅被撤回项（见下方 inst.tasks = withdrawn），防级联回写多余任务
+    const withdrawn: ProcessTask[] = []
     for (const t of await this.repo.findDoingTasks(instanceId)) {
-      t.abandon(now)
-      abandoned.push(t)
+      // issues/113：撤回写 Withdraw(30)，不用 Abandoned(99)——99 是引擎废弃码
+      // （会签一票否决 / abandonAllDoing 用它），混用会让撤回单与废弃单在任务表里塌成同值
+      t.withdraw(now)
+      withdrawn.push(t)
     }
     // issues/53 E25：撤回状态应为 Withdraw(30) 而非 Reject(45)（对齐 Java）
     inst.withdraw(now)
     inst.updateUser = operator
-    // 级联覆盖防护（issues/57 补正）：废弃副本同步回聚合——updateInstance 级联会用
-    // 聚合内旧任务覆盖已废弃状态（memory 加载 tasks 时必现）
-    inst.tasks = abandoned
-    for (const t of abandoned) await this.repo.updateTask(t)
+    // 级联覆盖防护（issues/57 补正）：撤回副本同步回聚合——updateInstance 级联会用
+    // 聚合内旧任务覆盖已撤回状态（memory 加载 tasks 时必现）
+    inst.tasks = withdrawn
+    for (const t of withdrawn) await this.repo.updateTask(t)
     await this.repo.updateInstance(inst)
   }
 
