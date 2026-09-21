@@ -253,8 +253,9 @@ export class EngineImpl implements Engine {
           const [actors, lc] = getCsState(vars, curNode.id)
           if (actors && lc + 1 < actors.length) {
             // 聚合根：创建串行会签下一步任务
-            const nt = inst.createTask(this.nextId(), curNode.id, curNode.text.value, actors[lc + 1], operator, curNode.properties?.form ?? '', now, 1)
-            nt.variables = {
+            const nt = inst.createTask(this.nextId(), curNode.id, curNode.text.value, actors[lc + 1], operator, curNode.properties?.form ?? '', now,
+              task.id, this.isFirstTaskNode(flow, curNode), 1)
+            nt.variables = { isFirstTaskNode: nt.variables.isFirstTaskNode,
               [`nrOfInstances_${curNode.id}`]: actors.length,
               [`loopCounter_${curNode.id}`]: lc + 1,
               [`operatorList_${curNode.id}`]: actors,
@@ -291,7 +292,7 @@ export class EngineImpl implements Engine {
       for (const node of followEdges(flow, curNode.id)) {
         // 统一走 executeNode：结束节点也经节点执行链（拦截器/事件完整触发），
         // executeNode 内部 TypeEnd 分支完成聚合根 finish + 事件发布
-        await this.executeNode(flow, inst, node, operator, vars)
+        await this.executeNode(flow, inst, node, operator, vars, task.id)
       }
     }
     return (await this.repo.findInstanceById(inst.id))!
@@ -320,7 +321,8 @@ export class EngineImpl implements Engine {
         const prev = findNode(flow, prevName)
         if (prev) {
           const actors = this.rollbackActors(prev, inst, task)
-          await this.createTaskWithActors(prev, inst, operator, vars, actors, await this.surrogateProcessName(flow, inst))
+          await this.createTaskWithActors(prev, inst, operator, vars, actors, await this.surrogateProcessName(flow, inst),
+            task.id, this.isFirstTaskNode(flow, prev))
         }
       }
     } else {
@@ -332,7 +334,7 @@ export class EngineImpl implements Engine {
         target.properties = target.properties ?? {}
         target.properties.assignee = inst.operator
       }
-      await this.executeNode(flow, inst, target, operator, vars)
+      await this.executeNode(flow, inst, target, operator, vars, task.id)
     }
     return (await this.repo.findInstanceById(inst.id))!
   }
@@ -348,7 +350,7 @@ export class EngineImpl implements Engine {
         if (node.type === TypeTask || node.type === TypeCustom) {
           node.properties = node.properties ?? {}
           node.properties.assignee = inst.operator
-          await this.executeNode(flow, inst, node, operator, vars)
+          await this.executeNode(flow, inst, node, operator, vars, taskId)
           break
         }
       }
@@ -463,7 +465,8 @@ export class EngineImpl implements Engine {
   }
 
   // 以显式参与者建任务（会签节点拆分为逐人任务，对齐 Java 会签创建语义）
-  private async createTaskWithActors(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>, actors: string[], processName = ''): Promise<void> {
+  private async createTaskWithActors(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>, actors: string[], processName = '',
+                                          parentId: string = '0', isFirst: boolean = false): Promise<void> {
     if (!actors.length) return
     // issues/116：与 createTask 同口径——代理人并入参与者集合后随任务落库
     const agents = await this.surrogateAgents(actors, processName)
@@ -475,7 +478,7 @@ export class EngineImpl implements Engine {
         case 'PARALLEL':
         case '':
           for (const actor of actors) {
-            const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1)
+            const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, parentId, isFirst, 1)
             const eff = mergeAgents([actor], agents)
             if (eff.length > 1) nt.actorIds = eff
             await this.repo.saveTask(nt)
@@ -483,8 +486,8 @@ export class EngineImpl implements Engine {
           }
           return
         case 'SEQUENTIAL': {
-          const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now, 1)
-          nt.variables = {
+          const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now, parentId, isFirst, 1)
+          nt.variables = { isFirstTaskNode: nt.variables.isFirstTaskNode,
             [`nrOfInstances_${node.id}`]: actors.length,
             [`loopCounter_${node.id}`]: 0,
             [`operatorList_${node.id}`]: actors,
@@ -497,7 +500,7 @@ export class EngineImpl implements Engine {
         }
         default:
           for (const actor of actors) {
-            const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1)
+            const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, parentId, isFirst, 1)
             const eff = mergeAgents([actor], agents)
             if (eff.length > 1) nt.actorIds = eff
             await this.repo.saveTask(nt)
@@ -507,7 +510,7 @@ export class EngineImpl implements Engine {
       }
     }
     const effActors = mergeAgents(actors, agents)
-    const nt = inst.createTask(this.nextId(), node.id, node.text.value, effActors[0], operator, form, now)
+    const nt = inst.createTask(this.nextId(), node.id, node.text.value, effActors[0], operator, form, now, parentId, isFirst)
     if (effActors.length > 1) nt.actorIds = effActors
     await this.repo.saveTask(nt)
     await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
@@ -525,25 +528,27 @@ export class EngineImpl implements Engine {
     return { task, inst }
   }
 
-  private async executeNode(flow: FlowModel, inst: ProcessInstance, node: FlowNode, operator: string, vars: Record<string, any>): Promise<void> {
+  private async executeNode(flow: FlowModel, inst: ProcessInstance, node: FlowNode, operator: string, vars: Record<string, any>,
+                        parentId: string = '0'): Promise<void> {
     // 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
     // 任务完成的拦截器由 executeProcessTask 显式触发，1.8.0 SYNC 同步演进）
     if (node.type === TypeTask || node.type === TypeCustom) {
-      await this.createTask(node, inst, operator, vars, await this.surrogateProcessName(flow, inst))
+      await this.createTask(node, inst, operator, vars, await this.surrogateProcessName(flow, inst),
+        parentId, this.isFirstTaskNode(flow, node))
       return
     }
     if (!(await this.firePre(node, inst))) return
     try {
     switch (node.type) {
       case TypeDecision:
-        return this.evaluateDecision(flow, inst, node, operator, vars)
+        return this.evaluateDecision(flow, inst, node, operator, vars, parentId)
       case TypeFork:
-        for (const n of followEdges(flow, node.id)) await this.executeNode(flow, inst, n, operator, vars)
+        for (const n of followEdges(flow, node.id)) await this.executeNode(flow, inst, n, operator, vars, parentId)
         return
       case TypeJoin: {
         const doing = await this.repo.findDoingTasks(inst.id)
         if (doing.length === 0)
-          for (const n of followEdges(flow, node.id)) await this.executeNode(flow, inst, n, operator, vars)
+          for (const n of followEdges(flow, node.id)) await this.executeNode(flow, inst, n, operator, vars, parentId)
         return
       }
       case TypeEnd: {
@@ -564,7 +569,7 @@ export class EngineImpl implements Engine {
     } finally { await this.firePost(node, inst) }
   }
 
-  private async evaluateDecision(flow: FlowModel, inst: ProcessInstance, node: FlowNode, operator: string, vars: Record<string, any>): Promise<void> {
+  private async evaluateDecision(flow: FlowModel, inst: ProcessInstance, node: FlowNode, operator: string, vars: Record<string, any>, parentId: string = '0'): Promise<void> {
     // 自定义决策（Registry 优先）
     if (this.registry) {
       const handlerName = (node.properties?.decisionHandler as string) ?? ''
@@ -576,7 +581,7 @@ export class EngineImpl implements Engine {
             for (const edge of flow.edges) {
               if (edge.id === branchId) {
                 const target = findNode(flow, edge.targetNodeId)
-                if (target) return this.executeNode(flow, inst, target, operator, vars)
+                if (target) return this.executeNode(flow, inst, target, operator, vars, parentId)
               }
             }
           }
@@ -591,7 +596,7 @@ export class EngineImpl implements Engine {
         for (const edge of flow.edges) {
           if (edge.id === branchId) {
             const target = findNode(flow, edge.targetNodeId)
-            if (target) return this.executeNode(flow, inst, target, operator, vars)
+            if (target) return this.executeNode(flow, inst, target, operator, vars, parentId)
           }
         }
       }
@@ -602,21 +607,22 @@ export class EngineImpl implements Engine {
       const expr = edge.properties?.expr as string | undefined
       if (!expr) {
         const target = findNode(flow, edge.targetNodeId)
-        if (target) return this.executeNode(flow, inst, target, operator, vars)
+        if (target) return this.executeNode(flow, inst, target, operator, vars, parentId)
         return
       }
       if (this.exprEval) {
         const result = await this.exprEval.eval(expr, vars)
         if (isTruthy(result)) {
           const target = findNode(flow, edge.targetNodeId)
-          if (target) return this.executeNode(flow, inst, target, operator, vars)
+          if (target) return this.executeNode(flow, inst, target, operator, vars, parentId)
           return
         }
       }
     }
   }
 
-  private async createTask(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>, processName = ''): Promise<void> {
+  private async createTask(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>, processName = '',
+                       parentId: string = '0', isFirst: boolean = false): Promise<void> {
     const actors = await this.resolveActors(node, inst, operator, vars)
     if (!actors.length) return
     // issues/116：参与者解析完成后、落库前应用生效委托——代理人并入参与者集合，
@@ -630,7 +636,7 @@ export class EngineImpl implements Engine {
       switch (ct) {
         case 'PARALLEL':
           for (const actor of actors) {
-            const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1)
+            const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, parentId, isFirst, 1)
             const eff = mergeAgents([actor], agents)
             if (eff.length > 1) nt.actorIds = eff
             await this.repo.saveTask(nt)
@@ -640,9 +646,9 @@ export class EngineImpl implements Engine {
           return
         case 'SEQUENTIAL': {
           // 顺序会签任务也是会签任务（issues/57 E29 修正：仅普通分支默认 0）
-          const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now, 1)
+          const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now, parentId, isFirst, 1)
           // 会签成员列表保持原 actors（委托不新增会签成员，只在该成员的任务上并入代理人）
-          nt.variables = {
+          nt.variables = { isFirstTaskNode: nt.variables.isFirstTaskNode,
             [`nrOfInstances_${node.id}`]: actors.length,
             [`loopCounter_${node.id}`]: 0,
             [`operatorList_${node.id}`]: actors,
@@ -655,7 +661,7 @@ export class EngineImpl implements Engine {
         }
         default:
           for (const actor of actors) {
-            const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1)
+            const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, parentId, isFirst, 1)
             const eff = mergeAgents([actor], agents)
             if (eff.length > 1) nt.actorIds = eff
             await this.repo.saveTask(nt)
@@ -666,7 +672,7 @@ export class EngineImpl implements Engine {
     }
     // 普通任务：一个任务承载全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
     const effActors = mergeAgents(actors, agents)
-    const nt = inst.createTask(this.nextId(), node.id, node.text.value, effActors[0], operator, form, now)
+    const nt = inst.createTask(this.nextId(), node.id, node.text.value, effActors[0], operator, form, now, parentId, isFirst)
     if (effActors.length > 1) nt.actorIds = effActors
     await this.repo.saveTask(nt)
     await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })

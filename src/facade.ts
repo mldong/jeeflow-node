@@ -852,7 +852,9 @@ export class JeeflowFacade {
     // 首个任务节点且 DOING → true，与 instance detail 的 activeTaskList 行语义一致
     const tExt: Record<string, any> = { ...(task.variables ?? {}) }
     const doing = task.taskState === TaskState.Doing
-    tExt.isFirstTaskNode = false
+    // 先留住行上值再覆写出口，否则丢掉「缺键」这个事实就没法回退现算
+    const tRowFirst = task.variables?.isFirstTaskNode
+    tExt.isFirstTaskNode = tRowFirst != null ? Boolean(tRowFirst) : false
     const vo: Record<string, any> = {
       id: task.id, processInstanceId: task.processInstanceId, taskName: task.taskName,
       displayName: task.displayName, taskType: task.taskType ?? null,
@@ -868,7 +870,10 @@ export class JeeflowFacade {
       const def = await this.repo.findDefineById(inst.defineId)
       if (def) {
         vo.jsonObject = this.parseGraph(def.content) // issues/05
-        tExt.isFirstTaskNode = doing && task.taskName === this.firstTaskNodeId(vo.jsonObject)
+        if (tRowFirst == null) {
+          // 存量行没有落库标记 ⇒ 回退现算（仅进行中口径）
+          tExt.isFirstTaskNode = doing && task.taskName === this.firstTaskNodeId(vo.jsonObject)
+        }
         try {
           const flow = JSON.parse(toStr(def.content))
           for (const n of flow.nodes ?? []) {
@@ -1105,7 +1110,10 @@ export class JeeflowFacade {
       }
       const ext: Record<string, any> = { ...(t.variables ?? {}) }
       const doing = t.taskState === TaskState.Doing
-      ext.isFirstTaskNode = doing && t.taskName === firstTaskNodeId
+      // issues/121 P1：行上值优先（引擎建单时写入，历史行同样有效），缺键（存量行）才回退现算
+      ext.isFirstTaskNode = t.variables?.isFirstTaskNode != null
+        ? Boolean(t.variables.isFirstTaskNode)
+        : (doing && t.taskName === firstTaskNodeId)
       vo.ext = ext
       tasks.push(vo)
       if (doing) activeTaskList.push(vo)

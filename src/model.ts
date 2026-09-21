@@ -252,14 +252,17 @@ export class ProcessInstance {
     return !this.tasks.some(t => t.isDoing())
   }
 
-  /** 创建任务（子实体工厂）——performType：0 普通 / 1 会签（issues/52 E24 落库对齐 Java） */
-  createTask(id: string, taskName: string, displayName: string, actor: string, operator: string, formKey: string, now: Date, performType = 0): ProcessTask {
+  /** 建单不变量（issues/121 P1）：本工厂必写 parentTaskId（发起 execution 无当前任务时传字符 0）
+   * 与行级 isFirstTaskNode；两参无默认值，漏传即编译不过，不留静默漏写路径。
+   *
+   * 创建任务（子实体工厂）——performType：0 普通 / 1 会签（issues/52 E24 落库对齐 Java） */
+  createTask(id: string, taskName: string, displayName: string, actor: string, operator: string, formKey: string, now: Date, parentId: string, isFirst: boolean, performType = 0): ProcessTask {
     const task = new ProcessTask({
       id, processInstanceId: this.id,
       taskName, displayName, taskState: TaskState.Doing,
       actorId: '', actorIds: [actor],
-      taskType: 0, performType, formKey,
-      variables: {},
+      taskType: 0, performType, formKey, parentTaskId: parentId,
+      variables: { isFirstTaskNode: isFirst },
       createTime: now, updateTime: now, createUser: operator, updateUser: operator,
     })
     this.tasks.push(task)

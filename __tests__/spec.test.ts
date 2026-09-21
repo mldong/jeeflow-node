@@ -101,6 +101,51 @@ describe('jeeflow compliance tests', () => {
     await assertDone(result, 'multi: expected done')
   })
 
+  it('issues/121 P1 建单不变量：taskParentId 与行级 isFirstTaskNode 必写、门面读时行上值优先', async () => {
+    const { engine, repo } = setup()
+    const def = loadFlow(repo, '02-multi-task.json')
+    // 夹具是 apply→task1→task2→task3 四级链；两步流里"上一节点"与"首任务节点"同格＝断言恒真
+    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    const facade = new JeeflowFacade(engine, repo, undefined)
+    const extOf = async (name: string) => {
+      const r = await facade.flow('processInstance/detail', { id: inst.id })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      const row = r.data.tasks.find((x: any) => x.taskName === name)
+      return row && row.ext && row.ext.isFirstTaskNode
+    }
+
+    const apply = (await repo.findDoingTasks(inst.id))[0]
+    assert.equal(apply.taskName, 'apply')
+    assert.equal(apply.parentTaskId, '0', '发起那条 execution 无当前任务 ⇒ parent 落 0（不是 null/undefined）')
+    assert.equal(apply.variables.isFirstTaskNode, true, '首任务节点行应落 isFirstTaskNode=true')
+    await repo.addTaskActor(apply.id, ['applicant'])
+    await engine.executeProcessTask(apply.id, 'applicant')
+
+    let prev = apply
+    for (const [name, who] of [['task1', 'userA'], ['task2', 'userB'], ['task3', 'userC']] as const) {
+      const t = (await repo.findDoingTasks(inst.id))[0]
+      assert.equal(t.taskName, name)
+      assert.equal(t.parentTaskId, prev.id, `${name}.parent 应为刚办结的 ${prev.taskName}.id`)
+      assert.equal(t.variables.isFirstTaskNode, false, '非首节点必须 false')
+      await repo.addTaskActor(t.id, [who])
+      await engine.executeProcessTask(t.id, who)
+      prev = t
+    }
+
+    // 本案真正要的那格：血缘版回退读的是已办结的历史行，标记必须随行存活
+    const his = await repo.findTaskById(apply.id)
+    assert.notEqual(his.taskState, 10, 'apply 应已办结')
+    assert.equal(his.variables.isFirstTaskNode, true, '历史行标记必须还在（现算版在历史行上恒 false）')
+    assert.equal(his.parentTaskId, '0', '历史行的血缘指针不应被后续路径覆写')
+
+    // 门面出口：行上值优先 ⇒ 历史行也报 true；缺键（存量行）⇒ 回退现算 ⇒ false
+    assert.equal(await extOf('apply'), true, '已办结的 apply 行出口应给行上值 true')
+    his.variables = { ...his.variables }
+    delete his.variables.isFirstTaskNode
+    await repo.updateTask(his)
+    assert.equal(await extOf('apply'), false, '缺键的存量历史行回退现算（仅进行中口径）⇒ false，且不得报错')
+  })
+
   it('02B issues/97 实例 u_realName 恒为发起人（execute 不覆盖实例 u_*，对齐 Java）', async () => {
     const { engine, repo } = setup()
     const def = loadFlow(repo, '02-multi-task.json')
