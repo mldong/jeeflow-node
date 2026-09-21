@@ -37,7 +37,7 @@ interface Engine {
   startProcessInstanceById(defineId: number, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
   executeProcessTask(taskId: number, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
   executeAndJumpToEnd(taskId: number, operator: string, args?: Record<string, any>): Promise<ProcessInstance>          // 拒绝（REJECT=2）→ 实例 45
-  executeAndJumpTask(taskId: number, operator: string, args: Record<string, any>, targetTaskName?: string): Promise<ProcessInstance>  // 跳转（JUMP=4）/退回上一步（ROLLBACK=3）
+  executeAndJumpTask(taskId: number, operator: string, args: Record<string, any>, targetTaskName?: string): Promise<ProcessInstance>  // 跳转（JUMP=4）/退回上一步（ROLLBACK=3，血缘版：复活血缘前驱行，见规范 04）
   executeAndJumpToFirstTaskNode(taskId: number, operator: string, args?: Record<string, any>): Promise<ProcessInstance> // 退回发起人（ROLLBACK_TO_OPERATOR=6）
 }
 ```
