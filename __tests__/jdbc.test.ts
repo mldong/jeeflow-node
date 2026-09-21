@@ -21,6 +21,7 @@ import { PostgresAdapter } from '../src/jdbc/postgres.js'
 import { InstanceState, TaskState, ProcessInstance, type ProcessDefine } from '../src/model.js'
 import { JeeflowFacade } from '../src/facade.js'
 import type { IDGenerator, UserProvider } from '../src/spi.js'
+import { runParity, PARITY_CASES } from './surrparity.js'
 
 const dbType = process.env.JEFFLOW_DB ?? 'mysql'
 const isPg = dbType === 'postgres'
@@ -843,6 +844,43 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
         assert.equal(await sqlExt.getSurrogate('n116-dirty', ''), null, '脏 enabled 不得当启用（SQL 侧）')
         await q(pool, 'DELETE FROM wf_process_surrogate WHERE id = ?', [dirtyId])
       }
+    } finally {
+      await cleanup(); await cleanupN116()
+    }
+  })
+
+  // ── 批次 D 收尾：条款 1.4「多条命中取 id 最大」乱序判别力夹具 ────────────────
+  // 数据与期望**只写一处**（__tests__/surrparity.ts），与 spec.test.ts 内存仓侧同源。
+  // ⚠️ 已知事实（Java/Go/Python 实测踩到）：SQL 侧 `ORDER BY id DESC LIMIT 1` 按主键序回行，
+  // "插入序打乱"在 SQL 侧没有判别力——真正钉住 1.4 的是 ORDER BY id DESC 子句本身
+  // （去掉它退化成取物理首行）；内存侧（Map 按插入序遍历）才是打乱序起作用的地方。
+  // 本用例仍两侧各跑一遍共用期望，并逐条断**两侧命中同一 id**（同答案）。
+  it('issues/116 条款 1.4 乱序 id 夹具（真机 SQL 仓 + 与内存仓同答案）', async () => {
+    await cleanup()
+    try {
+      await applySchema(); await cleanupN116()
+      const sqlExt = new JdbcProcessExtRepository(makeAdapter(pool), new TsIDGenerator())
+      const memExt = new MemoryExtRepository()
+      // 显式 10 位 id 段（Node 栈 116 系列既有约定 9016xxxxxx / 9116xxxxxx，避开 900004 define 段）
+      const baseId = isPg ? 9116000100 : 9016000100
+      const failures: string[] = []
+      await runParity(sqlExt, baseId, (desc, ok, detail) => {
+        if (!ok) failures.push(`[SQL] ${desc}${detail ? `（${detail}）` : ''}`)
+      })
+      await runParity(memExt, baseId, (desc, ok, detail) => {
+        if (!ok) failures.push(`[内存] ${desc}${detail ? `（${detail}）` : ''}`)
+      })
+      // 两侧同答案：同一条 (授权人, 流程名) 查询，两仓必须命中同一条记录（id 一致）
+      for (const c of PARITY_CASES) {
+        const s = await sqlExt.getSurrogate(c.operator, c.processName)
+        const m = await memExt.getSurrogate(c.operator, c.processName)
+        assert.equal(m?.id ?? null, s?.id ?? null,
+          `两仓同答案（${c.what}）：SQL=${s?.id ?? 'null'} 内存=${m?.id ?? 'null'}`)
+      }
+      assert.deepEqual(failures, [], '乱序 id 夹具与共用期望表不一致：\n' + failures.join('\n'))
+      await q(pool, `DELETE FROM wf_process_surrogate WHERE id BETWEEN ? AND ?`,
+        isPg ? [String(baseId), String(baseId + 99)] : [baseId, baseId + 99])
+      await cleanupN116()
     } finally {
       await cleanup(); await cleanupN116()
     }

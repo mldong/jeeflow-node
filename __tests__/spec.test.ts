@@ -10,6 +10,7 @@ import { InstanceState, TaskState, SubmitType, type ProcessDefine, ProcessInstan
 import type { ExpressionEvaluator, UserProvider } from '../src/spi.js'
 import { type FlowInterceptor, EventType, type EngineExtensions } from '../src/extensions.js'
 import { dir as flowsResolverDir } from '../flows-resolver.js'
+import { runParity } from './surrparity.js'
 
 const flowDir = flowsResolverDir() + '/'
 
@@ -3010,15 +3011,15 @@ describe('issues/116 委托代理自动生效（引擎内置·内存仓路径）
     assert.equal((await repo.pageTodoTasks(1, 50, 'agentC')).rows.length, 0, 'C 不得因环状委托收到该单')
   })
 
-  it('条款 1 覆盖：串行会签每一步推进出的新单都并入（且 1.3 不改投票名册）', async () => {
+  it('串行会签第一步并入 + 条款 1.3 名册（每一步推进的并入由「条款 1 路径 3/3」独立钉）', async () => {
     const { engine, repo } = setup()
     const ext = new MemoryExtRepository()
     engine.setSurrogateRepository(ext)
     const def = loadFlow(repo, '06-countersign-sequential.json')   // 模型 name = countersign-sequential
     assert.notEqual(String(def.name), 'countersign-sequential', '诱饵前提：两仓名不同')
     await putSur(ext, { operator: 'userA', surrogate: 'agentA', processName: 'countersign-sequential' })
-    await putSur(ext, { operator: 'userB', surrogate: 'agentB', processName: 'countersign-sequential' })
-
+    // 注意：userB **不配**委托——推进路径的并入由专属用例（路径 3/3）独立钉死，
+    // 本用例失能取证时只应暴露 createTask 的 SEQUENTIAL 分支挂点问题。
     const inst = await engine.startProcessInstanceById(def.id, 'applicant')
     const apply = (await repo.findDoingTasks(inst.id))[0]
     await engine.executeProcessTask(apply.id, 'applicant')
@@ -3030,53 +3031,97 @@ describe('issues/116 委托代理自动生效（引擎内置·内存仓路径）
     assert.deepEqual((await repo.findTaskById(step1.id))!.variables['operatorList_task1'], ['userA', 'userB'],
       '条款 1.3：代理人只进当一步任务，不得扩会签投票名册（否则改票数）')
 
-    // 推进会出第二步任务——这条路径最容易漏（只挂"发起"一处即红）
+    // 推进会出第二步任务（此处 userB 无委托 ⇒ 断言的是"无代理人时集合原样 + 名册仍不扩"，
+    // 第二步并入代理人的正判据在「条款 1 路径 3/3 串行会签每一步推进」）
     await engine.executeProcessTask(step1.id, 'userA')
     doing = await repo.findDoingTasks(inst.id)
     const step2 = doing[0]
     assert.equal(step2.taskName, 'task1')
-    assert.deepEqual(await repo.findTaskActors(step2.id), ['userB', 'agentB'], '串行会签第二步也要并入代理人')
+    assert.deepEqual(await repo.findTaskActors(step2.id), ['userB'], '第二步成员原样参与者（userB 未配委托）')
     assert.deepEqual((await repo.findTaskById(step2.id))!.variables['operatorList_task1'], ['userA', 'userB'],
       '条款 1.3：推进出的新单同样不改名册')
     await engine.executeProcessTask(step2.id, 'userB')
     assert.equal((await repo.findInstanceById(inst.id))!.state, InstanceState.Done, '两步走完流程应结束')
   })
 
-  it('条款 1 覆盖：跳转两条路径（ROLLBACK 回上一节点 / JUMP 指定节点）建的新单都并入', async () => {
-    const { engine, repo } = setup()
-    const ext = new MemoryExtRepository()
-    engine.setSurrogateRepository(ext)
-    const def = loadFlow(repo, '02-multi-task.json')               // 模型 name = multi-task
-    await putSur(ext, { operator: 'leader', surrogate: 'agentLeader', processName: 'multi-task' })
-    await putSur(ext, { operator: 'manager', surrogate: 'agentManager', processName: 'multi-task' })
+  // ── 条款 1「覆盖范围」：流转中新增建任务路径各一条**独立**用例 ─────────────────
+  // 三条路径各用**专属流程名 + 专属参与者 + 专属代理人**（互不共用——某路径失能时
+  // 只有它自己的用例红，其余全绿）。断言一律落在 `findTaskActors` 读回的持久参与者行。
+  // 挂点归属与"单路径失能"实测结论（本轮逐条注一遍跑全量，恢复后 git diff 核对逐字节回到改前）：
+  //   · 串行会签推进 = engine.ts executeProcessTask 的 SEQUENTIAL 分支（:263 附近，**独占**挂点）
+  //       → 只注它：全量恰好 1 红 = 「条款 1 路径 3/3」
+  //   · ROLLBACK     = engine.ts createTaskWithActors（**独占**挂点，仅被 ROLLBACK 调用）
+  //       → 只注它：全量恰好 1 红 = 「条款 1 路径 2/3」
+  //   · JUMP         = executeNode → createTask，与「发起 / 办理推进 / 跳首节点」**共用同一挂点**，
+  //       注掉整处挂点必连发起与条款 1.1 全家一起红，做不到"只红自己"——故用**路径内注入**取证：
+  //       挂点内按本路径专属流程名 'surrjump116' 跳过委托应用（该流程内唯一对委托敏感的断言
+  //       是 j2，起点自证保证 j1 无代理人 ⇒ 全量恰好 1 红 = 「条款 1 路径 1/3」。
+  //       Go/Python 栈 JUMP 与发起共用 _create_task，取证方式与此同款）。
 
-    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
-    const apply = (await repo.findDoingTasks(inst.id))[0]
-    await engine.executeProcessTask(apply.id, 'applicant')
-    const task1 = (await repo.findDoingTasks(inst.id))[0]
-    assert.deepEqual(await repo.findTaskActors(task1.id), ['leader', 'agentLeader'], '正向推进：task1 并入')
+  it('条款 1 路径 1/3 跳转(JUMP)：委托只配跳转目标参与人，跳转新建任务并入代理人', async () => {
+    const { engine, repo, ext, def } = surrHarness('surrjump116',
+      surrFlowJson('surrjump116', [{ id: 'j1', assignee: 'jmp-zhang' }, { id: 'j2', assignee: 'jmp-wang' }]))
+    await putSur(ext, { operator: 'jmp-wang', surrogate: 'jmp-agent', processName: 'surrjump116' })
 
-    // ROLLBACK（无 target → 回上一节点 apply，新单 actor = 当前任务完成人 leader）
-    await engine.executeAndJumpTask(task1.id, 'leader')
-    const back = (await repo.findDoingTasks(inst.id))[0]
-    assert.equal(back.taskName, 'apply', 'ROLLBACK 应回到上一任务节点')
-    assert.deepEqual(await repo.findTaskActors(back.id), ['leader', 'agentLeader'],
-      'ROLLBACK 建单路径（createTaskWithActors）也要并入')
+    const inst = await engine.startProcessInstanceById(def.id, 'jmp-boss')
+    assert.deepEqual(await doingActors(repo, inst.id, 'j1'), ['jmp-zhang'],
+      '起点自证：发起产生的 j1 不该出现代理人（jmp-zhang 无委托）⇒ j2 里的代理人只可能由跳转路径写入')
+    const j1 = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'j1')!
+    await engine.executeAndJumpTask(j1.id, 'jmp-zhang', {}, 'j2')
+    assert.deepEqual(await doingActors(repo, inst.id, 'j2'), ['jmp-wang', 'jmp-agent'],
+      '条款 1「跳转(JUMP)」：跳转新建的任务未并入代理人（期望 [jmp-wang jmp-agent]）')
+  })
 
-    // JUMP（指定 target task2，actor = manager）
-    await engine.executeAndJumpTask(back.id, 'leader', {}, 'task2')
-    const t2 = (await repo.findDoingTasks(inst.id))[0]
-    assert.equal(t2.taskName, 'task2')
-    assert.deepEqual(await repo.findTaskActors(t2.id), ['manager', 'agentManager'],
-      'JUMP 建单路径（executeNode→createTask）也要并入')
+  it('条款 1 路径 2/3 回退(ROLLBACK)：回退新建上一节点任务并入回退操作人的代理人（诱饵配原参与人）', async () => {
+    const { engine, repo, ext, def } = surrHarness('surrback116',
+      surrFlowJson('surrback116', [{ id: 'b1', assignee: 'rbk-zhang' }, { id: 'b2', assignee: 'rbk-wang' }]))
+    await putSur(ext, { operator: 'rbk-wang', surrogate: 'rbk-agent', processName: 'surrback116' })    // 回退操作人
+    await putSur(ext, { operator: 'rbk-zhang', surrogate: 'rbk-decoy', processName: 'surrback116' })   // 诱饵：b1 原参与人
+
+    const inst = await engine.startProcessInstanceById(def.id, 'rbk-boss')
+    assert.deepEqual(await doingActors(repo, inst.id, 'b1'), ['rbk-zhang', 'rbk-decoy'],
+      '起点自证：发起产生的 b1 只带 rbk-zhang 自己的代理人 ⇒ 回退新建 b1 里的代理人必须另有其人（rbk-agent）')
+    const b1 = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'b1')!
+    await engine.executeProcessTask(b1.id, 'rbk-zhang')
+    const b2 = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'b2')!
+    await engine.executeAndJumpTask(b2.id, 'rbk-wang', {})
+    // 原 b1 已 Done，b1 上唯一进行中任务就是回退新建的那一条
+    assert.deepEqual(await doingActors(repo, inst.id, 'b1'), ['rbk-wang', 'rbk-agent'],
+      '条款 1「回退(ROLLBACK)」：回退新建的任务未并入代理人（期望 [rbk-wang rbk-agent]）')
+  })
+
+  it('条款 1 路径 3/3 串行会签每一步推进：推进出的下一步任务并入该成员代理人（1.3 名册顺带钉）', async () => {
+    const { engine, repo, ext, def } = surrHarness('surrseq116',
+      surrFlowJson('surrseq116', [{ id: 'cs', assignee: 'seq-zhang,seq-wang', countersign: 'SEQUENTIAL' }]))
+    await putSur(ext, { operator: 'seq-wang', surrogate: 'seq-agent', processName: 'surrseq116' })
+
+    const inst = await engine.startProcessInstanceById(def.id, 'seq-boss')
+    assert.deepEqual(await doingActors(repo, inst.id, 'cs'), ['seq-zhang'],
+      '起点自证：第一步任务不该出现代理人（seq-zhang 无委托，代理只配第二步成员）')
+    const step1 = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'cs')!
+    await engine.executeProcessTask(step1.id, 'seq-zhang')
+    const second = (await repo.findDoingTasks(inst.id)).filter(t => t.taskName === 'cs')
+    assert.equal(second.length, 1, `串行会签推进后应恰好一条进行中任务: ${second.length}`)
+    assert.equal(String((await repo.findTaskById(second[0].id))!.variables['loopCounter_cs']), '1',
+      '自证：断言对象必须是串行会签第 2 步（loopCounter_cs=1），不是第一步残留')
+    assert.deepEqual(await repo.findTaskActors(second[0].id), ['seq-wang', 'seq-agent'],
+      '条款 1「串行会签的每一步推进」：推进出的下一步任务未并入代理人（期望 [seq-wang seq-agent]）')
+    const vars2 = (await repo.findTaskById(second[0].id))!.variables
+    assert.deepEqual(vars2['operatorList_cs'], ['seq-zhang', 'seq-wang'], '条款 1.3：代理人不得进投票名册')
+    assert.equal(Number(vars2['nrOfInstances_cs']), 2, '条款 1.3：票数不得因代理人改变')
   })
 
   it('条款 1.4 多条命中取 id 最大：乱序写入 / 雪花 19 位都不被 Map 插入序带跑', async () => {
     const ext = new MemoryExtRepository()
-    // ① 先大后小：取"遍历末条"会选成 small，SQL 侧 ORDER BY id DESC 选 big
-    await putSur(ext, { id: '900', operator: 'opOrd', surrogate: 'big' })
-    await putSur(ext, { id: '100', operator: 'opOrd', surrogate: 'small' })
-    assert.equal((await ext.getSurrogate('opOrd', 'x'))?.surrogate, 'big', '全流程兜底组：取 id 最大')
+    // ① 三条乱序：按插入顺序给 id 900 → 1000 → 950，期望命中 1000（**插入序中间位**）——
+    //    "取遍历首条"答 900、"取插入末条"答 950、BigInt 比较退化成**字典序**也答 950
+    //    （'950' > '1000'），三种错实现同红。SQL 侧主键序即数值序、等长 id 无此分叉，
+    //    乱序夹具的判别力就在内存侧（surrparity.ts 头注同款事实）。
+    await putSur(ext, { id: '900', operator: 'opOrd', surrogate: 'first' })
+    await putSur(ext, { id: '1000', operator: 'opOrd', surrogate: 'max-mid' })
+    await putSur(ext, { id: '950', operator: 'opOrd', surrogate: 'last' })
+    assert.equal((await ext.getSurrogate('opOrd', 'x'))?.surrogate, 'max-mid',
+      '全流程兜底组：id 数值最大 ≠ 插入首条 ≠ 插入末条 ≠ 字典序最大')
     // ② 先小后大：同样必须选 big（与 ① 合起来才排除"插入序"）
     await putSur(ext, { id: '100', operator: 'opAsc', surrogate: 'small' })
     await putSur(ext, { id: '900', operator: 'opAsc', surrogate: 'big' })
@@ -3090,6 +3135,128 @@ describe('issues/116 委托代理自动生效（引擎内置·内存仓路径）
     await putSur(ext, { id: '1827345678901234568', operator: 'opSf', surrogate: 'sfNew' })
     assert.equal((await ext.getSurrogate('opSf', 'anything'))?.surrogate, 'sfNew',
       '雪花 id 必须按数值比大小（Number 精度会塌成相等而错选首条）')
+  })
+
+  // ── 批次 D 收尾：条款 1.1 逐形态核实 + 缓存留痕 + 条款 1.4 共用夹具（内存侧）────
+
+  it('契约 1.1 五种"未带 name"形态逐一回落 define.name（键缺失/null/空串/纯空白/tab 空格 + 回落值自身 trim）', async () => {
+    const shapes: Array<[string, string | null | undefined]> = [
+      ['键缺失', undefined], ['null', null], ['空串', ''], ['纯空白', '   '], ['制表符+空格', '\t '],
+    ]
+    let i = 0
+    for (const [what, model] of shapes) {
+      i++
+      const dn = `fb-${i}-surr116`
+      const { engine, repo, ext, def } = surrHarness(dn, surrFlowJson(model, [{ id: 'fbt', assignee: `fb${i}-zhang` }]))
+      await putSur(ext, { operator: `fb${i}-zhang`, surrogate: `fb${i}-agent`, processName: dn })
+      const inst = await engine.startProcessInstanceById(def.id, `fb${i}-boss`)
+      assert.deepEqual(await doingActors(repo, inst.id, 'fbt'), [`fb${i}-zhang`, `fb${i}-agent`],
+        `条款 1.1「模型 name ${what}」必须回落 wf_process_define.name=${dn} 并命中（先 trim 再判空）`)
+    }
+    // 回落值本身也 trim：define.name 带首尾空白、台账存的是干净名 ⇒ 不 trim 回落值就查不到
+    const h = surrHarness('  spaced-def-surr116  ', surrFlowJson('   ', [{ id: 'fbt', assignee: 'fb-sp-zhang' }]))
+    await putSur(h.ext, { operator: 'fb-sp-zhang', surrogate: 'fb-sp-agent', processName: 'spaced-def-surr116' })
+    const inst = await h.engine.startProcessInstanceById(h.def.id, 'fb-sp-boss')
+    assert.deepEqual(await doingActors(h.repo, inst.id, 'fbt'), ['fb-sp-zhang', 'fb-sp-agent'],
+      '条款 1.1 回落值（define.name）也须 trim 后再查（台账存干净名，" 名 "查不到）')
+  })
+
+  it('契约 1.1 undefined 形态（typeof 守卫直调单点）：JSON 序列化后与"键缺失"等价，端到端上一条已覆盖', async () => {
+    const { engine, def } = surrHarness('fb-undef-116', surrFlowJson(undefined, [{ id: 'fbt', assignee: 'fb-u-zhang' }]))
+    const probe = await (engine as any).surrogateProcessName({ name: undefined }, { defineId: def.id })
+    assert.equal(probe, 'fb-undef-116',
+      'flow.name=undefined 必须走回落（typeof 守卫）；该形态经 JSON 序列化即成"键缺失"，端到端由上一条覆盖')
+  })
+
+  it('契约 1.1 传给委托查询的值必须 trim：假仓储捕获入参断言（不只断最终参与者）', async () => {
+    const cap = new CaptureExt()
+    const { engine, repo, def } = surrHarness('paddeddef-116',
+      surrFlowJson('  padded-surr116  ', [{ id: 't1', assignee: 'pd-zhang' }]), cap)
+    await putSur(cap, { operator: 'pd-zhang', surrogate: 'pd-agent', processName: 'padded-surr116' })
+    const inst = await engine.startProcessInstanceById(def.id, 'pd-boss')
+    assert.deepEqual(await doingActors(repo, inst.id, 't1'), ['pd-zhang', 'pd-agent'],
+      '台账按干净名配置 ⇒ 只有引擎传出 trim 值才命中（" 名 " 与 "名" 必须命中同一条委托）')
+    assert.ok(cap.queries.length > 0, '未捕获到任何 getSurrogate 调用，用例空转')
+    const bad = cap.queries.filter(([, pn]) => pn !== 'padded-surr116')
+    assert.deepEqual(bad, [],
+      `传给委托查询的流程名必须是 trim 后的值，实测未 trim 入参：${JSON.stringify(bad)}`)
+  })
+
+  it('契约 1.1 回落读定义行抛错：按"拿不到流程名"只命中全流程兜底，不打断建单、不吞正常路径', async () => {
+    const repo = new FlakyDefineRepo()
+    const engine = new EngineImpl(repo, undefined, seqIdGen('tf'))
+    const cap = new CaptureExt()
+    engine.setSurrogateRepository(cap)
+    const def = seedSurrDefine(repo, 'tf-surr116', surrFlowJson(undefined, [{ id: 't1', assignee: 'tf-zhang' }]))
+    repo.badId = String(def.id)   // 首读（start 取 content）放行，其后回落读抛错
+    await putSur(cap, { operator: 'tf-zhang', surrogate: 'tf-global', processName: '' })
+
+    const inst = await engine.startProcessInstanceById(def.id, 'tf-boss')   // 不得抛
+    assert.deepEqual(await doingActors(repo, inst.id, 't1'), ['tf-zhang', 'tf-global'],
+      '回落抛错必须退回"拿不到流程名"：只命中全流程兜底（判据 4——委托是增强能力，绝不打断建单）')
+    assert.deepEqual(cap.queries, [['tf-zhang', '']],
+      `异常回落传给查询的流程名应为空串，实测 ${JSON.stringify(cap.queries)}`)
+
+    // 不吞正常路径：另一条带模型 name 的流程在同一引擎上照常精确命中
+    const def2 = seedSurrDefine(repo, 'tf2-surr116', surrFlowJson('tg-surr116', [{ id: 't2', assignee: 'tg-zhang' }]))
+    await putSur(cap, { operator: 'tg-zhang', surrogate: 'tg-agent', processName: 'tg-surr116' })
+    const inst2 = await engine.startProcessInstanceById(def2.id, 'tg-boss')
+    assert.deepEqual(await doingActors(repo, inst2.id, 't2'), ['tg-zhang', 'tg-agent'],
+      '一次回落异常不得把后续正常解析一起吞掉')
+  })
+
+  it('契约 1.1 defineName 缓存：一次 execution 解析后复用（不逐任务读）；命中值恒等于首读值 + "不失效"欠账留痕', async () => {
+    // ① 不逐任务解析：fork 出两个任务节点、模型 name 纯空白 → 读定义行应恰 2 次
+    //    （①发起取 content ②首次回落解析并缓存）；若逐任务回落解析会是 3 次。
+    const repo = new CountDefineRepo()
+    const engine = new EngineImpl(repo, undefined, seqIdGen('ck'))
+    const ext = new MemoryExtRepository()
+    engine.setSurrogateRepository(ext)
+    const forkFlow = {
+      name: '   ', displayName: '委托测试', type: 'approval',
+      nodes: [
+        { id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } },
+        { id: 'fork', type: 'snaker:fork', properties: {}, text: { value: '并行' } },
+        { id: 'ckA', type: 'snaker:task', properties: { assignee: 'ck-zhang', taskType: 0, performType: 0 }, text: { value: 'ckA' } },
+        { id: 'ckB', type: 'snaker:task', properties: { assignee: 'ck-wang', taskType: 0, performType: 0 }, text: { value: 'ckB' } },
+        { id: 'end', type: 'snaker:end', properties: {}, text: { value: '结束' } },
+      ],
+      edges: [
+        { id: 'e0', sourceNodeId: 'start', targetNodeId: 'fork', properties: {} },
+        { id: 'e1', sourceNodeId: 'fork', targetNodeId: 'ckA', properties: {} },
+        { id: 'e2', sourceNodeId: 'fork', targetNodeId: 'ckB', properties: {} },
+        { id: 'e3', sourceNodeId: 'ckA', targetNodeId: 'end', properties: {} },
+        { id: 'e4', sourceNodeId: 'ckB', targetNodeId: 'end', properties: {} },
+      ],
+    }
+    const def = seedSurrDefine(repo, 'cache-def-surr116', JSON.stringify(forkFlow))
+    await putSur(ext, { operator: 'ck-zhang', surrogate: 'ck-agent-a', processName: 'cache-def-surr116' })
+    await putSur(ext, { operator: 'ck-wang', surrogate: 'ck-agent-b', processName: 'cache-def-surr116' })
+    const inst = await engine.startProcessInstanceById(def.id, 'ck-boss')
+    assert.deepEqual(await doingActors(repo, inst.id, 'ckA'), ['ck-zhang', 'ck-agent-a'], '分支 A 回落命中')
+    assert.deepEqual(await doingActors(repo, inst.id, 'ckB'), ['ck-wang', 'ck-agent-b'], '分支 B 回落命中')
+    assert.equal(repo.defineReads, 2,
+      `回落解析必须缓存复用、不得逐任务读：findDefineById 次数 = ${repo.defineReads}, want 2（逐任务会是 3）`)
+
+    // ② 命中缓存的值 == 首次读到的值（**已知欠账留痕**：本栈 defineNameCache 与 Go 同款
+    //    跨 execution 不失效；Java 逐次 execution 现解、Python 每次 start 重播无此账。
+    //    行为待 owner 拍板，本用例只钉"缓存值与首读一致"的现状，不做失效改造。）
+    const h = surrHarness('cache-v1-116', surrFlowJson(undefined, [{ id: 't1', assignee: 'cc2-zhang' }]))
+    await putSur(h.ext, { operator: 'cc2-zhang', surrogate: 'agent-v1', processName: 'cache-v1-116' })
+    const i1 = await h.engine.startProcessInstanceById(h.def.id, 'cc2-boss')
+    assert.deepEqual(await doingActors(h.repo, i1.id, 't1'), ['cc2-zhang', 'agent-v1'], '首跑回落读 V1 并命中')
+    h.def.name = 'cache-v2-116'   // 改定义行名（模拟改名/重部署）；V2 委托 id 更大，重读必命中 V2
+    await putSur(h.ext, { operator: 'cc2-zhang', surrogate: 'agent-v2', processName: 'cache-v2-116' })
+    const i2 = await h.engine.startProcessInstanceById(h.def.id, 'cc2-boss')
+    assert.deepEqual(await doingActors(h.repo, i2.id, 't1'), ['cc2-zhang', 'agent-v1'],
+      '第二跑必须拿到与首跑一致的缓存值（agent-v1）——钉住"缓存命中==首读值"，同时留痕缓存不失效欠账')
+  })
+
+  it('条款 1.4 判别力夹具·内存仓侧：与真机 SQL 仓同一份数据+期望（__tests__/surrparity.ts 单一事实源）', async () => {
+    const ext = new MemoryExtRepository()
+    const failures: string[] = []
+    await runParity(ext, 900000, (desc, ok, detail) => { if (!ok) failures.push(detail ? `${desc}（${detail}）` : desc) })
+    assert.deepEqual(failures, [], '内存仓与共用期望表不一致：\n' + failures.join('\n'))
   })
 
   it('条款 5 判据 d 写侧：脏 enabled 归 0 落库且不打断保存（读回持久值）', async () => {
@@ -3124,4 +3291,96 @@ describe('issues/116 委托代理自动生效（引擎内置·内存仓路径）
 function fmtDt(d: Date): string {
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+// ─── issues/116 批次 D 测试基建（形状对齐 Go mkFlow / Python _flow_json）─────────
+// 自建线性流程 start → tasks… → end（节点 id 即 taskName）。name **原样**写入 JSON：
+// 不传 = 不带键、null = "name": null、字符串（含空白）原样落盘——条款 1.1 各形态可精确构造。
+function surrFlowJson(
+  name: string | null | undefined,
+  specs: Array<{ id: string; assignee: string; countersign?: string }>,
+): string {
+  const nodes: any[] = [{ id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } }]
+  const edges: any[] = []
+  let prev = 'start'
+  for (const s of specs) {
+    const props: Record<string, any> = s.countersign
+      ? { assignee: s.assignee, taskType: 0, performType: '1', countersignType: s.countersign }
+      : { assignee: s.assignee, taskType: 0, performType: 0 }
+    nodes.push({ id: s.id, type: 'snaker:task', properties: props, text: { value: s.id } })
+    edges.push({ id: `e_${prev}_${s.id}`, sourceNodeId: prev, targetNodeId: s.id, properties: {} })
+    prev = s.id
+  }
+  nodes.push({ id: 'end', type: 'snaker:end', properties: {}, text: { value: '结束' } })
+  edges.push({ id: `e_${prev}_end`, sourceNodeId: prev, targetNodeId: 'end', properties: {} })
+  const raw: Record<string, any> = { displayName: '委托测试', type: 'approval', nodes, edges }
+  if (name !== undefined) raw.name = name
+  return JSON.stringify(raw)
+}
+
+// 直接落定义行（**绕过门面 deploy 的 def.name = model.name 不变量**）——条款 1.1 的
+// 诱饵/回落形态只有"define.name ≠ 模型 name"时才造得出来，与集成方自带导入链路同形。
+function seedSurrDefine(repo: MemoryRepository, defineName: string, content: string): ProcessDefine {
+  const def = {
+    id: '', name: defineName, displayName: '委托测试', type: 'test', state: 1, content, version: 1,
+    createTime: new Date(), createUser: 't', updateTime: new Date(), updateUser: 't',
+  } as ProcessDefine
+  repo.addDefine(def)
+  return def
+}
+
+// 确定性发号：setup()/默认发号是 `Date.now()*1000+random`，同毫秒多单可撞号——
+// 实例 id 相撞会让 findDoingTasks 翻倍、任务 id 相撞会让 saveTask 覆盖丢单
+// （既有用例「07 countersign ratio」同型偶发红即此病根，非本批引入，建议挂账统一换种）。
+function seqIdGen(prefix: string) {
+  let n = 0
+  return { nextId: () => `${prefix}-${++n}` }
+}
+
+// 引擎直用 + 注入扩展仓储（= 门面装配同形态，委托默认开启）；顺序发号保证 harness 内 id 唯一
+function surrHarness(defineName: string, content: string, ext?: MemoryExtRepository) {
+  const repo = new MemoryRepository()
+  const engine = new EngineImpl(repo, undefined, seqIdGen('h'))
+  const e = ext ?? new MemoryExtRepository()
+  engine.setSurrogateRepository(e)
+  const def = seedSurrDefine(repo, defineName, content)
+  return { engine, repo, ext: e, def }
+}
+
+// 读回某节点进行中任务的**持久参与者行**（不看内存对象快照、不看待办空不空）
+async function doingActors(repo: MemoryRepository, instId: string, node: string): Promise<string[]> {
+  const doing = (await repo.findDoingTasks(instId)).filter(t => t.taskName === node)
+  assert.equal(doing.length, 1, `节点 ${node} 进行中任务数 = ${doing.length}, want 1`)
+  return repo.findTaskActors(doing[0].id)
+}
+
+/** 捕获 getSurrogate 真实入参的内存扩展仓储（条款 1.1「传出去必须 trim」的入参级断言用） */
+class CaptureExt extends MemoryExtRepository {
+  queries: Array<[string, string]> = []
+  async getSurrogate(operator: string, processName: string, at = new Date()) {
+    this.queries.push([operator, String(processName ?? '')])
+    return super.getSurrogate(operator, processName, at)
+  }
+}
+
+/** badId 定义行首读放行（start 取 content 必须成功），此后每次读抛错——模拟回落读定义行失败 */
+class FlakyDefineRepo extends MemoryRepository {
+  badId = ''
+  private reads = new Map<string, number>()
+  async findDefineById(id: string) {
+    const k = String(id)
+    const n = (this.reads.get(k) ?? 0) + 1
+    this.reads.set(k, n)
+    if (k === this.badId && n > 1) throw new Error('模拟定义行读取失败（含 content BLOB）')
+    return super.findDefineById(id)
+  }
+}
+
+/** 统计 findDefineById 次数（条款 1.1 尾注"逐次 execution 解析一次后复用"取证用） */
+class CountDefineRepo extends MemoryRepository {
+  defineReads = 0
+  async findDefineById(id: string) {
+    this.defineReads++
+    return super.findDefineById(id)
+  }
 }
