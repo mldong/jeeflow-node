@@ -1503,7 +1503,10 @@ function ccRowToMap(r: CcInstanceRow): Record<string, any> {
 /** 任务行：ext（任务变量，空回退实例变量）+ instanceExt + version */
 function taskRowToMap(r: TaskRow): Record<string, any> {
   const instanceExt = parseVarMap(r.instanceVariable)
-  const ext = Object.keys(r.variables ?? {}).length > 0 ? r.variables : instanceExt
+  // issues/121 P1：引擎建单必写的控制键不算「任务变量非空」，否则新建任务的 ext
+  // 永远不再回退实例变量（issues/82-3 既有契约）。
+  const userKeys = Object.keys(r.variables ?? {}).filter(k => k !== 'isFirstTaskNode')
+  const ext = userKeys.length > 0 ? r.variables : instanceExt
   return {
     id: r.id, processInstanceId: r.processInstanceId, taskName: r.taskName,
     displayName: r.displayName, taskType: r.taskType, performType: r.performType,
