@@ -1957,8 +1957,8 @@ describe('jeeflow compliance tests', () => {
     assert.equal(r3.code, 0, r3.msg)
     const rbTask1 = await doingTaskId(repo, rb, 'task1')
     assert.ok(rbTask1, 'ROLLBACK 应在 task1 产生新待办')
-    const rb1Actors = await repo.findTaskActors(rbTask1!)  // issues/121 P2 血缘版：复活行参与者＝该行办结人
-    assert.ok(rb1Actors.includes('leader') && !rb1Actors.includes('manager'),
+    const rb1Actors = await repo.findTaskActors(rbTask1!)  // issues/121 P2 血缘版：复活行参与者＝该行办结人
+    assert.ok(rb1Actors.includes('leader') && !rb1Actors.includes('manager'),
       `血缘版：复活行 actor 应为 task1 原办结人 leader，不该是执行回退的 manager：${rb1Actors}`)
     assert.equal((await repo.findInstanceById(rb))!.state, InstanceState.Doing, 'ROLLBACK 后实例应保持 DOING(10)')
 
@@ -3441,13 +3441,36 @@ class CountDefineRepo extends MemoryRepository {
 
 // ═══ issues/121 P2 退回上一步（血缘版）两格负向 ═══════════════════════════════
 describe('issues/121 P2 血缘回退负向：20010007 无血缘 / 20010008 守卫', () => {
-  it('首任务节点上退回 ⇒ 无血缘（parent 为 0）报 20010007，不得静默不建单', async () => {
+  it('首任务节点上退回 ⇒ 无血缘（parent 为 0 与 P1 之前老行的 undefined 两种形状）报 20010007', async () => {
     const { engine, repo, def } = surrHarness('lin07', surrFlowJson('lin07',
       [{ id: 'b1', assignee: 'ln-zhang' }, { id: 'b2', assignee: 'ln-wang' }]))
     const inst = await engine.startProcessInstanceById(def.id, 'ln-boss')
     const b1 = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'b1')!
     assert.equal(b1.parentTaskId ?? '0', '0', '前置条件：发起那条 parent 应为 0')
     await assert.rejects(() => engine.executeAndJumpTask(b1.id, 'ln-zhang', {}), /20010007/)
+
+    // 老行形状：P1 之前落的数据该列是 NULL（仓储读回 undefined），同样必须报错——
+    // 不能因为"取不到 parent"就静默走"什么都不建单"那条路。
+    // 另起一条实例：上一段那次退回已把这条 b1 办结（内存仓储无事务），复用它会先撞到"任务不在进行中"。
+    const inst2 = await engine.startProcessInstanceById(def.id, 'ln-boss')
+    const legacy = (await repo.findDoingTasks(inst2.id)).find(t => t.taskName === 'b1')!
+    legacy.parentTaskId = undefined
+    await repo.updateTask(legacy)
+    const beforeRollback = (await repo.findDoingTasks(inst2.id)).length
+    await assert.rejects(() => engine.executeAndJumpTask(legacy.id, 'ln-zhang', {}), /20010007/)
+    assert.ok((await repo.findDoingTasks(inst2.id)).length <= beforeRollback,
+      '报错即不建单：不该凭空多出进行中任务（内存仓储无事务，只断"不多"）')
+
+    // 第三种形状：parent 是个非 0 但**指不到真实行**的值（老数据被清理过 / 跨库迁过来）
+    // ⇒ 走"取不到历史行"那条分支，同样必须报 20010007，不得静默不建单
+    const inst3 = await engine.startProcessInstanceById(def.id, 'ln-boss')
+    const dangling = (await repo.findDoingTasks(inst3.id)).find(t => t.taskName === 'b1')!
+    dangling.parentTaskId = '9223372036854775807'
+    await repo.updateTask(dangling)
+    const before3 = (await repo.findDoingTasks(inst3.id)).length
+    await assert.rejects(() => engine.executeAndJumpTask(dangling.id, 'ln-zhang', {}), /20010007/)
+    assert.ok((await repo.findDoingTasks(inst3.id)).length <= before3,
+      '"取不到历史行"也不得静默不建单')
   })
 
   it('血缘前驱跨不过 fork（boot2 语义：遇 fork/join/start 跳过该入边不再深入）⇒ 报 20010008', async () => {
