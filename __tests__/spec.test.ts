@@ -2708,6 +2708,419 @@ describe('jeeflow compliance tests', () => {
   })
 })
 
+// ─────────────────────────────────────────────────────────────────────────────
+// issues/116 委托代理自动生效（引擎内置、默认开启）——内存仓路径
+// spec 06 §4.5 运行期语义 6 条 / spec 05 SurrogateInterceptor / 08 合规用例 26·27
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('issues/116 委托代理自动生效（引擎内置·内存仓路径）', () => {
+  // 标准装配链：门面构造时把扩展仓储注入引擎（集成方零配置即开启）
+  function setupExt() {
+    const { engine, repo } = setup()
+    const ext = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, ext)
+    return { engine, repo, ext, facade }
+  }
+
+  async function deploySimple(facade: JeeflowFacade): Promise<string> {
+    const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    const r = await facade.flow('processDefine/deploy', { content, operator: 'zhangsan' })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    return String(r.data.processDefineId)
+  }
+
+  const dayMs = 86400000
+
+  it('用例26 正向：窗口内配"张三→李四"→ 李四真的落进任务参与者，张三那行仍在', async () => {
+    const { engine, repo, facade } = setupExt()
+    const defineId = await deploySimple(facade)
+    // 张三→李四（精确流程名 simple）；leader→王五（空流程名 = 全流程兜底）
+    assert.equal((await facade.flow('processSurrogate/save', {
+      operator: 'zhangsan', surrogate: 'lisi', processName: 'simple',
+      startTime: fmtDt(new Date(Date.now() - dayMs)), endTime: fmtDt(new Date(Date.now() + dayMs)),
+    })).code, 0)
+    assert.equal((await facade.flow('processSurrogate/save', {
+      operator: 'leader', surrogate: 'wangwu', processName: '',
+    })).code, 0)
+    assert.ok(engine.isSurrogateEnabled(), '门面装配后默认开启')
+
+    const inst = await engine.startProcessInstanceById(defineId, 'zhangsan')
+    const apply = (await repo.findDoingTasks(inst.id))[0]
+    assert.equal(apply.taskName, 'apply')
+    // ① 落库读回（不是内存对象快照）：任务参与者 = 授权人 + 代理人
+    assert.deepEqual(await repo.findTaskActors(apply.id), ['zhangsan', 'lisi'],
+      '李四应在 actor 表真有一行，且张三那行仍在（委托不摘原人）')
+    // ② 代理人待办分页真能查到该单（读回值，非"doing 列表为空"式空断言）
+    const todoLi = await repo.pageTodoTasks(1, 50, 'lisi')
+    assert.ok(todoLi.rows.some(t => t.id === apply.id), '李四待办应出现该单')
+    assert.ok((await repo.pageTodoTasks(1, 50, 'zhangsan')).rows.some(t => t.id === apply.id),
+      '张三待办应保留（任一可办）')
+
+    // ③ 代理人直接办结（鉴权走 actorIds 读回值 → 委托真的能办，不只是多一行数据）
+    await engine.executeProcessTask(apply.id, 'lisi')
+    const task1 = (await repo.findDoingTasks(inst.id))[0]
+    assert.equal(task1.taskName, 'task1', '李四办结 apply 后流程应推进')
+    // ④ 第二跳：空 processName 全流程兜底委托也在建单那一刻并入（判据 a）
+    assert.deepEqual(await repo.findTaskActors(task1.id), ['leader', 'wangwu'],
+      '空 processName 兜底委托应在建单时并入（判据 a）')
+    // ⑤ 二级代理人办结 → 流程走完（端到端证明"并入的人可办且办得掉"）
+    await engine.executeProcessTask(task1.id, 'wangwu')
+    const done = await repo.findInstanceById(inst.id)
+    assert.equal(done?.state, InstanceState.Done, '代理人办完两级后流程应结束')
+  })
+
+  it('用例26 负向：窗外 / enabled=0 / 自委托 → 代理人无行', async () => {
+    const { engine, repo, ext, facade } = setupExt()
+    const defineId = await deploySimple(facade)
+    // 窗外（已结束）
+    await facade.flow('processSurrogate/save', {
+      operator: 'zhangsan', surrogate: 'agent-expired', processName: 'simple',
+      startTime: fmtDt(new Date(Date.now() - 3 * dayMs)), endTime: fmtDt(new Date(Date.now() - 2 * dayMs)),
+    })
+    // 未开始
+    await facade.flow('processSurrogate/save', {
+      operator: 'leader', surrogate: 'agent-future', processName: 'simple',
+      startTime: fmtDt(new Date(Date.now() + 2 * dayMs)), endTime: fmtDt(new Date(Date.now() + 3 * dayMs)),
+    })
+    // enabled=0（停用）
+    await facade.flow('processSurrogate/save', {
+      operator: 'lisi', surrogate: 'agent-off', processName: 'simple', enabled: 0,
+    })
+    // 自委托：自己委托给自己
+    await facade.flow('processSurrogate/save', {
+      operator: 'wangwu', surrogate: 'wangwu', processName: 'simple',
+    })
+
+    // 窗外 / 未到窗：建单读回仍是原参与者
+    const inst = await engine.startProcessInstanceById(defineId, 'zhangsan')
+    const apply = (await repo.findDoingTasks(inst.id))[0]
+    assert.deepEqual(await repo.findTaskActors(apply.id), ['zhangsan'], '窗外委托不应并入（判据 b）')
+    await engine.executeProcessTask(apply.id, 'zhangsan')
+    const task1 = (await repo.findDoingTasks(inst.id))[0]
+    assert.equal(task1.taskName, 'task1')
+    assert.deepEqual(await repo.findTaskActors(task1.id), ['leader'], '未到窗委托不应并入（判据 b）')
+
+    // enabled=0 + 自委托：把两人直接做成参与人，确证两条委托都没并进来新行
+    const inst2 = await engine.startProcessInstanceById(defineId, 'lisi', {
+      tf_nextNodeOperator: 'lisi,wangwu',
+    })
+    const apply2 = (await repo.findDoingTasks(inst2.id))[0]
+    assert.deepEqual(await repo.findTaskActors(apply2.id), ['lisi', 'wangwu'],
+      'enabled=0 与自委托均不得并入（判据 c/d）')
+    // 仓储侧同口径复核（同一条数据在查询层也不该命中）
+    assert.equal(await ext.getSurrogate('lisi', 'simple'), null, 'enabled=0 仓储侧也不生效')
+    assert.equal(await ext.getSurrogate('wangwu', 'simple'), null, '自委托仓储侧也不生效')
+  })
+
+  it('用例26 静默跳过：未配置扩展仓储 → 建单不被打断', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, undefined)
+    assert.equal(engine.isSurrogateEnabled(), false, '未注入查询源 → 委托能力未启用')
+    const defineId = await deploySimple(facade)
+    const r = await facade.flow('processInstance/startAndExecute', {
+      processDefineId: defineId, operator: 'zhangsan',
+    })
+    assert.equal(r.code, 0, `缺扩展仓储不得打断建单: ${JSON.stringify(r)}`)
+    const inst = await repo.findInstanceById(String(r.data.processInstanceId))
+    const doing = await repo.findDoingTasks(inst!.id)
+    assert.ok(doing.length > 0, '实例应正常推进到待办节点')
+    assert.deepEqual(await repo.findTaskActors(doing[0].id), ['leader'], '参与者原样（无代理人）')
+  })
+
+  it('用例26 静默跳过：查询源抛错也只跳过该参与人，不打断建单', async () => {
+    const { engine, repo } = setup()
+    engine.setSurrogateRepository({
+      getSurrogate: async (op: string) => {
+        if (op === 'leader') throw new Error('模拟委托表不存在')
+        return null
+      },
+    })
+    const defineId = await deploySimple(new JeeflowFacade(engine, repo))
+    const inst = await engine.startProcessInstanceById(defineId, 'zhangsan')
+    const apply = (await repo.findDoingTasks(inst.id))[0]
+    await engine.executeProcessTask(apply.id, 'zhangsan')
+    const task1 = (await repo.findDoingTasks(inst.id))[0]
+    assert.equal(task1.taskName, 'task1', '委托查询异常不应中断流程推进')
+    assert.deepEqual(await repo.findTaskActors(task1.id), ['leader'])
+  })
+
+  it('用例26 显式关闭：三条关闭路均回到"仅台账"（委托行仍在，只是运行期不并入）', async () => {
+    // 路 1：开关 setSurrogateEnabled(false)
+    {
+      const { engine, repo, ext, facade } = setupExt()
+      const defineId = await deploySimple(facade)
+      await facade.flow('processSurrogate/save', { operator: 'zhangsan', surrogate: 'lisi', processName: 'simple' })
+      engine.setSurrogateEnabled(false)
+      assert.equal(engine.isSurrogateEnabled(), false)
+      const inst = await engine.startProcessInstanceById(defineId, 'zhangsan')
+      const apply = (await repo.findDoingTasks(inst.id))[0]
+      assert.deepEqual(await repo.findTaskActors(apply.id), ['zhangsan'], '关闭后不并入代理人')
+      const [rows] = await ext.pageSurrogates(1, 10, { operator: 'zhangsan' })
+      assert.equal(rows.length, 1, '关闭只关运行期，台账仍在（processSurrogate/* 不受影响）')
+    }
+    // 路 2：摘掉查询源 setSurrogateRepository(null)
+    {
+      const { engine, repo, facade } = setupExt()
+      const defineId = await deploySimple(facade)
+      await facade.flow('processSurrogate/save', { operator: 'zhangsan', surrogate: 'lisi', processName: 'simple' })
+      engine.setSurrogateRepository(null)
+      const inst = await engine.startProcessInstanceById(defineId, 'zhangsan')
+      assert.deepEqual(await repo.findTaskActors((await repo.findDoingTasks(inst.id))[0].id), ['zhangsan'])
+    }
+    // 路 3：注册空实现（只覆盖 getSurrogate）
+    {
+      const { engine, repo, facade } = setupExt()
+      const defineId = await deploySimple(facade)
+      await facade.flow('processSurrogate/save', { operator: 'zhangsan', surrogate: 'lisi', processName: 'simple' })
+      engine.setSurrogateRepository({ getSurrogate: async () => null })
+      const inst = await engine.startProcessInstanceById(defineId, 'zhangsan')
+      assert.deepEqual(await repo.findTaskActors((await repo.findDoingTasks(inst.id))[0].id), ['zhangsan'])
+    }
+    // 路 4：构造参数形态
+    {
+      const { repo, ext } = setupExt()
+      const engine2 = new EngineImpl(repo, undefined, undefined, undefined, { surrogateRepository: ext, surrogateEnabled: false })
+      const facade2 = new JeeflowFacade(engine2, repo, ext)
+      const defineId = await deploySimple(facade2)
+      await facade2.flow('processSurrogate/save', { operator: 'zhangsan', surrogate: 'lisi', processName: 'simple' })
+      const inst = await engine2.startProcessInstanceById(defineId, 'zhangsan')
+      assert.deepEqual(await repo.findTaskActors((await repo.findDoingTasks(inst.id))[0].id), ['zhangsan'],
+        '构造参数 surrogateEnabled:false 应压过门面自动装配')
+    }
+  })
+
+  it('多参与人任务：每人各自的代理人并入同一任务且去重（委托不新增会签成员）', async () => {
+    const { engine, repo, facade } = setupExt()
+    const defineId = await deploySimple(facade)
+    await facade.flow('processSurrogate/save', { operator: 'zhangsan', surrogate: 'agent1', processName: 'simple' })
+    await facade.flow('processSurrogate/save', { operator: 'leader', surrogate: 'agent1', processName: 'simple' })
+    await facade.flow('processSurrogate/save', { operator: 'lisi', surrogate: 'agent2', processName: 'simple' })
+    const inst = await engine.startProcessInstanceById(defineId, 'zhangsan', {
+      tf_nextNodeOperator: 'zhangsan,leader,lisi',
+    })
+    const apply = (await repo.findDoingTasks(inst.id))[0]
+    assert.deepEqual(await repo.findTaskActors(apply.id),
+      ['zhangsan', 'leader', 'lisi', 'agent1', 'agent2'],
+      '原参与人顺序不变，代理人按序追加且同名去重')
+  })
+
+  it('用例27 判据 a~d（内存仓）：空流程名兜底 / 时间窗 NULL 不限 / 自委托过滤 / enabled 只认 1', async () => {
+    const ext = new MemoryExtRepository()
+    const put = async (id: string, s: any) => {
+      await ext.saveSurrogate({ id, createTime: new Date(), createUser: 't', updateTime: new Date(), updateUser: 't', ...s } as any)
+    }
+    // d：enabled 脏值一律不启用（'1' 与 1 同结论，与 SQL 侧 INT 列一致）
+    await put('1', { operator: 'opD', surrogate: 'aTrue', enabled: 1, processName: 'p' })
+    await put('2', { operator: 'opD', surrogate: 'aStr', enabled: '1', processName: 'p2' })
+    await put('3', { operator: 'opD', surrogate: 'aAbc', enabled: 'abc', processName: 'p3' })
+    await put('4', { operator: 'opD', surrogate: 'aBool', enabled: true as any, processName: 'p4' })
+    await put('5', { operator: 'opD', surrogate: 'aNum', enabled: 2, processName: 'p5' })
+    await put('6', { operator: 'opD', surrogate: 'aNull', enabled: null as any, processName: 'p6' })
+    assert.equal((await ext.getSurrogate('opD', 'p'))?.surrogate, 'aTrue', 'enabled=1 生效')
+    assert.equal((await ext.getSurrogate('opD', 'p2'))?.surrogate, 'aStr', "enabled='1' 与整数 1 同结论")
+    for (const pn of ['p3', 'p4', 'p5', 'p6']) {
+      assert.equal(await ext.getSurrogate('opD', pn), null, `脏值 enabled 不得当启用（${pn}）`)
+    }
+    // c：自委托过滤
+    await put('10', { operator: 'opC', surrogate: 'opC', enabled: 1, processName: 'p' })
+    assert.equal(await ext.getSurrogate('opC', 'p'), null, '自己委托给自己不生效')
+    // b：时间窗任一侧 NULL = 该侧不限；字符串窗与 Date 窗同结论
+    await put('20', { operator: 'opB', surrogate: 'bOpen', enabled: 1, processName: 'open', startTime: '2000-01-01 00:00:00' })
+    await put('21', { operator: 'opB', surrogate: 'bPast', enabled: 1, processName: 'past', endTime: new Date(Date.now() - dayMs) })
+    await put('22', { operator: 'opB', surrogate: 'bFuture', enabled: 1, processName: 'future', startTime: new Date(Date.now() + dayMs) })
+    await put('23', { operator: 'opB', surrogate: 'bBoth', enabled: 1, processName: 'both',
+      startTime: new Date(Date.now() - dayMs), endTime: new Date(Date.now() + dayMs) })
+    assert.equal((await ext.getSurrogate('opB', 'open'))?.surrogate, 'bOpen', 'start 有值 end NULL = 结束侧不限')
+    assert.equal(await ext.getSurrogate('opB', 'past'), null, '已过窗不生效')
+    assert.equal(await ext.getSurrogate('opB', 'future'), null, '未到窗不生效')
+    assert.equal((await ext.getSurrogate('opB', 'both'))?.surrogate, 'bBoth', '窗内生效')
+    // a：精确命中优先于全流程兜底；无精确命中时用兜底
+    await put('30', { operator: 'opA', surrogate: 'global', enabled: 1, processName: '' })
+    await put('31', { operator: 'opA', surrogate: 'exact', enabled: 1, processName: 'special' })
+    assert.equal((await ext.getSurrogate('opA', 'special'))?.surrogate, 'exact', '精确流程优先')
+    assert.equal((await ext.getSurrogate('opA', 'other'))?.surrogate, 'global', '其它流程走全流程兜底')
+    assert.equal((await ext.getSurrogate('opA', ''))?.surrogate, 'global', '引擎拿不到流程名时仍走兜底')
+    // 多条兜底命中取最新（与 SQL 侧 ORDER BY id DESC LIMIT 1 同结论）
+    await put('40', { operator: 'opZ', surrogate: 'globalOld', enabled: 1, processName: null })
+    await put('41', { operator: 'opZ', surrogate: 'globalNew', enabled: 1, processName: '' })
+    assert.equal((await ext.getSurrogate('opZ', 'anything'))?.surrogate, 'globalNew', '多条兜底取 id 最大')
+    // NULL process_name 也算全流程兜底
+    assert.equal((await ext.getSurrogate('opZ', 'anything'))?.surrogate, 'globalNew')
+    assert.equal(await ext.getSurrogate('nobody', 'x'), null, '无授权人记录 → null')
+  })
+
+  // ── 逐条契约补测：1.1 取值口径 / 1.2 不级联 / 1 建单路径全覆盖 / 1.3 名册 / 1.4 id 最大 ──
+
+  /** 直接写台账（跳过门面），便于构造乱序 id、脏 enabled 等边界行 */
+  async function putSur(ext: MemoryExtRepository, s: Record<string, any>) {
+    await ext.saveSurrogate({
+      id: '', processName: '', enabled: 1, createTime: new Date(), createUser: 't',
+      updateTime: new Date(), updateUser: 't', ...s,
+    } as any)
+  }
+
+  it('契约 1.1 取值口径：define.name ≠ 模型 name 时取模型 name（诱饵行钉住）', async () => {
+    const { engine, repo } = setup()
+    const ext = new MemoryExtRepository()
+    engine.setSurrogateRepository(ext)
+    // loadFlow 直接落库：define.name = 文件名，而模型 JSON 的 name = 'simple'（两者刻意不同）
+    const def = loadFlow(repo, '01-simple.json')
+    assert.notEqual(String(def.name), 'simple', '诱饵前提：define.name 必须 ≠ 流程模型 name')
+    await putSur(ext, { operator: 'applicant', surrogate: 'agentModel', processName: 'simple' })
+    await putSur(ext, { operator: 'leader', surrogate: 'agentDefine', processName: String(def.name) })
+
+    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    const apply = (await repo.findDoingTasks(inst.id))[0]
+    assert.deepEqual(await repo.findTaskActors(apply.id), ['applicant', 'agentModel'],
+      '必须按流程模型 name 命中（内置版 SurrogateInterceptor 用 processModel.getName() 的迁移基线）')
+    await engine.executeProcessTask(apply.id, 'applicant')
+    const task1 = (await repo.findDoingTasks(inst.id))[0]
+    assert.deepEqual(await repo.findTaskActors(task1.id), ['leader'],
+      '挂在 define.name 那一头的委托不得命中（本栈若改回取 define.name，此断言即红）')
+  })
+
+  it('契约 1.1 回落：模型未带 name 时才用 wf_process_define.name', async () => {
+    const { engine, repo } = setup()
+    const ext = new MemoryExtRepository()
+    engine.setSurrogateRepository(ext)
+    const def = loadFlow(repo, '01-simple.json')
+    const bare = JSON.parse(String(def.content))
+    delete bare.name
+    def.content = JSON.stringify(bare)          // 模型不带 name（addDefine 存同一对象引用）
+    def.name = 'define-only-name'
+    await putSur(ext, { operator: 'applicant', surrogate: 'agentFallback', processName: 'define-only-name' })
+    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    assert.deepEqual(await repo.findTaskActors((await repo.findDoingTasks(inst.id))[0].id),
+      ['applicant', 'agentFallback'],
+      '模型未带 name 时必须回落 define.name（否则内置版配的委托迁到 jeeflow 就永远命中不上）')
+  })
+
+  it('契约 1.2 不级联：A→B 且 B→C 时 C 不进参与者（环状 A→B→C→A 也不死循环）', async () => {
+    const { engine, repo } = setup()
+    const ext = new MemoryExtRepository()
+    engine.setSurrogateRepository(ext)
+    const def = loadFlow(repo, '01-simple.json')
+    await putSur(ext, { operator: 'applicant', surrogate: 'agentB', processName: 'simple' })
+    await putSur(ext, { operator: 'agentB', surrogate: 'agentC', processName: 'simple' })
+    await putSur(ext, { operator: 'agentC', surrogate: 'applicant', processName: 'simple' })
+    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    const apply = (await repo.findDoingTasks(inst.id))[0]
+    assert.deepEqual(await repo.findTaskActors(apply.id), ['applicant', 'agentB'],
+      '只对建单那一刻的原始参与者快照逐个查一次委托，代理人自身的委托不展开')
+    assert.equal((await repo.pageTodoTasks(1, 50, 'agentC')).rows.length, 0, 'C 不得因环状委托收到该单')
+  })
+
+  it('条款 1 覆盖：串行会签每一步推进出的新单都并入（且 1.3 不改投票名册）', async () => {
+    const { engine, repo } = setup()
+    const ext = new MemoryExtRepository()
+    engine.setSurrogateRepository(ext)
+    const def = loadFlow(repo, '06-countersign-sequential.json')   // 模型 name = countersign-sequential
+    assert.notEqual(String(def.name), 'countersign-sequential', '诱饵前提：两仓名不同')
+    await putSur(ext, { operator: 'userA', surrogate: 'agentA', processName: 'countersign-sequential' })
+    await putSur(ext, { operator: 'userB', surrogate: 'agentB', processName: 'countersign-sequential' })
+
+    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    const apply = (await repo.findDoingTasks(inst.id))[0]
+    await engine.executeProcessTask(apply.id, 'applicant')
+
+    let doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing.length, 1, '串行会签一步一人')
+    const step1 = doing[0]
+    assert.deepEqual(await repo.findTaskActors(step1.id), ['userA', 'agentA'], '第一步并入 userA 的代理人')
+    assert.deepEqual((await repo.findTaskById(step1.id))!.variables['operatorList_task1'], ['userA', 'userB'],
+      '条款 1.3：代理人只进当一步任务，不得扩会签投票名册（否则改票数）')
+
+    // 推进会出第二步任务——这条路径最容易漏（只挂"发起"一处即红）
+    await engine.executeProcessTask(step1.id, 'userA')
+    doing = await repo.findDoingTasks(inst.id)
+    const step2 = doing[0]
+    assert.equal(step2.taskName, 'task1')
+    assert.deepEqual(await repo.findTaskActors(step2.id), ['userB', 'agentB'], '串行会签第二步也要并入代理人')
+    assert.deepEqual((await repo.findTaskById(step2.id))!.variables['operatorList_task1'], ['userA', 'userB'],
+      '条款 1.3：推进出的新单同样不改名册')
+    await engine.executeProcessTask(step2.id, 'userB')
+    assert.equal((await repo.findInstanceById(inst.id))!.state, InstanceState.Done, '两步走完流程应结束')
+  })
+
+  it('条款 1 覆盖：跳转两条路径（ROLLBACK 回上一节点 / JUMP 指定节点）建的新单都并入', async () => {
+    const { engine, repo } = setup()
+    const ext = new MemoryExtRepository()
+    engine.setSurrogateRepository(ext)
+    const def = loadFlow(repo, '02-multi-task.json')               // 模型 name = multi-task
+    await putSur(ext, { operator: 'leader', surrogate: 'agentLeader', processName: 'multi-task' })
+    await putSur(ext, { operator: 'manager', surrogate: 'agentManager', processName: 'multi-task' })
+
+    const inst = await engine.startProcessInstanceById(def.id, 'applicant')
+    const apply = (await repo.findDoingTasks(inst.id))[0]
+    await engine.executeProcessTask(apply.id, 'applicant')
+    const task1 = (await repo.findDoingTasks(inst.id))[0]
+    assert.deepEqual(await repo.findTaskActors(task1.id), ['leader', 'agentLeader'], '正向推进：task1 并入')
+
+    // ROLLBACK（无 target → 回上一节点 apply，新单 actor = 当前任务完成人 leader）
+    await engine.executeAndJumpTask(task1.id, 'leader')
+    const back = (await repo.findDoingTasks(inst.id))[0]
+    assert.equal(back.taskName, 'apply', 'ROLLBACK 应回到上一任务节点')
+    assert.deepEqual(await repo.findTaskActors(back.id), ['leader', 'agentLeader'],
+      'ROLLBACK 建单路径（createTaskWithActors）也要并入')
+
+    // JUMP（指定 target task2，actor = manager）
+    await engine.executeAndJumpTask(back.id, 'leader', {}, 'task2')
+    const t2 = (await repo.findDoingTasks(inst.id))[0]
+    assert.equal(t2.taskName, 'task2')
+    assert.deepEqual(await repo.findTaskActors(t2.id), ['manager', 'agentManager'],
+      'JUMP 建单路径（executeNode→createTask）也要并入')
+  })
+
+  it('条款 1.4 多条命中取 id 最大：乱序写入 / 雪花 19 位都不被 Map 插入序带跑', async () => {
+    const ext = new MemoryExtRepository()
+    // ① 先大后小：取"遍历末条"会选成 small，SQL 侧 ORDER BY id DESC 选 big
+    await putSur(ext, { id: '900', operator: 'opOrd', surrogate: 'big' })
+    await putSur(ext, { id: '100', operator: 'opOrd', surrogate: 'small' })
+    assert.equal((await ext.getSurrogate('opOrd', 'x'))?.surrogate, 'big', '全流程兜底组：取 id 最大')
+    // ② 先小后大：同样必须选 big（与 ① 合起来才排除"插入序"）
+    await putSur(ext, { id: '100', operator: 'opAsc', surrogate: 'small' })
+    await putSur(ext, { id: '900', operator: 'opAsc', surrogate: 'big' })
+    assert.equal((await ext.getSurrogate('opAsc', 'x'))?.surrogate, 'big', '兜底组反向：仍取 id 最大')
+    // ③ 精确组同样按 id 最大
+    await putSur(ext, { id: '900', operator: 'opEx', surrogate: 'exBig', processName: 'p' })
+    await putSur(ext, { id: '100', operator: 'opEx', surrogate: 'exSmall', processName: 'p' })
+    assert.equal((await ext.getSurrogate('opEx', 'p'))?.surrogate, 'exBig', '精确组：取 id 最大')
+    // ④ 雪花 19 位：Number 精度下两者相等，只有按数值（BigInt）比才能给对，对齐 BIGINT 列
+    await putSur(ext, { id: '1827345678901234567', operator: 'opSf', surrogate: 'sfOld' })
+    await putSur(ext, { id: '1827345678901234568', operator: 'opSf', surrogate: 'sfNew' })
+    assert.equal((await ext.getSurrogate('opSf', 'anything'))?.surrogate, 'sfNew',
+      '雪花 id 必须按数值比大小（Number 精度会塌成相等而错选首条）')
+  })
+
+  it('条款 5 判据 d 写侧：脏 enabled 归 0 落库且不打断保存（读回持久值）', async () => {
+    const { engine, repo, ext, facade } = setupExt()
+    const defineId = await deploySimple(facade)
+    const r = await facade.flow('processSurrogate/save', {
+      operator: 'zhangsan', surrogate: 'lisi', processName: 'simple', enabled: 'abc',
+    })
+    assert.equal(r.code, 0, `脏 enabled 不得报错打断保存: ${JSON.stringify(r)}`)
+    assert.equal(Number((await facade.flow('processSurrogate/detail', { id: r.data.id })).data.enabled), 0,
+      '脏值必须按停用落库（持久值读回）')
+    assert.equal(await ext.getSurrogate('zhangsan', 'simple'), null, '脏值行仓储侧也不命中')
+    const inst = await engine.startProcessInstanceById(defineId, 'zhangsan')
+    assert.deepEqual(await repo.findTaskActors((await repo.findDoingTasks(inst.id))[0].id), ['zhangsan'],
+      '脏值委托不得并入（不得默认当启用）')
+    // 未传 = 契约默认 1；布尔 true/false 不算脏值
+    const r2 = await facade.flow('processSurrogate/save', { operator: 'lisi', surrogate: 'agent2', processName: 'simple' })
+    assert.equal(Number((await facade.flow('processSurrogate/detail', { id: r2.data.id })).data.enabled), 1,
+      '未传 enabled 应落契约默认 1')
+    const r3 = await facade.flow('processSurrogate/save', {
+      operator: 'wangwu', surrogate: 'agent3', processName: 'simple', enabled: false,
+    })
+    assert.equal(Number((await facade.flow('processSurrogate/detail', { id: r3.data.id })).data.enabled), 0,
+      'enabled:false 应落 0')
+    const r4 = await facade.flow('processSurrogate/update', { id: r.data.id, operator: 'zhangsan', surrogate: 'lisi', processName: 'simple', enabled: '1' })
+    assert.equal(r4.code, 0, JSON.stringify(r4))
+    assert.equal(Number((await facade.flow('processSurrogate/detail', { id: r.data.id })).data.enabled), 1,
+      "'1' 可解析为整数 1，应与整数 1 同结论")
+  })
+})
+
 function fmtDt(d: Date): string {
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`

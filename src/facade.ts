@@ -35,7 +35,13 @@ export class JeeflowFacade {
     private readonly engine: EngineImpl,
     private readonly repo: ProcessRepository,
     private readonly extRepo?: ProcessExtRepository,
-  ) {}
+  ) {
+    // issues/116：标准装配链下「委托代理自动生效」由引擎内置并默认开启——
+    // 传入了扩展仓储就把它交给引擎（集成方无需再手工注册拦截器）。
+    // 关闭：engine.setSurrogateEnabled(false) / engine.setSurrogateRepository(null)。
+    // engine 允许为 null（纯统计门面用法），此时无引擎可装配，跳过。
+    if (extRepo && this.engine) this.engine.setSurrogateRepository(extRepo)
+  }
 
   /** 注入业务数据读取器（issue 30）：需有 readByProcessInstance(tableName, processInstanceId) */
   setMetaReader(reader: { readByProcessInstance(tableName: string, processInstanceId: unknown): unknown }): this {
@@ -647,7 +653,9 @@ export class JeeflowFacade {
     s.surrogate = String(args.surrogate ?? '')
     s.startTime = parseSurrogateTime(args.startTime)
     s.endTime = parseSurrogateTime(args.endTime)
-    s.enabled = args.enabled != null ? toInt(args.enabled) : 1
+    // issues/116 判据 d 的**写侧**：脏值不得默认当启用（此前走 toInt 遇 'abc' 直接抛
+    // 「数值缺失或非法」→ 门面 500，与 Java toInt(x,0) / Go parseSurrogateEnabled 分叉）
+    s.enabled = parseSurrogateEnabled(args.enabled)
     s.updateUser = operator
   }
 
@@ -1427,6 +1435,24 @@ function parseSurrogateTime(v: any): Date | undefined {
   // 兜底：交给 Date 解析（覆盖其它可解析形态），失败返回 undefined
   const d = new Date(s)
   return isNaN(d.getTime()) ? undefined : d
+}
+
+/**
+ * issues/116 判据 d 的写侧：委托启用位解析（processSurrogate/save 与 /update 共用）。
+ * 契约「enabled 只有 1 生效，脏值不得默认当启用」——所以：
+ *   - 未传（null/undefined）→ 1，契约默认启用（06 §4.5 save 参数表 enabled 可省）；
+ *   - 布尔 → true=1 / false=0（前端开关组件偶发传布尔，不算脏值）；
+ *   - 传了但不可解析为整数（'abc' / {} / NaN / 空串）→ **0 停用**落库，不抛错打断保存。
+ * 对齐 Java `toInt(arg, 0)` / Go `parseSurrogateEnabled`；此前本栈走 `toInt(arg)`，
+ * 脏值直接抛「数值缺失或非法」（门面 500），与其余各栈"落 0"行为分叉。
+ */
+function parseSurrogateEnabled(v: any): number {
+  if (v == null) return 1
+  if (typeof v === 'boolean') return v ? 1 : 0
+  const s = typeof v === 'string' ? v.trim() : v
+  if (s === '' || s == null) return 0
+  const n = Number(s)
+  return Number.isInteger(n) ? n : 0
 }
 
 function designRowToMap(r: ProcessDesign): Record<string, any> {

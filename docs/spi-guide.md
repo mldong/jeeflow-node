@@ -146,5 +146,33 @@ deploy 自动版本管理，execute 按 submitType 全分发，操作人由 `arg
 三张扩展表（wf_process_design / design_his / surrogate）SQL 已随 schema 分发
 （`schema-<db>.sql`，维护源 jeeflow-java resources）。
 
+### 委托代理运行期自动生效（issues/116，spec 05/06 定为 v1.9.0 起引擎内置）
+
+`processSurrogate/*` 五个 action 只是**台账 CRUD**；真正的能力是**建单那一刻**由引擎对每个参与者
+查一次生效委托，命中则把代理人**并入该任务的参与者集合**（随任务一起落 `wf_process_task_actor`，
+授权人保留、任一可办——委托不是转办）。见 spec 06 §4.5 运行期语义。
+
+装配链零配置即生效：`new JeeflowFacade(engine, repo, extRepo)` 会把 `extRepo` 注入引擎的委托查询面。
+
+- **未配置扩展仓储 → 静默跳过**，不抛错、不打断建单（委托是增强能力，缺仓储属正常部署形态）
+- **显式关闭**（任选一条，关闭后回到"仅台账"）：
+  - `engine.setSurrogateEnabled(false)` —— 开关（默认为开）
+  - `engine.setSurrogateRepository(null)` —— 摘掉查询源
+  - `engine.setSurrogateRepository({ getSurrogate: async () => null })` —— 注册空实现
+  - 构造参数形态：`new EngineImpl(repo, userProv, idGen, exprEval, { surrogateRepository: ext, surrogateEnabled: false })`
+  - 只读自检：`engine.isSurrogateEnabled()`
+- **查询判据（内存仓与 SQL 仓必须同结论）**：空 `processName` 全流程兜底（先精确后兜底）/
+  时间窗 `start<=now<=end`（任一侧空 = 该侧不限）/ `surrogate <> operator` 自委托过滤 /
+  `enabled` 只认 1（脏值不当启用，**门面写侧也把脏值归 0 落库**）
+- **多条命中取主键 id 最大一条**（判据 1.4）：SQL 侧 `ORDER BY id DESC LIMIT 1`，内存侧显式比 id
+  （雪花串按 BigInt 比数值），**不得按 Map 插入序取首条/末条**——乱序写入时两仓结论就分叉了
+- **`processName` 取值口径**（判据 1.1）：以**流程模型 `name`**（流程 JSON）为准，模型未带时才回落
+  `wf_process_define.name`。内置版（mldong-wf）的 `SurrogateInterceptor` 用的正是
+  `execution.getProcessModel().getName()`，用户在内置版配的委托迁到 jeeflow 才命中得同一条
+- **不级联**：只对建单那一刻的原始参与者快照逐个查一次，代理人自身的委托不展开（环状委托不死循环）
+
+> 会签节点的成员列表（`operatorList_` / `nrOfInstances_`）**不含**代理人——委托只在该成员的任务上
+> 追加参与人，不新增会签成员。委托在 todoList 的合并展示仍是集成方视图层职责（spec 05）。
+
 > 分页说明（v1.1.0）：核心表分页 SPI（pageDefines/pageTodoTasks 等）目前 Java 提供，
 > 本语言对应分页 action 返回明确错误，计划 1.2.0 补齐；设计/委托分页全支持。

@@ -4,7 +4,7 @@ import {
   ProcessInstance, type ProcessTask, type ProcessDefine,
   InstanceState, TaskState, SubmitType,
 } from './model.js'
-import type { ProcessRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
+import type { ProcessRepository, ProcessExtRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
 import { type EngineExtensions, type FlowInterceptor, type AssignmentHandler, type DecisionHandler, type ProcessEventListener, EventType, type ProcessEvent } from './extensions.js'
 import { HandlerRegistry } from './registry.js'
 
@@ -34,16 +34,96 @@ export interface Engine {
   executeAndJumpToFirstTaskNode(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
 }
 
+/**
+ * 委托代理自动生效的注入面（issues/116）——只需要 getSurrogate 一侧能力，
+ * 完整 ProcessExtRepository 天然满足；传 `{ getSurrogate: async () => null }`
+ * 即为"注册空实现"关闭形态。
+ */
+export type SurrogateLookup = Pick<ProcessExtRepository, 'getSurrogate'>
+
+/** 引擎委托配置（构造参数与 setSurrogateOptions 共用同一形状） */
+export interface EngineOptions {
+  /** 委托查询源；不传 = 未配置扩展仓储 → 引擎静默跳过委托（不打断建单） */
+  surrogateRepository?: SurrogateLookup | null
+  /** 委托自动生效开关，**默认 true（引擎内置开启）**；显式传 false → 回到"仅台账"行为 */
+  surrogateEnabled?: boolean
+}
+
 export class EngineImpl implements Engine {
   private ext?: EngineExtensions
   private registry?: HandlerRegistry
+  // issues/116：委托代理自动生效——内置能力，注入查询源后默认开启
+  private surrogateRepo?: SurrogateLookup | null
+  private surrogateOn = true
 
   constructor(
     private repo: ProcessRepository,
     private userProv?: UserProvider,
     private idGen?: IDGenerator,
     private exprEval?: ExpressionEvaluator,
-  ) {}
+    opts?: EngineOptions,
+  ) {
+    if (opts?.surrogateRepository !== undefined) this.surrogateRepo = opts.surrogateRepository
+    if (opts?.surrogateEnabled !== undefined) this.surrogateOn = opts.surrogateEnabled
+  }
+
+  /**
+   * issues/116：注入/摘除委托查询源（ProcessExtRepository 或任何实现 getSurrogate 的对象）。
+   * 传 null 摘除 = 关闭委托自动生效（回到"仅台账"）。不影响已设置的开关。
+   */
+  setSurrogateRepository(repo: SurrogateLookup | null): this {
+    this.surrogateRepo = repo
+    return this
+  }
+
+  /**
+   * issues/116：委托自动生效开关（**默认开启**）。传 false 显式关闭 → 建单不再并入代理人。
+   */
+  setSurrogateEnabled(enabled: boolean): this {
+    this.surrogateOn = enabled
+    return this
+  }
+
+  /** issues/116：组合设置（与构造参数同形状），未给的字段保持现状 */
+  setSurrogateOptions(opts: EngineOptions): this {
+    if (opts.surrogateRepository !== undefined) this.surrogateRepo = opts.surrogateRepository
+    if (opts.surrogateEnabled !== undefined) this.surrogateOn = opts.surrogateEnabled
+    return this
+  }
+
+  /** 委托自动生效当前是否启用（只读，供集成层自检/测试用） */
+  isSurrogateEnabled(): boolean {
+    return this.surrogateOn && this.surrogateRepo != null
+  }
+
+  /** defineId → wf_process_define.name 缓存（仅"模型未带 name"的回落路径用得到） */
+  private defineNameCache = new Map<string, string>()
+
+  /**
+   * issues/116 契约 1.1：委托查询的 processName **以流程模型 name 为准**
+   * （迁移基线 = 内置版 SurrogateInterceptor 取的 `execution.getProcessModel().getName()`），
+   * 模型未带 name（缺失/空串/纯空白）时才回落 `wf_process_define.name`。
+   * 正常 deploy 两者恒等（saveDeployedDefine 执行 `def.name = flow.name`），但直接落库的
+   * 定义（测试 loadFlow、集成方自带导入链路）会不一致——取错那一头，用户在内置版配的
+   * 委托迁到 jeeflow 后就不再命中。对齐 Go `EngineImpl.surrogateProcessName` 同判据同姿势。
+   */
+  private async surrogateProcessName(flow: FlowModel, inst: ProcessInstance): Promise<string> {
+    const fromModel = typeof flow?.name === 'string' ? flow.name.trim() : ''
+    if (fromModel) return fromModel
+    if (inst?.defineId == null) return ''
+    const key = String(inst.defineId)
+    const cached = this.defineNameCache.get(key)
+    if (cached !== undefined) return cached
+    let name = ''
+    try {
+      const def = await this.repo.findDefineById(inst.defineId)
+      name = typeof def?.name === 'string' ? def.name.trim() : ''
+    } catch {
+      /* 定义读取失败按"拿不到流程名"处理：只命中全流程兜底委托，绝不打断建单（判据 4） */
+    }
+    this.defineNameCache.set(key, name)
+    return name
+  }
 
   setExtensions(ext: EngineExtensions) {
     this.ext = ext
@@ -179,6 +259,10 @@ export class EngineImpl implements Engine {
               [`loopCounter_${curNode.id}`]: lc + 1,
               [`operatorList_${curNode.id}`]: actors,
             }
+            // issues/116：串行会签推进出的新任务同样并入该成员生效中的代理人
+            const pn = await this.surrogateProcessName(flow, inst)
+            const eff = mergeAgents([actors[lc + 1]], await this.surrogateAgents([actors[lc + 1]], pn))
+            if (eff.length > 1) nt.actorIds = eff
             await this.repo.saveTask(nt)
             // TASK_CREATE：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler / Rust）
             await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: curNode.id, operator })
@@ -236,7 +320,7 @@ export class EngineImpl implements Engine {
         const prev = findNode(flow, prevName)
         if (prev) {
           const actors = this.rollbackActors(prev, inst, task)
-          await this.createTaskWithActors(prev, inst, operator, vars, actors)
+          await this.createTaskWithActors(prev, inst, operator, vars, actors, await this.surrogateProcessName(flow, inst))
         }
       }
     } else {
@@ -355,9 +439,34 @@ export class EngineImpl implements Engine {
     return []
   }
 
+  /**
+   * issues/116：对每个参与人查一次生效委托（判据在仓储侧：空 processName 全流程兜底 /
+   * 时间窗 / 自委托过滤 / enabled 只认 1）。返回 actor → 代理人 映射。
+   * 未配置查询源、显式关闭、无参与人 → 空映射（= 原样参与者，不打断建单）；
+   * 单条查询异常只记录不传播（委托是增强能力，建单主流程不得被拖崩）。
+   */
+  private async surrogateAgents(actors: string[], processName: string): Promise<Map<string, string>> {
+    const map = new Map<string, string>()
+    const ext = this.surrogateRepo
+    if (!ext || !this.surrogateOn || actors.length === 0) return map
+    const now = new Date()
+    for (const actor of actors) {
+      try {
+        const hit = await ext.getSurrogate(actor, processName ?? '', now)
+        const agent = typeof hit?.surrogate === 'string' ? hit.surrogate.trim() : ''
+        if (agent && agent !== actor) map.set(actor, agent)
+      } catch (e: any) {
+        console.error(`[jeeflow] 委托查询失败（跳过该参与人）actor=${actor}:`, e?.message ?? e)
+      }
+    }
+    return map
+  }
+
   // 以显式参与者建任务（会签节点拆分为逐人任务，对齐 Java 会签创建语义）
-  private async createTaskWithActors(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>, actors: string[]): Promise<void> {
+  private async createTaskWithActors(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>, actors: string[], processName = ''): Promise<void> {
     if (!actors.length) return
+    // issues/116：与 createTask 同口径——代理人并入参与者集合后随任务落库
+    const agents = await this.surrogateAgents(actors, processName)
     const ct = node.properties?.countersignType as string | undefined
     const now = new Date()
     const form = node.properties?.form ?? ''
@@ -367,6 +476,8 @@ export class EngineImpl implements Engine {
         case '':
           for (const actor of actors) {
             const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1)
+            const eff = mergeAgents([actor], agents)
+            if (eff.length > 1) nt.actorIds = eff
             await this.repo.saveTask(nt)
             await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
           }
@@ -378,6 +489,8 @@ export class EngineImpl implements Engine {
             [`loopCounter_${node.id}`]: 0,
             [`operatorList_${node.id}`]: actors,
           }
+          const eff = mergeAgents([actors[0]], agents)
+          if (eff.length > 1) nt.actorIds = eff
           await this.repo.saveTask(nt)
           await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
           return
@@ -385,14 +498,17 @@ export class EngineImpl implements Engine {
         default:
           for (const actor of actors) {
             const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1)
+            const eff = mergeAgents([actor], agents)
+            if (eff.length > 1) nt.actorIds = eff
             await this.repo.saveTask(nt)
             await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
           }
           return
       }
     }
-    const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now)
-    if (actors.length > 1) nt.actorIds = actors
+    const effActors = mergeAgents(actors, agents)
+    const nt = inst.createTask(this.nextId(), node.id, node.text.value, effActors[0], operator, form, now)
+    if (effActors.length > 1) nt.actorIds = effActors
     await this.repo.saveTask(nt)
     await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
   }
@@ -413,7 +529,7 @@ export class EngineImpl implements Engine {
     // 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
     // 任务完成的拦截器由 executeProcessTask 显式触发，1.8.0 SYNC 同步演进）
     if (node.type === TypeTask || node.type === TypeCustom) {
-      await this.createTask(node, inst, operator, vars)
+      await this.createTask(node, inst, operator, vars, await this.surrogateProcessName(flow, inst))
       return
     }
     if (!(await this.firePre(node, inst))) return
@@ -500,9 +616,12 @@ export class EngineImpl implements Engine {
     }
   }
 
-  private async createTask(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>): Promise<void> {
+  private async createTask(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>, processName = ''): Promise<void> {
     const actors = await this.resolveActors(node, inst, operator, vars)
     if (!actors.length) return
+    // issues/116：参与者解析完成后、落库前应用生效委托——代理人并入参与者集合，
+    // 随任务一起 saveTask 落 wf_process_task_actor（严禁"事后 addTaskActor 补写"）
+    const agents = await this.surrogateAgents(actors, processName)
     const ct = node.properties?.countersignType as string | undefined
     const now = new Date()
     const form = node.properties?.form ?? ''
@@ -512,6 +631,8 @@ export class EngineImpl implements Engine {
         case 'PARALLEL':
           for (const actor of actors) {
             const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1)
+            const eff = mergeAgents([actor], agents)
+            if (eff.length > 1) nt.actorIds = eff
             await this.repo.saveTask(nt)
             // TASK_CREATE：任务落库后逐个 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
             await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
@@ -520,11 +641,14 @@ export class EngineImpl implements Engine {
         case 'SEQUENTIAL': {
           // 顺序会签任务也是会签任务（issues/57 E29 修正：仅普通分支默认 0）
           const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now, 1)
+          // 会签成员列表保持原 actors（委托不新增会签成员，只在该成员的任务上并入代理人）
           nt.variables = {
             [`nrOfInstances_${node.id}`]: actors.length,
             [`loopCounter_${node.id}`]: 0,
             [`operatorList_${node.id}`]: actors,
           }
+          const eff = mergeAgents([actors[0]], agents)
+          if (eff.length > 1) nt.actorIds = eff
           await this.repo.saveTask(nt)
           await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
           return
@@ -532,6 +656,8 @@ export class EngineImpl implements Engine {
         default:
           for (const actor of actors) {
             const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, 1)
+            const eff = mergeAgents([actor], agents)
+            if (eff.length > 1) nt.actorIds = eff
             await this.repo.saveTask(nt)
             await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
           }
@@ -539,8 +665,9 @@ export class EngineImpl implements Engine {
       }
     }
     // 普通任务：一个任务承载全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
-    const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now)
-    if (actors.length > 1) nt.actorIds = actors
+    const effActors = mergeAgents(actors, agents)
+    const nt = inst.createTask(this.nextId(), node.id, node.text.value, effActors[0], operator, form, now)
+    if (effActors.length > 1) nt.actorIds = effActors
     await this.repo.saveTask(nt)
     await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
   }
@@ -635,6 +762,18 @@ export class EngineImpl implements Engine {
 }
 
 // ─── Pure Functions ──────────────────────────────────────────────────────────
+
+/** issues/116：把代理人并入参与者集合——授权人保留、原顺序不动、代理人按参与人顺序追加、去重。
+ *  返回新数组（无代理命中时返回原数组引用，零开销）。 */
+export function mergeAgents(actors: string[], agents: Map<string, string>): string[] {
+  if (agents.size === 0) return actors
+  const out = [...actors]
+  for (const a of actors) {
+    const agent = agents.get(a)
+    if (agent && !out.includes(agent)) out.push(agent)
+  }
+  return out
+}
 
 function findNode(flow: FlowModel, id: string): FlowNode | undefined {
   return flow.nodes.find(n => n.id === id)

@@ -13,6 +13,7 @@ import pg from 'pg'
 import { EngineImpl } from '../src/engine.js'
 import { JdbcRepository, TsIDGenerator, convertPlaceholder } from '../src/jdbc/index.js'
 import { JdbcProcessExtRepository } from '../src/jdbc/ext.js'
+import { MemoryExtRepository } from '../src/memory-ext.js'
 import { type ProcessDesign, type ProcessDesignHis, type ProcessSurrogate } from '../src/model.js'
 import { dir as flowsResolverDir } from '../flows-resolver.js'
 import { MysqlAdapter } from '../src/jdbc/mysql.js'
@@ -616,6 +617,234 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
       assert.ok(Array.isArray(todos.rows), 'pageTodoTasks rows')
     } finally {
       await cleanup()
+    }
+  })
+
+  // ── issues/116 委托代理自动生效（SQL 仓路径，spec 06 §4.5 / 08 用例 26·27）────
+  // 参与者一律用 n116- 前缀隔离，避免与其它栈并发跑 SQL 用例时互相污染。
+  const DAY = 86400000
+  const sur = (o: Partial<ProcessSurrogate> & { operator: string; surrogate: string }): ProcessSurrogate => ({
+    id: '', processName: '', enabled: 1, createTime: new Date(), createUser: 'n116',
+    updateTime: new Date(), updateUser: 'n116', ...o,
+  })
+
+  async function cleanupN116(): Promise<void> {
+    await q(pool, "DELETE FROM wf_process_surrogate WHERE operator LIKE 'n116-%' OR surrogate LIKE 'n116-%'")
+  }
+
+  async function actorsOf(taskId: string | number): Promise<string[]> {
+    const rows = await q(pool, 'SELECT actor_id FROM wf_process_task_actor WHERE process_task_id = ? ORDER BY id', [taskId])
+    return rows.map((r: any) => String(r.actor_id))
+  }
+
+  it('issues/116 用例26（SQL 仓）：建单那一刻并入代理人，直查 actor 表读回（授权人那行仍在）', async () => {
+    await cleanup()
+    try {
+      await applySchema(); await insertDefine(); await cleanupN116()
+      const repo = new JdbcRepository(makeAdapter(pool), new TsIDGenerator())
+      const engine = new EngineImpl(repo, userProv, new SeqIDGen())
+      const ext = new JdbcProcessExtRepository(makeAdapter(pool), new TsIDGenerator())
+      const facade = new JeeflowFacade(engine, repo, ext)
+      assert.ok(engine.isSurrogateEnabled(), '门面装配扩展仓储后引擎应默认开启委托')
+
+      // 张三→李四：精确流程名（= 流程模型 name "simple"，部署时同 wf_process_define.name）
+      await ext.saveSurrogate(sur({
+        operator: 'n116-zhangsan', surrogate: 'n116-lisi', processName: 'simple',
+        startTime: new Date(Date.now() - DAY), endTime: new Date(Date.now() + DAY),
+      }))
+      // leader→王五：空 processName = 全流程兜底
+      await ext.saveSurrogate(sur({ operator: 'n116-leader', surrogate: 'n116-wangwu', processName: '' }))
+
+      const inst = await engine.startProcessInstanceById(DEFINE_ID, 'n116-zhangsan')
+      const apply = (await repo.findDoingTasks(inst.id))[0]
+      assert.equal(apply.taskName, 'apply')
+      // ① 持久值读回：代理人真有一行，授权人那行仍在（委托不是转办）
+      assert.deepEqual(await actorsOf(apply.id), ['n116-zhangsan', 'n116-lisi'],
+        '李四应在 wf_process_task_actor 真有一行，张三那行仍在')
+      // ② 代理人待办分页真查到该单，授权人待办保留（任一可办）
+      assert.ok((await repo.pageTodoTasks(1, 50, 'n116-lisi')).rows.some(t => String(t.id) === String(apply.id)),
+        '李四待办应出现该单')
+      assert.ok((await repo.pageTodoTasks(1, 50, 'n116-zhangsan')).rows.some(t => String(t.id) === String(apply.id)),
+        '张三待办应保留')
+
+      // ③ 第二跳：空 processName 全流程兜底同样在建单时并入（判据 a）
+      await engine.executeProcessTask(apply.id, 'n116-zhangsan', { tf_nextNodeOperator: 'n116-leader' })
+      const task1 = (await repo.findDoingTasks(inst.id))[0]
+      assert.equal(task1.taskName, 'task1')
+      assert.deepEqual(await actorsOf(task1.id), ['n116-leader', 'n116-wangwu'], '全流程兜底委托应并入')
+      // ④ 仓储水合读回同口径（actorIds 来自 wf_process_task_actor）
+      assert.deepEqual((await repo.findTaskById(task1.id))?.actorIds, ['n116-leader', 'n116-wangwu'],
+        '仓储水合读回同口径')
+      // ⑤ 代理人经门面办结 → 实例终态落库 20（委托真的能办，不只是多一行数据）
+      const ex = await facade.flow('processTask/execute',
+        { processTaskId: task1.id, operator: 'n116-wangwu', submitType: 1 })
+      assert.equal(ex.code, 0, `代理人办结应成功: ${JSON.stringify(ex)}`)
+      const st = (await q(pool, 'SELECT state FROM wf_process_instance WHERE id = ?', [inst.id]))[0]
+      assert.equal(Number(st.state), InstanceState.Done, '代理人办结后实例终态应落库 20')
+    } finally {
+      await cleanup(); await cleanupN116()
+    }
+  })
+
+  it('issues/116 用例26 负向（SQL 仓）：窗外 / enabled=0 / 自委托 → actor 表无代理人行', async () => {
+    await cleanup()
+    try {
+      await applySchema(); await insertDefine(); await cleanupN116()
+      const repo = new JdbcRepository(makeAdapter(pool), new TsIDGenerator())
+      const engine = new EngineImpl(repo, userProv, new SeqIDGen())
+      const ext = new JdbcProcessExtRepository(makeAdapter(pool), new TsIDGenerator())
+      new JeeflowFacade(engine, repo, ext)
+
+      await ext.saveSurrogate(sur({ operator: 'n116-zhangsan', surrogate: 'n116-past', processName: 'simple',
+        startTime: new Date(Date.now() - 3 * DAY), endTime: new Date(Date.now() - 2 * DAY) }))
+      await ext.saveSurrogate(sur({ operator: 'n116-zhangsan', surrogate: 'n116-future', processName: 'simple',
+        startTime: new Date(Date.now() + 2 * DAY), endTime: new Date(Date.now() + 3 * DAY) }))
+      await ext.saveSurrogate(sur({ operator: 'n116-zhangsan', surrogate: 'n116-off', processName: 'simple', enabled: 0 }))
+      await ext.saveSurrogate(sur({ operator: 'n116-zhangsan', surrogate: 'n116-zhangsan', processName: 'simple' }))
+      await ext.saveSurrogate(sur({ operator: 'n116-zhangsan', surrogate: 'n116-other-flow', processName: 'other-flow-name' }))
+
+      const inst = await engine.startProcessInstanceById(DEFINE_ID, 'n116-zhangsan')
+      const apply = (await repo.findDoingTasks(inst.id))[0]
+      assert.deepEqual(await actorsOf(apply.id), ['n116-zhangsan'],
+        '窗外/未到窗/停用/自委托/异流程名五类委托均不得并入（判据 a~d）')
+      assert.equal((await repo.pageTodoTasks(1, 50, 'n116-past')).rows.filter(t => String(t.id) === String(apply.id)).length, 0,
+        '代理人不应收到该单')
+    } finally {
+      await cleanup(); await cleanupN116()
+    }
+  })
+
+  it('issues/116 用例26 装配形态（SQL 仓）：未配扩展仓储不打断建单 / 显式关闭回到仅台账', async () => {
+    await cleanup()
+    try {
+      await applySchema(); await insertDefine(); await cleanupN116()
+      const ext = new JdbcProcessExtRepository(makeAdapter(pool), new TsIDGenerator())
+      await ext.saveSurrogate(sur({ operator: 'n116-zhangsan', surrogate: 'n116-lisi', processName: 'simple' }))
+
+      // ① 未配置扩展仓储：建单必须照常
+      {
+        const repo = new JdbcRepository(makeAdapter(pool), new TsIDGenerator())
+        const engine = new EngineImpl(repo, userProv, new SeqIDGen())
+        const facade = new JeeflowFacade(engine, repo, undefined)
+        assert.equal(engine.isSurrogateEnabled(), false, '未注入查询源 → 未启用')
+        const r = await facade.flow('processInstance/startAndExecute', {
+          processDefineId: DEFINE_ID, operator: 'n116-zhangsan',
+        })
+        assert.equal(r.code, 0, `缺扩展仓储不得打断建单: ${JSON.stringify(r)}`)
+      }
+      // ② 显式关闭：开关 / 摘除查询源 / 注册空实现 / 构造参数四种形状，都回到"仅台账"
+      const routes: Array<[string, (e: EngineImpl) => void, boolean]> = [
+        ['setSurrogateEnabled(false)', e => e.setSurrogateEnabled(false), false],
+        ['setSurrogateRepository(null)', e => e.setSurrogateRepository(null), false],
+        ['注册空实现（getSurrogate 恒 null）', e => e.setSurrogateRepository({ getSurrogate: async () => null }), true],
+        ['构造参数 surrogateEnabled:false', () => { /* 走下面的独立构造 */ }, false],
+      ]
+      for (const [label, apply, wantEnabled] of routes) {
+        const repo = new JdbcRepository(makeAdapter(pool), new TsIDGenerator())
+        const engine = label.startsWith('构造参数')
+          ? new EngineImpl(repo, userProv, new SeqIDGen(), undefined, { surrogateRepository: ext, surrogateEnabled: false })
+          : new EngineImpl(repo, userProv, new SeqIDGen())
+        new JeeflowFacade(engine, repo, ext)
+        apply(engine)
+        const inst = await engine.startProcessInstanceById(DEFINE_ID, 'n116-zhangsan')
+        const applyTask = (await repo.findDoingTasks(inst.id))[0]
+        assert.deepEqual(await actorsOf(applyTask.id), ['n116-zhangsan'], `${label} 后不应并入代理人`)
+        assert.equal(engine.isSurrogateEnabled(), wantEnabled, `${label} 后 isSurrogateEnabled 应为 ${wantEnabled}`)
+      }
+      // ③ 关闭只关运行期：台账分页仍读得到那条委托
+      const repo = new JdbcRepository(makeAdapter(pool), new TsIDGenerator())
+      const facade = new JeeflowFacade(new EngineImpl(repo, userProv, new SeqIDGen()), repo, ext)
+      const page = await facade.flow('processSurrogate/page', { operator: 'n116-zhangsan' })
+      assert.equal(page.code, 0, JSON.stringify(page))
+      assert.equal(page.data.recordCount, 1, '关闭运行期不影响台账')
+    } finally {
+      await cleanup(); await cleanupN116()
+    }
+  })
+
+  it('issues/116 用例27 判据双仓一致（SQL 仓 vs 内存仓）：同一份数据同结论', async () => {
+    await cleanup()
+    try {
+      await applySchema(); await cleanupN116()
+      const sqlExt = new JdbcProcessExtRepository(makeAdapter(pool), new TsIDGenerator())
+      const memExt = new MemoryExtRepository()
+      const rows: ProcessSurrogate[] = [
+        // 精确流程名命中
+        sur({ operator: 'n116-dual', surrogate: 'd-exact', processName: 'd-a' }),
+        // 窗外 / 未到窗 / 停用 / 自委托 / 只给 start（end 不限）
+        sur({ operator: 'n116-dual', surrogate: 'd-past', processName: 'd-b', endTime: new Date(Date.now() - DAY) }),
+        sur({ operator: 'n116-dual', surrogate: 'd-future', processName: 'd-c', startTime: new Date(Date.now() + DAY) }),
+        sur({ operator: 'n116-dual', surrogate: 'd-off', processName: 'd-d', enabled: 0 }),
+        sur({ operator: 'n116-dual', surrogate: 'n116-dual', processName: 'd-e' }),
+        sur({ operator: 'n116-dual', surrogate: 'd-open', processName: 'd-f', startTime: new Date(Date.now() - DAY) }),
+        // 兜底组：精确行存在但全部不生效 → 落到空流程名行
+        sur({ operator: 'n116-dualg', surrogate: 'g-global', processName: '' }),
+        sur({ operator: 'n116-dualg', surrogate: 'g-past', processName: 'g-p', endTime: new Date(Date.now() - DAY) }),
+        sur({ operator: 'n116-dualg', surrogate: 'g-hit', processName: 'g-s', enabled: 1 }),
+        // 两条兜底同时命中 → 取最新（SQL: ORDER BY id DESC LIMIT 1）
+        sur({ operator: 'n116-dualz', surrogate: 'g-old', processName: null as any }),
+        sur({ operator: 'n116-dualz', surrogate: 'g-new', processName: '' }),
+      ]
+      for (const r of rows) {
+        const s = { ...r }
+        await sqlExt.saveSurrogate(s)
+        await memExt.saveSurrogate({ ...s })   // 同一 id 同一数据，两仓各存一份
+      }
+      // (授权人, 流程名) → 期望代理人（null = 不生效）
+      const matrix: Array<[string, string, string | null]> = [
+        ['n116-dual', 'd-a', 'd-exact'],
+        ['n116-dual', 'd-b', null],
+        ['n116-dual', 'd-c', null],
+        ['n116-dual', 'd-d', null],
+        ['n116-dual', 'd-e', null],
+        ['n116-dual', 'd-f', 'd-open'],
+        ['n116-dual', 'd-none', null],
+        ['n116-dualg', 'g-x', 'g-global'],
+        ['n116-dualg', 'g-p', 'g-global'],
+        ['n116-dualg', 'g-s', 'g-hit'],
+        ['n116-dualg', '', 'g-global'],
+        ['n116-dualz', 'anything', 'g-new'],
+        ['n116-nobody', 'd-a', null],
+      ]
+      for (const [op, pn, want] of matrix) {
+        const sqlHit = await sqlExt.getSurrogate(op, pn)
+        const memHit = await memExt.getSurrogate(op, pn)
+        assert.equal(sqlHit?.surrogate ?? null, want, `SQL 仓 ${op}/${pn} 应为 ${want}，实测 ${sqlHit?.surrogate}`)
+        assert.equal(memHit?.surrogate ?? null, want, `内存仓 ${op}/${pn} 应为 ${want}，实测 ${memHit?.surrogate}`)
+        assert.equal(memHit?.id ?? null, sqlHit?.id ?? null, `两仓同一份数据必须给出同一条记录（${op}/${pn}）`)
+      }
+      // 判据 1.4 双仓同序：多条命中取 **id 最大**——故意"先插大 id 再插小 id"，
+      // 排除"取首条/取插入末条"蒙对：上面那批行 id 严格升序，两序恰好重合，钉不住。
+      // SQL 侧去掉 ORDER BY id DESC、或内存侧改回按插入序取，这里必红。
+      const ordBig = isPg ? '9116000002' : '9016000002'
+      const ordSmall = isPg ? '9116000001' : '9016000001'
+      for (const [id, agent] of [[ordBig, 'ord-big'], [ordSmall, 'ord-small']] as Array<[string, string]>) {
+        const s = sur({ id, operator: 'n116-idorder', surrogate: agent, processName: 'ord-p' })
+        await sqlExt.saveSurrogate(s)
+        await memExt.saveSurrogate({ ...s })
+      }
+      assert.equal((await sqlExt.getSurrogate('n116-idorder', 'ord-p'))?.surrogate, 'ord-big',
+        'SQL 仓多条命中必须 ORDER BY id DESC 取最大（乱序写入时不得跟着行序走）')
+      assert.equal((await memExt.getSurrogate('n116-idorder', 'ord-p'))?.surrogate, 'ord-big',
+        '内存仓必须比 id 数值取最大，不得按 Map 插入序取末条')
+      assert.equal((await memExt.getSurrogate('n116-idorder', 'ord-p'))?.id, ordBig, '内存仓命中的就是大 id 那一条')
+      await q(pool, 'DELETE FROM wf_process_surrogate WHERE id IN (?,?)', [ordBig, ordSmall])
+      // enabled 脏值：SQL 侧 enabled 是 INT 列——严格模式直接拒收（本用例捕获即通过），
+      // 宽松模式落库为 0 也命不中 `enabled = 1`；两条路都不许把脏值当启用。
+      // 内存侧脏值判据（'abc'/true/2/NULL 一律不启用）见 spec.test.ts 用例27。
+      const dirtyId = new SeqIDGen().nextId()
+      let dirtyInserted = false
+      try {
+        await q(pool, 'INSERT INTO wf_process_surrogate (id, operator, surrogate, enabled) VALUES (?,?,?,?)',
+          [dirtyId, 'n116-dirty', 'n116-dirty-agent', 'abc'])
+        dirtyInserted = true
+      } catch { /* 严格模式拒收，判据由列类型守住 */ }
+      if (dirtyInserted) {
+        assert.equal(await sqlExt.getSurrogate('n116-dirty', ''), null, '脏 enabled 不得当启用（SQL 侧）')
+        await q(pool, 'DELETE FROM wf_process_surrogate WHERE id = ?', [dirtyId])
+      }
+    } finally {
+      await cleanup(); await cleanupN116()
     }
   })
 })

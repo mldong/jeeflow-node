@@ -9,10 +9,25 @@ import { EngineImpl } from '@mldong/jeeflow/engine'
 import { MemoryRepository } from '@mldong/jeeflow/memory'
 
 const repo = new MemoryRepository()          // 内存仓储（演示/测试用）
-const engine = new EngineImpl(repo, userProv?, idGen?, exprEval?)
+const engine = new EngineImpl(repo, userProv?, idGen?, exprEval?, opts?)
 //                                  ├── UserProvider（可选）
 //                                  ├── IDGenerator（可选）
-//                                  └── ExpressionEvaluator（可选，决策/会签表达式）
+//                                  ├── ExpressionEvaluator（可选，决策/会签表达式）
+//                                  └── EngineOptions（可选）{ surrogateRepository?, surrogateEnabled? }
+```
+
+### 委托代理自动生效（issues/116，默认开启）
+
+引擎在**建单那一刻**（参与者解析完成后、落库前）对每个参与者查一次生效委托，命中则把代理人并入
+该任务的参与者集合（授权人保留，任一可办）。`new JeeflowFacade(engine, repo, extRepo)` 会自动把
+扩展仓储注入委托查询面，集成方零配置即生效；未注入时静默跳过，不打断建单。
+
+```ts
+engine.setSurrogateRepository(extRepo)      // 注入查询源（ProcessExtRepository 或仅实现 getSurrogate 的对象）
+engine.setSurrogateEnabled(false)           // 显式关闭 → 回到"仅台账"
+engine.setSurrogateRepository(null)         // 或摘掉查询源
+engine.setSurrogateRepository({ getSurrogate: async () => null })  // 或注册空实现
+engine.isSurrogateEnabled()                 // 只读自检
 ```
 
 ## 核心方法

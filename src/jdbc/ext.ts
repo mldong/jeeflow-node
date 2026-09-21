@@ -276,9 +276,20 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
     }
   }
 
+  /**
+   * 生效委托查询（issues/116 判据 a~d 基准实现）：
+   *  a. processName 先精确命中，未命中再兜底 process_name IS NULL OR = '' （全流程委托）
+   *  b. 时间窗 start_time <= at <= end_time，任一侧 NULL = 该侧不限
+   *  c. 自委托过滤 surrogate <> operator
+   *  d. enabled 只认 1（INT 列，脏值进不来；NULL 也不生效）
+   * 多条命中取 id 最大（最新）一条 —— 内存仓须给出同结论（MemoryExtRepository.getSurrogate）
+   */
   async getSurrogate(operator: string, processName: string, at: Date = new Date()): Promise<ProcessSurrogate | null> {
-    const hit = await this.querySurrogate(operator, processName, at)
-    if (hit) return hit
+    const name = processName ?? ''
+    if (name) {
+      const hit = await this.querySurrogate(operator, name, at)
+      if (hit) return hit
+    }
     return this.querySurrogate(operator, '', at)
   }
 
