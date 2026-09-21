@@ -21,11 +21,15 @@ describe('EnumDict（v1.4.0）', () => {
     assert.deepEqual(items[6], { value: '99', label: '已废弃' })
   })
 
-  it('提交类型字典 8 项', () => {
+  it('提交类型字典 9 项（issues/115 注册 7 转办；20 会签拒绝不与 2 重名）', () => {
     const items = enumDict('wf_process_submit_type')
-    assert.equal(items.length, 8)
+    assert.equal(items.length, 9)
     assert.deepEqual(items[0], { value: '0', label: '发起申请' })
-    assert.deepEqual(items[7], { value: '20', label: '拒绝申请' })
+    assert.deepEqual(items[2], { value: '2', label: '拒绝申请' })
+    assert.deepEqual(items[7], { value: '7', label: '转办' })
+    assert.deepEqual(items[8], { value: '20', label: '会签拒绝' })
+    // 同字典内 label 唯一——重名会让前端下拉两项不可分（issues/115 附带修）
+    assert.equal(new Set(items.map(i => i.label)).size, items.length, 'submitType 字典 label 不得重复')
   })
 
   it('未知 key 返回空列表', () => {

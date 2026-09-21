@@ -128,6 +128,8 @@ export enum SubmitType {
   Jump                = 4,
   ReApply             = 5,
   RollbackToOperator  = 6,
+  /** issues/115：转办留痕（processTask/transfer 用，不走 execute） */
+  Transfer            = 7,
   CountersignDisagree = 20,
 }
 

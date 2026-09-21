@@ -22,7 +22,7 @@ const DICTS: Record<string, DictItem[]> = {
   wf_process_submit_type: [
     { value: '0', label: '发起申请' }, { value: '1', label: '同意申请' }, { value: '2', label: '拒绝申请' },
     { value: '3', label: '退回上一步' }, { value: '4', label: '跳转' }, { value: '5', label: '重新提交' },
-    { value: '6', label: '退回发起人' }, { value: '20', label: '拒绝申请' },
+    { value: '6', label: '退回发起人' }, { value: '7', label: '转办' }, { value: '20', label: '会签拒绝' },
   ],
   wf_process_task_state: [
     { value: '10', label: '进行中' }, { value: '20', label: '已完成' }, { value: '30', label: '已撤回' },

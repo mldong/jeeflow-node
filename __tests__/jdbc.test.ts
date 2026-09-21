@@ -448,6 +448,161 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
     }
   })
 
+  it('issues/114/115：撤回鉴权 + update_user 回写 / 转办落库（SQL 直查读回）', async () => {
+    await cleanup()
+    try {
+      await applySchema()
+      await insertDefine()
+      const repo = new JdbcRepository(makeAdapter(pool), new TsIDGenerator())
+      const engine = new EngineImpl(repo, userProv, new SeqIDGen())
+      const facade = new JeeflowFacade(engine, repo, undefined)
+
+      // 推进到 task1（参与者 leader）：start → apply(zhangsan) 完成
+      const inst = await engine.startProcessInstanceById(DEFINE_ID, 'zhangsan', { BUSINESS_NO: `BIZ-${dbType}-114` })
+      const applyTask = (await repo.findDoingTasks(inst.id))[0]
+      await engine.executeProcessTask(applyTask.id, 'zhangsan')
+      const task1 = (await repo.findDoingTasks(inst.id))[0]
+      assert.equal(task1.taskName, 'task1')
+
+      // ── 撤回鉴权（负向：精确码 + msg；直查库确证状态未被静默改写）──
+      const rwMiss = await facade.flow('processInstance/withdraw', { id: inst.id })
+      assert.equal(rwMiss.code, 99999999, JSON.stringify(rwMiss))
+      assert.ok(String(rwMiss.msg).includes('operator 必填'), `msg: ${rwMiss.msg}`)
+      const rwOutsider = await facade.flow('processInstance/withdraw', { id: inst.id, operator: 'nobody' })
+      assert.equal(rwOutsider.code, 99999999, JSON.stringify(rwOutsider))
+      assert.ok(String(rwOutsider.msg).includes('无权限撤回该流程实例'), `msg: ${rwOutsider.msg}`)
+      let iRows = await q(pool, 'SELECT state, update_user FROM wf_process_instance WHERE id = ?', [inst.id])
+      assert.equal(Number(iRows[0].state), InstanceState.Doing, '拒绝后实例仍 10')
+      assert.notEqual(String(iRows[0].update_user), 'nobody', '拒绝后 update_user 未被污染')
+
+      // 判据 2（进行中任务参与者，非发起人）撤回成功；直查读回 30 + update_user
+      const rwOk = await facade.flow('processInstance/withdraw', { id: inst.id, operator: 'leader' })
+      assert.equal(rwOk.code, 0, JSON.stringify(rwOk))
+      iRows = await q(pool, 'SELECT state, update_user FROM wf_process_instance WHERE id = ?', [inst.id])
+      assert.equal(Number(iRows[0].state), InstanceState.Withdraw, '实例落库 state=30')
+      assert.equal(String(iRows[0].update_user), 'leader', '实例 update_user 回写撤回人')
+      const tRows = await q(pool, 'SELECT id, task_state, update_user FROM wf_process_task WHERE process_instance_id = ?', [inst.id])
+      const rowOf = (id: string) => tRows.find((r: any) => String(r.id) === String(id))
+      assert.equal(Number(rowOf(applyTask.id)?.task_state), TaskState.Done, '已完成(20) apply 行不被撤回改写')
+      assert.equal(Number(rowOf(task1.id)?.task_state), TaskState.Withdraw, '进行中 task1 行落 30')
+      assert.equal(String(rowOf(task1.id)?.update_user), 'leader', '进行中任务 update_user 回写撤回人')
+
+      // ── 转办（新实例）：正向落库读回 + 报错不破坏参与者 ──
+      const inst2 = await engine.startProcessInstanceById(DEFINE_ID, 'zhangsan', { BUSINESS_NO: `BIZ-${dbType}-115` })
+      await engine.executeProcessTask((await repo.findDoingTasks(inst2.id))[0].id, 'zhangsan')
+      const task2 = (await repo.findDoingTasks(inst2.id))[0]
+      await repo.addTaskActor(task2.id, ['coactor'])
+
+      const tr = await facade.flow('processTask/transfer',
+        { processTaskId: task2.id, fromActor: 'leader', toActor: 'lisi', reason: '出差', operator: 'other' })
+      assert.equal(tr.code, 99999999, JSON.stringify(tr))
+      assert.ok(String(tr.msg).includes('无权限转办该任务'), `msg: ${tr.msg}`)
+      let aRows = await q(pool, 'SELECT actor_id FROM wf_process_task_actor WHERE process_task_id = ? ORDER BY id', [task2.id])
+      assert.deepEqual(aRows.map((r: any) => r.actor_id), ['leader', 'coactor'], '报错后参与者行不变')
+
+      const trOk = await facade.flow('processTask/transfer',
+        { processTaskId: task2.id, fromActor: 'leader', toActor: 'lisi', reason: '出差', operator: 'leader' })
+      assert.equal(trOk.code, 0, JSON.stringify(trOk))
+      // ① actor 表读回：只摘 leader，coactor 保留，lisi 追加（同一 taskId）
+      aRows = await q(pool, 'SELECT actor_id FROM wf_process_task_actor WHERE process_task_id = ? ORDER BY id', [task2.id])
+      assert.deepEqual(aRows.map((r: any) => r.actor_id), ['coactor', 'lisi'], '参与者落库读回值')
+      // ② 任务行读回：仍 DOING、operator 列恒无值（契约 06 ⚠️ 严禁覆写）、
+      //    变量含 submitType=7 / tf_transferTo / tf_transferReason、update_user=转办人
+      const t2Row = (await q(pool,
+        'SELECT task_state, operator, update_user, variable FROM wf_process_task WHERE id = ?', [task2.id]))[0]
+      assert.equal(Number(t2Row.task_state), TaskState.Doing, '转办后任务仍进行中')
+      assert.ok(t2Row.operator == null || String(t2Row.operator) === '',
+        `转办后落库 operator 列 = ${JSON.stringify(t2Row.operator)}, want 恒无值`)
+      assert.equal(String(t2Row.update_user), 'leader', '任务 update_user=转办人')
+      const vars2 = JSON.parse(String(t2Row.variable))
+      assert.equal(Number(vars2.submitType), 7, 'submitType=7 落库')
+      assert.equal(String(vars2.tf_transferTo), 'lisi', 'tf_transferTo 落库')
+      assert.equal(String(vars2.tf_transferReason), '出差', 'tf_transferReason 落库')
+      assert.ok(String(vars2.tf_approvalComment).includes('leader 转办给 lisi'), `审批文案可读: ${vars2.tf_approvalComment}`)
+      // ③ 待办挪移（SQL 分页）：B 出现、A 消失
+      const todoB = await repo.pageTodoTasks(1, 50, 'lisi')
+      assert.ok(todoB.rows.some(r => String(r.id) === String(task2.id)), 'B 待办出现')
+      const todoA = await repo.pageTodoTasks(1, 50, 'leader')
+      assert.ok(!todoA.rows.some(r => String(r.id) === String(task2.id)), 'A 待办消失')
+      // ④ 非进行中不可转办（把实例撤掉后任务已 30）
+      await facade.flow('processInstance/withdraw', { id: inst2.id, operator: 'zhangsan' })
+      const trDone = await facade.flow('processTask/transfer',
+        { processTaskId: task2.id, fromActor: 'lisi', toActor: 'zhaoliu', operator: 'lisi' })
+      assert.equal(trDone.code, 99999999)
+      assert.ok(String(trDone.msg).includes('任务非进行中，不可转办'), `msg: ${trDone.msg}`)
+      // ⑤ 契约06 transfer⚠️ 落库版（Node 实测复现的冒单缺陷）：转办+撤回后 operator 列仍无值，
+      //    被摘走的 leader / 未办的 lisi 的「我已办」（state <> 10 AND operator = ?）不得冒入该单
+      const opRow = (await q(pool, 'SELECT operator, task_state FROM wf_process_task WHERE id = ?', [task2.id]))[0]
+      assert.equal(Number(opRow.task_state), TaskState.Withdraw, '撤回后任务落 30（判据生效前提）')
+      assert.ok(opRow.operator == null || String(opRow.operator) === '',
+        `转办→撤回后落库 operator 列 = ${JSON.stringify(opRow.operator)}, want 恒无值`)
+      for (const who of ['leader', 'lisi']) {
+        const d = await repo.pageDoneTasks(1, 50, who)
+        assert.ok(!d.rows.some(r => String(r.id) === String(task2.id)),
+          `转办→撤回后 ${who} 的已办分页冒入该单（他从没办过）`)
+      }
+    } finally {
+      await cleanup()
+    }
+  })
+
+  it('issues/115 转办两跳账本 tf_transferHistory：SQL 落库读回 + 办结后仍在', async () => {
+    await cleanup()
+    try {
+      await applySchema()
+      await insertDefine()
+      const repo = new JdbcRepository(makeAdapter(pool), new TsIDGenerator())
+      const engine = new EngineImpl(repo, userProv, new SeqIDGen())
+      const facade = new JeeflowFacade(engine, repo, undefined)
+
+      // 推进到 task1（参与者 leader）：start → apply(zhangsan) 完成
+      const inst = await engine.startProcessInstanceById(DEFINE_ID, 'zhangsan', { BUSINESS_NO: `BIZ-${dbType}-115b` })
+      await engine.executeProcessTask((await repo.findDoingTasks(inst.id))[0].id, 'zhangsan')
+      const task = (await repo.findDoingTasks(inst.id))[0]
+      assert.equal(task.taskName, 'task1')
+      const TIME_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/
+      const readVars = async () => {
+        const r = (await q(pool, 'SELECT task_state, variable FROM wf_process_task WHERE id = ?', [task.id]))[0]
+        return { state: Number(r.task_state), vars: JSON.parse(String(r.variable)) }
+      }
+
+      // 两跳 leader→lisi→zhaoliu（同一 taskId）
+      assert.equal((await facade.flow('processTask/transfer', { processTaskId: task.id,
+        fromActor: 'leader', toActor: 'lisi', reason: '出差', operator: 'leader' })).code, 0)
+      assert.equal((await facade.flow('processTask/transfer', { processTaskId: task.id,
+        fromActor: 'lisi', toActor: 'zhaoliu', reason: '转专家', operator: 'lisi' })).code, 0)
+
+      // ① 直查 JSON 列：两跳各一条、逐字段、时间格式 spec §2.4
+      let snap = await readVars()
+      assert.equal(snap.state, TaskState.Doing, '两跳后任务仍进行中')
+      const h0 = snap.vars.tf_transferHistory
+      assert.ok(Array.isArray(h0), `账本应为数组，实测 ${JSON.stringify(snap.vars.tf_transferHistory)}`)
+      assert.equal(h0?.length, 2, `SQL 落库读回应 2 条，实测 ${h0?.length}`)
+      assert.deepEqual({ ...h0[0], time: '' }, { submitType: 7, fromActor: 'leader', toActor: 'lisi', reason: '出差', time: '', operator: 'leader' }, '第 1 跳逐字段')
+      assert.deepEqual({ ...h0[1], time: '' }, { submitType: 7, fromActor: 'lisi', toActor: 'zhaoliu', reason: '转专家', time: '', operator: 'lisi' }, '第 2 跳 append 不覆盖第 1 跳')
+      assert.match(h0[0].time, TIME_RE); assert.match(h0[1].time, TIME_RE)
+      assert.equal(snap.vars.tf_transferTo, 'zhaoliu', '末跳便捷键')
+      // ② 仓储水合读回同口径（findTaskById 走 variable JSON 解析）
+      assert.equal((await repo.findTaskById(task.id))?.variables.tf_transferHistory?.length, 2, '仓储读回账本 2 条')
+
+      // ③ C 办结（submitType=1）：槽位被覆盖属预期，账本必须还在库里
+      const rEx = await facade.flow('processTask/execute', { processTaskId: task.id, operator: 'zhaoliu', submitType: 1 })
+      assert.equal(rEx.code, 0, JSON.stringify(rEx))
+      snap = await readVars()
+      assert.equal(snap.state, TaskState.Done)
+      assert.equal(Number(snap.vars.submitType), 1, '末跳槽位被办结动作覆盖（契约明定预期）')
+      assert.equal(snap.vars.tf_transferHistory?.length, 2, '办结后全量账本仍在')
+      assert.deepEqual({ ...snap.vars.tf_transferHistory[0], time: '' }, { submitType: 7, fromActor: 'leader', toActor: 'lisi', reason: '出差', time: '', operator: 'leader' }, '办结后第 1 跳不被改写')
+      assert.deepEqual({ ...snap.vars.tf_transferHistory[1], time: '' }, { submitType: 7, fromActor: 'lisi', toActor: 'zhaoliu', reason: '转专家', time: '', operator: 'lisi' }, '办结后第 2 跳不被改写')
+      // ④ 审批记录（SQL findHistoryTasks）透出全量账本
+      const rec = await facade.flow('processInstance/approvalRecord', { id: inst.id })
+      const row = rec.data.find((x: any) => x.taskName === 'task1')
+      assert.equal(row?.variable?.tf_transferHistory?.length, 2, '审批记录透出两跳账本')
+    } finally {
+      await cleanup()
+    }
+  })
+
   it('pageDefines / pageTodoTasks 不因 LIMIT 占位符抛错（issues/66）', async () => {
     await cleanup()
     try {

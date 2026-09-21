@@ -10,7 +10,7 @@ import {
 } from './model.js'
 import type { OrgUserProvider, ProcessExtRepository, ProcessRepository, QueryCondition } from './spi.js'
 import type { EngineImpl } from './engine.js'
-import { KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign } from './engine.js'
+import { KeyAutoExecute, KeyAdminID, KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign } from './engine.js'
 import { EventType, type ProcessEvent } from './extensions.js'
 
 // submitType 枚举（对齐 boot3）
@@ -20,6 +20,7 @@ const SUBMIT_REJECT = 2
 const SUBMIT_ROLLBACK = 3
 const SUBMIT_JUMP = 4
 const SUBMIT_ROLLBACK_TO_OPERATOR = 6
+const SUBMIT_TRANSFER = 7
 const SUBMIT_COUNTERSIGN_DISAGREE = 20
 
 export type UserSearch = (query: Record<string, any>) => Promise<[Record<string, any>[], number]> | [Record<string, any>[], number]
@@ -144,6 +145,8 @@ export class JeeflowFacade {
       case 'processTask/surrogate':
       case 'processTask/addCandidate':
         return this.taskAddActor(args)
+      case 'processTask/transfer': // issues/115：转办（摘原人 + 换新人）
+        return this.taskTransfer(args)
       case 'processTask/latest':
         return this.taskLatest(args)
       case 'processInstance/stats/overview':
@@ -258,25 +261,42 @@ export class JeeflowFacade {
 
   private async withdraw(args: Record<string, any>): Promise<void> {
     const instanceId = toId(args.id)
+    // issues/114：operator 硬必填——严禁缺省回落 user1 等固定账号（撤回人静默记成别人，
+    // 审计链失真且不报错）。msg 跨栈统一「operator 必填」。
+    const operator = String(args.operator ?? '').trim()
+    if (!operator) throw new Error('operator 必填')
     const inst = await this.repo.findInstanceById(instanceId)
     if (!inst) throw new Error('流程实例不存在')
     // 撤回：全部 doing 任务置 Withdraw(30) + 实例置 30（v1.0.1：updateInstance 级联落库）
-    const operator = String(args.operator ?? 'user1')
     const now = new Date()
     // findInstanceById 现水合 tasks（issues/110），此处仍按实例单独查 doing 任务撤回，
     // 且必须把聚合副本重置为仅被撤回项（见下方 inst.tasks = withdrawn），防级联回写多余任务
     const withdrawn: ProcessTask[] = []
     for (const t of await this.repo.findDoingTasks(instanceId)) {
+      withdrawn.push(t)
+    }
+    // issues/114 归属判据（命中任一放行，全不命中拒绝，msg 跨栈统一）：
+    // 1) operator = 实例发起人——⚠️ 不可复用 isAllowed（其只判任务 actorIds + auto/admin，不查发起人）
+    // 2) operator 是该实例任一进行中任务的参与者
+    // 3) operator ∈ {flow.auto, flow.admin}（沿用 isAllowed 既有放行约定）
+    const lower = operator.toLowerCase()
+    const isSystem = lower === KeyAutoExecute || lower === KeyAdminID
+    const isStarter = operator === String(inst.operator ?? '')
+    const isActor = withdrawn.some(t => (t.actorIds ?? []).includes(operator))
+    if (!isSystem && !isStarter && !isActor) throw new Error('无权限撤回该流程实例')
+    for (const t of withdrawn) {
       // issues/113：撤回写 Withdraw(30)，不用 Abandoned(99)——99 是引擎废弃码
       // （会签一票否决 / abandonAllDoing 用它），混用会让撤回单与废弃单在任务表里塌成同值
       t.withdraw(now)
-      withdrawn.push(t)
+      // issues/114：进行中任务的 update_user 同样回写为撤回人（与实例口径一致）
+      t.updateUser = operator
     }
     // issues/53 E25：撤回状态应为 Withdraw(30) 而非 Reject(45)（对齐 Java）
     inst.withdraw(now)
     inst.updateUser = operator
     // 级联覆盖防护（issues/57 补正）：撤回副本同步回聚合——updateInstance 级联会用
-    // 聚合内旧任务覆盖已撤回状态（memory 加载 tasks 时必现）
+    // 聚合内旧任务覆盖已撤回状态（memory 加载 tasks 时必现）；已完成(20)/已终止(40)
+    // 任务行不在 withdrawn 内，天然不被改写
     inst.tasks = withdrawn
     for (const t of withdrawn) await this.repo.updateTask(t)
     await this.repo.updateInstance(inst)
@@ -952,6 +972,64 @@ export class JeeflowFacade {
     const actors = toStringList2(args.actorIds)
     if (actors.length === 0) throw new Error('actorIds 缺失')
     await this.repo.addTaskActor(taskId, actors)
+  }
+
+  /**
+   * issues/115：转办（摘原人 + 换新人），区别于 surrogate 加签的"只追加"。七条契约语义（spec 06）：
+   * 只摘 fromActor 那一行 actor / toActor 追加 / 沿用同一 taskId / 留痕三件（submitType=7 槽位 +
+   * tf_transferHistory 追加式账本 + 末跳 tf_approvalComment 文案）/ 变量合并序 实例←任务←本次 /
+   * 四类明确报错（msg 跨栈统一）。
+   */
+  private async taskTransfer(args: Record<string, any>): Promise<void> {
+    const taskId = toId(args.processTaskId)
+    const operator = String(args.operator ?? '').trim()
+    if (!operator) throw new Error('operator 必填')
+    const fromActor = String(args.fromActor ?? '').trim()
+    const toActor = String(args.toActor ?? '').trim()
+    if (!fromActor) throw new Error('fromActor 必填')
+    if (!toActor) throw new Error('toActor 必填')
+    // 归属判据：只能转自己那一条待办；flow.auto/flow.admin 放行（对齐 isAllowed 既有约定）
+    const lower = operator.toLowerCase()
+    if (operator !== fromActor && lower !== KeyAutoExecute && lower !== KeyAdminID) {
+      throw new Error('无权限转办该任务')
+    }
+    const task = await this.repo.findTaskById(taskId)
+    if (!task) throw new Error('任务不存在')
+    // 前置态：仅进行中（DOING=10）任务可转办
+    if (task.taskState !== TaskState.Doing) throw new Error('任务非进行中，不可转办')
+    const actors = await this.repo.findTaskActors(taskId)
+    if (!actors.includes(fromActor)) throw new Error('原办理人不是该任务参与人')
+    if (actors.includes(toActor)) throw new Error('目标人已是该任务参与人')
+    // 摘原人（仅 fromActor 一行，会签其余成员不受影响）+ 加新人（同一 taskId，不新建任务）
+    await this.repo.removeTaskActor(taskId, [fromActor])
+    await this.repo.addTaskActor(taskId, [toActor])
+    // 留痕三件（spec 06 clause 4，缺一不可）：① 任务行 submitType=7 槽位 ② tf_transferHistory 账本
+    // ③ 末跳可读文案 tf_approvalComment（approvalRecord 的 ext 读它）
+    const reason = String(args.reason ?? '').trim()
+    const now = new Date()
+    // 账本动机：审批记录的槽位就是任务行本身，B 办结时 submitType 会被 1/2/20 覆盖——没有追加式
+    // 账本，多跳转办只剩末跳、办结后转办事实整体消失，故本键每跳 append、永不覆盖。
+    const history = Array.isArray(task.variables?.tf_transferHistory)
+      ? (task.variables.tf_transferHistory as Record<string, any>[])
+      : []
+    task.variables = {
+      ...(task.variables ?? {}),
+      submitType: SUBMIT_TRANSFER,
+      tf_transferTo: toActor,
+      tf_transferReason: reason,
+      // 时间格式按 spec §2.4 统一 yyyy-MM-dd HH:mm:ss（跨栈同形，前端免时区换算）
+      tf_transferHistory: [...history, { submitType: SUBMIT_TRANSFER, fromActor, toActor, reason, time: fmtTime(now), operator }],
+      tf_approvalComment: reason ? `${fromActor} 转办给 ${toActor}（${reason}）` : `${fromActor} 转办给 ${toActor}`,
+    }
+    // 契约 06 §transfer 留痕⚠️：**严禁覆写 actorId/operator 列**——进行中任务该列恒无值是既有
+    // 不变量；把被摘走的人写进去，该单撤回/终止后（离开 DOING 但列值留着）会凭空出现在
+    // 他从没办过的「我已办」列表（pageDoneTasks 按 state <> 10 AND operator = ? 过滤，实测复现）。
+    // 办理人由 updateUser + tf_transferHistory[].operator 承载。
+    task.updateUser = operator
+    task.updateTime = now
+    // 仓储 updateTask 会以任务副本的 actorIds 覆写参与者（memory 语义），须同步为摘/加后的最新值
+    task.actorIds = await this.repo.findTaskActors(taskId)
+    await this.repo.updateTask(task)
   }
 
   private async taskLatest(args: Record<string, any>): Promise<any> {

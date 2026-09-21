@@ -6,7 +6,7 @@ import { HandlerRegistry, registerBuiltinAssignments } from '../src/index.js'
 import { MemoryRepository } from '../src/memory.js'
 import { MemoryExtRepository } from '../src/memory-ext.js'
 import { JeeflowFacade } from '../src/facade.js'
-import { InstanceState, TaskState, type ProcessDefine, ProcessInstance, ProcessTask } from '../src/model.js'
+import { InstanceState, TaskState, SubmitType, type ProcessDefine, ProcessInstance, ProcessTask } from '../src/model.js'
 import type { ExpressionEvaluator, UserProvider } from '../src/spi.js'
 import { type FlowInterceptor, EventType, type EngineExtensions } from '../src/extensions.js'
 import { dir as flowsResolverDir } from '../flows-resolver.js'
@@ -1591,6 +1591,274 @@ describe('jeeflow compliance tests', () => {
     assert.equal(r.data.pageSize, 1)
     assert.ok(r.data.recordCount >= 1)
     assert.equal(r.data.totalPage, r.data.recordCount)
+  })
+
+  it('31 issues/114 撤回鉴权：operator 硬必填 + 三条归属判据 + update_user 回写', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const r0 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') })
+    const defineId = r0.data.processDefineId
+    const start = async (operator: string) => {
+      const r = await facade.flow('processInstance/startAndExecute', { processDefineId: defineId, operator })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      return r.data.processInstanceId as string
+    }
+
+    // ① operator 缺失/空串 → 明确报错，严禁回落 user1：实例与任务必须原样未动
+    const iid1 = await start('zhangsan')
+    const doing1 = await repo.findDoingTasks(iid1)
+    const rw1 = await facade.flow('processInstance/withdraw', { id: iid1 })
+    assert.equal(rw1.code, 99999999, JSON.stringify(rw1))
+    assert.ok(String(rw1.msg).includes('operator 必填'), `msg 应为「operator 必填」: ${rw1.msg}`)
+    const rw1b = await facade.flow('processInstance/withdraw', { id: iid1, operator: '  ' })
+    assert.equal(rw1b.code, 99999999)
+    assert.ok(String(rw1b.msg).includes('operator 必填'), `空串同样必填: ${rw1b.msg}`)
+    assert.equal((await repo.findInstanceById(iid1))?.state, InstanceState.Doing, '被拒后实例仍进行中')
+    for (const t of doing1) {
+      assert.equal((await repo.findTaskById(t.id))?.taskState, TaskState.Doing, '被拒后任务仍 DOING（未回落 user1 静默撤回）')
+    }
+
+    // ② 判据 1 发起人：撤回成功 + 持久值断言（状态 30 / update_user=撤回人）
+    const rw2 = await facade.flow('processInstance/withdraw', { id: iid1, operator: 'zhangsan' })
+    assert.equal(rw2.code, 0, JSON.stringify(rw2))
+    const inst2 = await repo.findInstanceById(iid1)
+    assert.equal(inst2?.state, InstanceState.Withdraw, '实例态应=30')
+    assert.equal(inst2?.updateUser, 'zhangsan', '实例 update_user 回写撤回人')
+    assert.ok(doing1.length > 0)
+    for (const t of doing1) {
+      const stored = await repo.findTaskById(t.id)
+      assert.equal(stored?.taskState, TaskState.Withdraw, `原 doing 任务落库应=30，实测 ${stored?.taskState}`)
+      assert.equal(stored?.updateUser, 'zhangsan', '进行中任务 update_user 回写撤回人')
+    }
+    // 已完成(20)的 apply 行不被改写（契约：20/40 任务行不得被撤回触碰）
+    const applyRow = (await repo.findHistoryTasks(iid1)).find(t => t.taskName === 'apply')
+    assert.equal(applyRow?.taskState, TaskState.Done, '已完成任务行不被撤回改写')
+
+    // ③ 判据 2 参与者：发起人 alice、当前任务参与者 leader（非发起人）撤回整单
+    //    ⚠️ isAllowed 只判 actorIds+auto/admin 不查发起人——此判据走"参与者"支，与 ④ 共同证伪
+    const iid3 = await start('alice')
+    const doing3 = await repo.findDoingTasks(iid3)
+    assert.deepEqual(doing3[0].actorIds, ['leader'], '01-simple task1 参与者=leader（非发起人 alice）')
+    const rw3 = await facade.flow('processInstance/withdraw', { id: iid3, operator: 'leader' })
+    assert.equal(rw3.code, 0, JSON.stringify(rw3))
+    assert.equal((await repo.findInstanceById(iid3))?.updateUser, 'leader', 'update_user=真实撤回人 leader（非 user1/非发起人）')
+    for (const t of doing3) {
+      const stored = await repo.findTaskById(t.id)
+      assert.equal(stored?.taskState, TaskState.Withdraw, `参与者撤回后任务应=30: ${stored?.taskState}`)
+      assert.equal(stored?.updateUser, 'leader')
+    }
+
+    // ④ 无关第三人 → 99999999 + msg；拒绝后任务/实例状态与 update_user 均不变
+    const iid4 = await start('alice')
+    const doing4 = await repo.findDoingTasks(iid4)
+    const rw4 = await facade.flow('processInstance/withdraw', { id: iid4, operator: 'nobody' })
+    assert.equal(rw4.code, 99999999, JSON.stringify(rw4))
+    assert.ok(String(rw4.msg).includes('无权限撤回该流程实例'), `msg 应为「无权限撤回该流程实例」: ${rw4.msg}`)
+    assert.equal((await repo.findInstanceById(iid4))?.state, InstanceState.Doing, '拒绝后实例仍 10')
+    assert.notEqual((await repo.findInstanceById(iid4))?.updateUser, 'nobody', '拒绝后 update_user 未被污染')
+    assert.equal((await repo.findTaskById(doing4[0].id))?.taskState, TaskState.Doing, '拒绝后任务仍 10')
+
+    // ⑤ flow.auto / flow.admin 放行（判据 3）
+    const iid5 = await start('alice')
+    assert.equal((await facade.flow('processInstance/withdraw', { id: iid5, operator: 'flow.admin' })).code, 0)
+    const iid5b = await start('alice')
+    assert.equal((await facade.flow('processInstance/withdraw', { id: iid5b, operator: 'flow.auto' })).code, 0)
+
+    // ⑥ 已完成(20)任务行不得被撤回改写：02-multi-task 推进到 task2（task1 已完成）
+    const rD = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '02-multi-task.json', 'utf-8') })
+    const rS = await facade.flow('processInstance/startAndExecute', { processDefineId: rD.data.processDefineId, operator: 'alice' })
+    const iid6 = rS.data.processInstanceId as string
+    let doing6 = await repo.findDoingTasks(iid6)
+    const task1Id = doing6.find(t => t.taskName === 'task1')!.id
+    await repo.addTaskActor(task1Id, ['leader'])
+    assert.equal((await facade.flow('processTask/execute', { processTaskId: task1Id, operator: 'leader', submitType: 1 })).code, 0)
+    doing6 = await repo.findDoingTasks(iid6)
+    const task2Id = doing6.find(t => t.taskName === 'task2')!.id
+    const rw6 = await facade.flow('processInstance/withdraw', { id: iid6, operator: 'alice' })
+    assert.equal(rw6.code, 0, JSON.stringify(rw6))
+    assert.equal((await repo.findTaskById(task1Id))?.taskState, TaskState.Done, '已完成(20)任务行不被撤回改写')
+    assert.equal((await repo.findTaskById(task2Id))?.taskState, TaskState.Withdraw, '进行中任务落 30')
+    // 作用于整单：同实例全部进行中任务都被撤（不只操作人自己那一条）
+    assert.equal((await repo.findDoingTasks(iid6)).length, 0, '撤回作用于整单，无残留 doing')
+  })
+
+  it('32 issues/115 转办：摘原人+换新人+submitType=7 留痕（同一 taskId）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const r0 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') })
+    const r1 = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: r0.data.processDefineId, operator: 'zhangsan', amount: '100' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const iid = r1.data.processInstanceId as string
+    const taskId = (await repo.findDoingTasks(iid))[0].id
+    // 多参与人任务：加签 coactor（surrogate 只追加语义不动）
+    assert.equal((await facade.flow('processTask/surrogate', { processTaskId: taskId, actorIds: ['coactor'] })).code, 0)
+
+    // ── 四类明确报错（精确失败码 + msg 关键字，且参与者集合不被破坏）──
+    const neg = async (args: Record<string, any>, keyword: string) => {
+      const r = await facade.flow('processTask/transfer', args)
+      assert.equal(r.code, 99999999, JSON.stringify(r))
+      assert.ok(String(r.msg).includes(keyword), `msg 应含「${keyword}」: ${r.msg}`)
+      assert.deepEqual(await repo.findTaskActors(taskId), ['leader', 'coactor'], `报错后参与者不变: ${keyword}`)
+    }
+    await neg({ processTaskId: taskId, fromActor: 'leader', toActor: 'lisi' }, 'operator 必填')
+    await neg({ processTaskId: taskId, fromActor: 'leader', toActor: 'lisi', operator: 'other' }, '无权限转办该任务')
+    await neg({ processTaskId: taskId, fromActor: 'ghost', toActor: 'lisi', operator: 'ghost' }, '原办理人不是该任务参与人')
+    await neg({ processTaskId: taskId, fromActor: 'leader', toActor: 'coactor', operator: 'leader' }, '目标人已是该任务参与人')
+
+    // ── 正向：leader 转办给 lisi（原因）──
+    const rw = await facade.flow('processTask/transfer',
+      { processTaskId: taskId, fromActor: 'leader', toActor: 'lisi', reason: '出差', operator: 'leader' })
+    assert.equal(rw.code, 0, JSON.stringify(rw))
+
+    // ① 只摘 fromActor 一行：coactor 保留、lisi 追加、leader 出局（读回持久值）
+    assert.deepEqual(await repo.findTaskActors(taskId), ['coactor', 'lisi'], '参与者读回值')
+    // ② 待办从 A 挪到 B（同一 taskId）
+    const todoB = await repo.pageTodoTasks(1, 50, 'lisi')
+    assert.ok(todoB.rows.some(r => String(r.id) === String(taskId)), 'B 待办出现该任务')
+    const todoA = await repo.pageTodoTasks(1, 50, 'leader')
+    assert.ok(!todoA.rows.some(r => String(r.id) === String(taskId)), 'A 待办消失')
+    // ③ 任务不新建：沿用同一 taskId、仍 DOING、变量落库
+    const stored = await repo.findTaskById(taskId)
+    assert.equal(stored?.taskState, TaskState.Doing, '转办后任务仍进行中')
+    assert.equal(stored?.actorId, '', '转办后 DOING 任务 actor_id 恒无值（契约 06 ⚠️ 严禁覆写）')
+    assert.equal(stored?.variables.submitType, SubmitType.Transfer, 'submitType=7 持久化')
+    assert.equal(stored?.variables.tf_transferTo, 'lisi', 'tf_transferTo 任务变量')
+    assert.equal(stored?.variables.tf_transferReason, '出差', 'tf_transferReason 任务变量')
+    assert.equal(stored?.updateUser, 'leader', 'update_user=转办人')
+    // ④ 审批记录可读"A 转办给 B（原因…）"
+    const rec = await facade.flow('processInstance/approvalRecord', { id: iid })
+    assert.equal(rec.code, 0, JSON.stringify(rec))
+    const recRow = rec.data.find((x: any) => x.taskName === 'task1')
+    assert.ok(String(recRow?.variable?.tf_approvalComment ?? recRow?.ext?.tf_approvalComment ?? '')
+      .includes('leader 转办给 lisi'), `审批记录文案可读转办: ${JSON.stringify(recRow)}`)
+    assert.equal(recRow?.variable?.submitType, SubmitType.Transfer, '审批记录 submitType=7')
+    // ⑤ 转办后 B 能正常办理（prepareExecuteTask 合并任务变量时 submitType 被 execute 入参覆盖）
+    const rEx = await facade.flow('processTask/execute', { processTaskId: taskId, operator: 'lisi', submitType: 1 })
+    assert.equal(rEx.code, 0, JSON.stringify(rEx))
+    assert.equal((await repo.findInstanceById(iid))?.state, InstanceState.Done, 'lisi 办结后流程正常结束')
+    // ⑥ 非 DOING（已完成）不可转办
+    const rT2 = await facade.flow('processTask/transfer',
+      { processTaskId: taskId, fromActor: 'lisi', toActor: 'zhaoliu', operator: 'lisi' })
+    assert.equal(rT2.code, 99999999)
+    assert.ok(String(rT2.msg).includes('任务非进行中，不可转办'), `msg: ${rT2.msg}`)
+
+    // ⑦ flow.admin 可代转办（归属判据例外）
+    const rD = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '05-countersign-parallel.json', 'utf-8') })
+    const rS = await facade.flow('processInstance/startAndExecute', { processDefineId: rD.data.processDefineId, operator: 'zhangsan' })
+    const iid7 = rS.data.processInstanceId as string
+    const doing7 = await repo.findDoingTasks(iid7)
+    const taskA = doing7.find(t => (t.actorIds ?? []).includes('userA'))!
+    const taskB = doing7.find(t => (t.actorIds ?? []).includes('userB'))!
+    assert.ok(taskA && taskB, '会签三任务 userA/userB/userC 就位')
+    const rAdm = await facade.flow('processTask/transfer',
+      { processTaskId: taskA.id, fromActor: 'userA', toActor: 'lisi', operator: 'flow.admin' })
+    assert.equal(rAdm.code, 0, JSON.stringify(rAdm))
+    // 契约 06 §transfer 留痕⚠️（新契约判据）：代转办同样**严禁覆写 actor_id 列**——进行中任务
+    // 该列恒无值；"办理人记谁"由 update_user + tf_transferHistory[].operator 承载
+    assert.equal((await facade.flow('processTask/detail', { id: taskA.id, operator: 'lisi' })).data.operator,
+      '', '转办后 DOING 任务 operator 列恒无值（严禁覆写）')
+    const admHop = (await repo.findTaskById(taskA.id))?.variables.tf_transferHistory
+    assert.ok(Array.isArray(admHop) && admHop.length === 1 && admHop[0].operator === 'flow.admin',
+      `真操作人由账本 operator 承载: ${JSON.stringify(admHop)}`)
+    // ⑧ 会签只动自己那一行：userA 任务参与者换成 lisi，userB 任务行不受影响
+    assert.deepEqual(await repo.findTaskActors(taskA.id), ['lisi'], 'userA 票只摘本人')
+    assert.deepEqual(await repo.findTaskActors(taskB.id), ['userB'], 'userB 票不受影响')
+  })
+
+  it('33 issues/115 转办两跳账本 tf_transferHistory：只追加不覆盖，办结后仍在', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const r0 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') })
+    const r1 = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: r0.data.processDefineId, operator: 'zhangsan' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const iid = r1.data.processInstanceId as string
+    const taskId = (await repo.findDoingTasks(iid))[0].id
+    // 时间格式契约：spec 06 §2.4 一律 yyyy-MM-dd HH:mm:ss
+    const TIME_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/
+
+    // ── clause 4 出口实勘：DOING 任务转办前 actorId 为空（引擎只在 finish 时写办理人）──
+    const beforeDetail = await facade.flow('processTask/detail', { id: taskId, operator: 'lisi' })
+    assert.equal(beforeDetail.data.operator, '', '未转办时 DOING 任务 detail.operator 为空')
+
+    // ── 两跳：leader→lisi→zhaoliu（同一 taskId，账本按跳序累积）──
+    assert.equal((await facade.flow('processTask/transfer', { processTaskId: taskId,
+      fromActor: 'leader', toActor: 'lisi', reason: '出差', operator: 'leader' })).code, 0)
+    assert.equal((await facade.flow('processTask/transfer', { processTaskId: taskId,
+      fromActor: 'lisi', toActor: 'zhaoliu', reason: '转专家', operator: 'lisi' })).code, 0)
+
+    // 每跳一条、六字段齐全；末跳便捷键与可读文案只留末跳（全量以账本为准）
+    const mid = await repo.findTaskById(taskId)
+    const hist = mid?.variables.tf_transferHistory
+    assert.ok(Array.isArray(hist), `tf_transferHistory 应为追加式数组，实测 ${JSON.stringify(mid?.variables.tf_transferHistory)}`)
+    assert.equal(hist?.length, 2, `两跳后账本应 2 条，实测 ${hist?.length}`)
+    const [hop1, hop2] = hist ?? []
+    assert.equal(Object.keys(hop1).sort().join(','), 'fromActor,operator,reason,submitType,time,toActor', '账本条目六字段')
+    assert.deepEqual({ ...hop1, time: '' }, { submitType: SubmitType.Transfer, fromActor: 'leader', toActor: 'lisi', reason: '出差', time: '', operator: 'leader' }, '第 1 跳逐字段')
+    assert.match(hop1.time, TIME_RE, '第 1 跳 time 格式')
+    assert.deepEqual({ ...hop2, time: '' }, { submitType: SubmitType.Transfer, fromActor: 'lisi', toActor: 'zhaoliu', reason: '转专家', time: '', operator: 'lisi' }, '第 2 跳逐字段（append 不覆盖第 1 跳）')
+    assert.match(hop2.time, TIME_RE, '第 2 跳 time 格式')
+    assert.equal(mid?.variables.tf_transferTo, 'zhaoliu', '便捷键反映末跳')
+    assert.equal(mid?.variables.tf_transferReason, '转专家', '末跳原因')
+
+    // ── 契约 06 §transfer 留痕⚠️（新契约判据，替代旧"实测锁死"断言）：转办严禁覆写 actor_id 列，
+    //    四个出口在任务仍 DOING 时读该列都必须是空——持单人以参与者表（taskActorIdList）为准 ──
+    const afterDetail = await facade.flow('processTask/detail', { id: taskId, operator: 'zhaoliu' })
+    const latest = await facade.flow('processTask/latest', { processInstanceId: iid })
+    const instDetail = await facade.flow('processInstance/detail', { id: iid })
+    const todo = await facade.flow('processTask/todoList', { operator: 'zhaoliu' })
+    assert.equal(afterDetail.data.operator, '', '契约回归：processTask/detail.operator 恒无值')
+    assert.equal(latest.data.operator, '', '契约回归：processTask/latest.operator 同上')
+    assert.equal(instDetail.data.activeTaskList.find((t: any) => String(t.id) === String(taskId))?.operator, '', '契约回归：实例详情 activeTaskList.operator 同上')
+    assert.equal(todo.data.rows.find((t: any) => String(t.id) === String(taskId))?.operator, '', '契约回归：待办卡片行 operator 同上')
+    assert.equal(afterDetail.data.taskState, TaskState.Doing, '转办后任务仍 DOING')
+    assert.deepEqual(afterDetail.data.taskActorIdList, ['zhaoliu'], '待办归属（参与者表）正确指向 C')
+
+    // ── C 办结：submitType 槽位被覆盖属预期，账本必须仍在 ──
+    const rEx = await facade.flow('processTask/execute', { processTaskId: taskId, operator: 'zhaoliu', submitType: SubmitType.Agree })
+    assert.equal(rEx.code, 0, JSON.stringify(rEx))
+    const after = await repo.findTaskById(taskId)
+    assert.equal(after?.taskState, TaskState.Done)
+    assert.equal(after?.variables.submitType, SubmitType.Agree, '末跳槽位被 C 的办理动作覆盖（契约明定为预期）')
+    assert.equal(after?.variables.tf_transferHistory?.length, 2, '办结后账本仍在（合并序：实例←任务←本次提交）')
+    assert.deepEqual({ ...after?.variables.tf_transferHistory?.[0], time: '' }, { ...hop1, time: '' }, '办结后第 1 跳内容不变')
+    assert.deepEqual({ ...after?.variables.tf_transferHistory?.[1], time: '' }, { ...hop2, time: '' }, '办结后第 2 跳内容不变')
+    // 审批记录读回（前端唯一读取路径）同样带全量账本
+    const rec = await facade.flow('processInstance/approvalRecord', { id: iid })
+    const row = rec.data.find((x: any) => x.taskName === 'task1')
+    assert.equal(row?.variable?.tf_transferHistory?.length, 2, '审批记录透出两跳账本')
+    assert.equal(row?.variable?.submitType, SubmitType.Agree, '审批记录槽位读作办结动作')
+  })
+
+  it('34 契约06 transfer⚠️：转办不覆写 actor_id——撤回后「我已办」不冒单（内存路契约回归）', async () => {
+    // 缺陷机理（Node 实测复现，契约已固化 778340a）：转办把被摘走的人写进任务 operator 列，
+    // 该单一旦撤回（离开 DOING 但列值留着），pageDoneTasks（state <> 10 AND operator = ?）
+    // 会让他凭空出现在从没办过的「我已办」列表。断言全落持久值/读回值。
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const r0 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') })
+    const r1 = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: r0.data.processDefineId, operator: 'zhangsan' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const iid = r1.data.processInstanceId as string
+    const taskId = (await repo.findDoingTasks(iid))[0].id
+    assert.equal((await facade.flow('processTask/transfer', { processTaskId: taskId,
+      fromActor: 'leader', toActor: 'lisi', reason: '出差', operator: 'leader' })).code, 0)
+    let mid = await repo.findTaskById(taskId)
+    assert.equal(mid?.actorId, '', '转办后持久任务行 actor_id 恒无值')
+    assert.equal(mid?.updateUser, 'leader', '办理人经 update_user 承载')
+    // 发起人撤回：任务离开 DOING(→30)，operator 列不被污染
+    assert.equal((await facade.flow('processInstance/withdraw', { id: iid, operator: 'zhangsan' })).code, 0)
+    mid = await repo.findTaskById(taskId)
+    assert.equal(mid?.taskState, TaskState.Withdraw, '撤回后任务态=30（本用例判据生效的前提）')
+    assert.equal(mid?.actorId, '', '撤回后 actor_id 列仍恒无值')
+    for (const who of ['leader', 'lisi']) {
+      const rd = await facade.flow('processTask/doneList', { operator: who, pageSize: 100 })
+      assert.equal(rd.code, 0, JSON.stringify(rd))
+      assert.ok(!rd.data.rows.some((r: any) => String(r.id) === String(taskId)),
+        `转办→撤回后 ${who} 的「我已办」不得冒入该单（他从没办过）: ${JSON.stringify(rd.data.rows.map((r: any) => r.id))}`)
+    }
   })
 
   // ═══ execute submitType 2/3/4/5/6/20 门面行为（issues/79，前端按钮全量暴露路径）═══
