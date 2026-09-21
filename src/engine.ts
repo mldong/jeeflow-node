@@ -49,6 +49,37 @@ export interface EngineOptions {
   surrogateEnabled?: boolean
 }
 
+/**
+ * 照 mldong-boot2 NodeModel.canRejected：自 current 的入边回溯，命中 parent 放行；
+ * 入边来源是 fork/join/start 时**跳过该条入边、不再深入**（boot2 是 continue，不是穿越），
+ * 其余来源递归。subprocess 在 boot2 里被注释掉，等同普通节点。
+ */
+function canRejected(flow: FlowModel, currentId: string, parentId: string): boolean {
+  for (const edge of flow.edges) {
+    if (edge.targetNodeId !== currentId) continue
+    if (edge.sourceNodeId === parentId) return true
+    const src = findNode(flow, edge.sourceNodeId)
+    if (!src) continue
+    if (src.type === TypeFork || src.type === TypeJoin || src.type === TypeStart) continue
+    if (canRejected(flow, src.id, parentId)) return true
+  }
+  return false
+}
+
+// 复活行的变量净化：剔控制类残留（submitType / taskName / tf_ 前缀 / csv_ 前缀 / 会签簿记），
+// 保留 f_ 表单字段、u_ 用户快照、autoGenTitle、isFirstTaskNode。
+function lineageVars(src: Record<string, any> | undefined): Record<string, any> {
+  const out: Record<string, any> = {}
+  for (const [k, v] of Object.entries(src ?? {})) {
+    if (k === 'submitType' || k === 'taskName'
+        || k.startsWith('tf_') || k.startsWith('csv_')
+        || k.startsWith('loopCounter') || k.startsWith('nrOfInstances')
+        || k.startsWith('operatorList')) continue
+    out[k] = v
+  }
+  return out
+}
+
 export class EngineImpl implements Engine {
   private ext?: EngineExtensions
   private registry?: HandlerRegistry
@@ -314,17 +345,10 @@ export class EngineImpl implements Engine {
   async executeAndJumpTask(taskId: string, operator: string, args: Record<string, any> = {}, targetTaskName?: string): Promise<ProcessInstance> {
     const { task, inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
     if (!targetTaskName) {
-      // issues/79：ROLLBACK 对齐 Java rejectTask——退回上一任务节点（首条输入边 source），
-      // 新任务 actor=当前任务完成人（退回操作人）；无上一任务节点则不产生新待办
-      const prevName = this.previousTaskName(flow, task.taskName)
-      if (prevName) {
-        const prev = findNode(flow, prevName)
-        if (prev) {
-          const actors = this.rollbackActors(prev, inst, task)
-          await this.createTaskWithActors(prev, inst, operator, vars, actors, await this.surrogateProcessName(flow, inst),
-            task.id, this.isFirstTaskNode(flow, prev))
-        }
-      }
+      // issues/121 P2：ROLLBACK 走血缘版——复活 task.parentTaskId 指的那条历史行，
+      // 参与者＝该行办结人（首任务节点行取该行 u_userId）。无血缘/守卫不过显式报错，
+      // 不再像拓扑版那样"什么都不做、实例保持 DOING 却零待办"。
+      await this.rollbackToParent(flow, inst, task, operator)
     } else {
       // issues/79：对齐 Java——目标节点不存在显式报错（前端 JUMP 无效 taskName 不再静默空操作）
       const target = findNode(flow, targetTaskName)
@@ -391,19 +415,6 @@ export class EngineImpl implements Engine {
     return { task, inst, flow, vars }
   }
 
-  // 当前任务节点的首条输入边 source（issues/79 对齐 Java getPreviousTaskName）
-  private previousTaskName(flow: FlowModel, taskName: string): string {
-    const node = findNode(flow, taskName)
-    if (!node) return ''
-    for (const edge of flow.edges) {
-      if (edge.targetNodeId === node.id) {
-        const src = findNode(flow, edge.sourceNodeId)
-        if (src && (src.type === TypeTask || src.type === TypeCustom)) return src.id
-      }
-    }
-    return ''
-  }
-
   // 是否 start 直接后继任务节点（issues/79 对齐 Java FlowUtil.isFirstTaskName）
   private isFirstTaskNode(flow: FlowModel, node: FlowNode): boolean {
     const start = findNodeByType(flow, TypeStart)
@@ -411,34 +422,37 @@ export class EngineImpl implements Engine {
     return flow.edges.some(e => e.sourceNodeId === start.id && e.targetNodeId === node.id)
   }
 
-  // ROLLBACK 新任务参与者：优先当前任务完成人（退回操作人，对齐 Java rejectTask
-  // singletonList(currentTask.getActorId())），其次按目标节点 assignee 解析
-  private rollbackActors(node: FlowNode, inst: ProcessInstance, task: ProcessTask): string[] {
-    if (task.actorId) return [task.actorId]
-    const nextOp = inst.variables[KeyNextNodeOperator]
-    if (nextOp != null) {
-      if (typeof nextOp === 'string') return nextOp.split(',').map(s => s.trim()).filter(Boolean)
-      if (Array.isArray(nextOp)) return nextOp.map(String)
-      return [String(nextOp)]
-    }
-    const assignee = node.properties?.assignee as string | undefined
-    if (assignee) {
-      const actors: string[] = []
-      for (const raw of assignee.split(',')) {
-        let token = raw.trim()
-        if (!token) continue
-        if (token.includes('applicant')) token = token.replace('applicant', inst.operator)
-        if (token in inst.variables) {
-          const val = inst.variables[token]
-          if (Array.isArray(val)) actors.push(...val.map(String))
-          else actors.push(String(val))
-        } else {
-          actors.push(token)
-        }
-      }
-      return actors
-    }
-    return []
+  /**
+   * 退回上一步（血缘版，规范 04 · 退回上一步）：上一步来源＝当前行的 parentTaskId，
+   * 复活那条历史行；不按模型入边拓扑推（拓扑版在分支/回环流会回到本实例没走过的节点，
+   * 还会静默留下"实例 DOING 却零待办"）。错码写在 msg 前缀（出口统一 99999999）。
+   */
+  private async rollbackToParent(flow: FlowModel, inst: ProcessInstance,
+                                  task: ProcessTask, operator: string): Promise<void> {
+    const NO_LINEAGE = '20010007: 上一步任务ID为空，无法驳回至上一步处理'
+    const GUARD = '20010008: 无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务'
+    const parentId = task.parentTaskId
+    if (!parentId || parentId === '0') throw new Error(NO_LINEAGE)
+    const his = await this.repo.findTaskById(parentId)
+    if (!his) throw new Error(NO_LINEAGE)
+    const prev = findNode(flow, his.taskName)
+    if (!prev || !canRejected(flow, task.taskName, prev.id)) throw new Error(GUARD)
+    // 首任务节点那条由发起人提交 ⇒ 参与者取该行 u_userId；其余取该行办结人。
+    // 老行没这个键 ⇒ 按 false 处理（宁可派给该行 actorId，也不用带"仅进行中"判定的现算值）。
+    const isFirst = his.variables?.isFirstTaskNode === true
+    let actor = isFirst ? String(his.variables?.u_userId ?? '') || inst.operator : his.actorId
+    if (!actor) throw new Error(NO_LINEAGE)
+    const nt = inst.createTask(this.nextId(), prev.id, prev.text.value, actor,
+      his.createUser ?? '', prev.properties?.form ?? '', new Date(),
+      his.parentTaskId ?? '0', isFirst, his.performType)
+    // 复活行只带数据类键：tf_*（上次表单提交）与 csv_*/会签簿记都是"上次提交"的残留
+    nt.variables = { ...lineageVars(his.variables), isFirstTaskNode: isFirst }
+    const agents = await this.surrogateAgents([actor], await this.surrogateProcessName(flow, inst))
+    const eff = mergeAgents([actor], agents)
+    if (eff.length > 1) nt.actorIds = eff
+    await this.repo.saveTask(nt)
+    await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id,
+      taskId: nt.id, nodeId: prev.id, operator })
   }
 
   /**

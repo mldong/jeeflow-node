@@ -1957,7 +1957,9 @@ describe('jeeflow compliance tests', () => {
     assert.equal(r3.code, 0, r3.msg)
     const rbTask1 = await doingTaskId(repo, rb, 'task1')
     assert.ok(rbTask1, 'ROLLBACK 应在 task1 产生新待办')
-    assert.ok((await repo.findTaskActors(rbTask1!)).includes('manager'), '退回任务 actor 应为退回操作人 manager')
+    const rb1Actors = await repo.findTaskActors(rbTask1!)  // issues/121 P2 血缘版：复活行参与者＝该行办结人
+    assert.ok(rb1Actors.includes('leader') && !rb1Actors.includes('manager'),
+      `血缘版：复活行 actor 应为 task1 原办结人 leader，不该是执行回退的 manager：${rb1Actors}`)
     assert.equal((await repo.findInstanceById(rb))!.state, InstanceState.Doing, 'ROLLBACK 后实例应保持 DOING(10)')
 
     // ── submitType=4 JUMP：task3 跳转 apply（首任务节点 = start 直接后继，assignee 强制发起人）
@@ -3117,22 +3119,29 @@ describe('issues/116 委托代理自动生效（引擎内置·内存仓路径）
       '条款 1「跳转(JUMP)」：跳转新建的任务未并入代理人（期望 [jmp-wang jmp-agent]）')
   })
 
-  it('条款 1 路径 2/3 回退(ROLLBACK)：回退新建上一节点任务并入回退操作人的代理人（诱饵配原参与人）', async () => {
+  it('条款 1 路径 2/3 回退(ROLLBACK)：复活血缘前驱行并并入该行参与人的代理人（诱饵配执行回退的人）', async () => {
+    // issues/121 P2 血缘版：复活 b1 那条历史行，参与者＝该行办结人 rbk-zhang（不是执行回退的
+    // rbk-wang）。台账延后到 b1 建单之后再配 ⇒ 起点自证仍然成立。
     const { engine, repo, ext, def } = surrHarness('surrback116',
       surrFlowJson('surrback116', [{ id: 'b1', assignee: 'rbk-zhang' }, { id: 'b2', assignee: 'rbk-wang' }]))
-    await putSur(ext, { operator: 'rbk-wang', surrogate: 'rbk-agent', processName: 'surrback116' })    // 回退操作人
-    await putSur(ext, { operator: 'rbk-zhang', surrogate: 'rbk-decoy', processName: 'surrback116' })   // 诱饵：b1 原参与人
 
     const inst = await engine.startProcessInstanceById(def.id, 'rbk-boss')
-    assert.deepEqual(await doingActors(repo, inst.id, 'b1'), ['rbk-zhang', 'rbk-decoy'],
-      '起点自证：发起产生的 b1 只带 rbk-zhang 自己的代理人 ⇒ 回退新建 b1 里的代理人必须另有其人（rbk-agent）')
+    assert.deepEqual(await doingActors(repo, inst.id, 'b1'), ['rbk-zhang'],
+      '起点自证：台账还没配，发起产生的 b1 不该有任何代理人')
     const b1 = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'b1')!
     await engine.executeProcessTask(b1.id, 'rbk-zhang')
+    await putSur(ext, { operator: 'rbk-zhang', surrogate: 'rbk-agent', processName: 'surrback116' })   // 该行办结人
+    await putSur(ext, { operator: 'rbk-boss', surrogate: 'rbk-agent', processName: 'surrback116' })    // 该行是首节点时 ⇒ 参与者取 u_userId/发起人
+    await putSur(ext, { operator: 'rbk-wang', surrogate: 'rbk-decoy', processName: 'surrback116' })    // 诱饵：执行回退的人
     const b2 = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'b2')!
     await engine.executeAndJumpTask(b2.id, 'rbk-wang', {})
-    // 原 b1 已 Done，b1 上唯一进行中任务就是回退新建的那一条
-    assert.deepEqual(await doingActors(repo, inst.id, 'b1'), ['rbk-wang', 'rbk-agent'],
-      '条款 1「回退(ROLLBACK)」：回退新建的任务未并入代理人（期望 [rbk-wang rbk-agent]）')
+    // 原 b1 已 Done，b1 上唯一进行中任务就是复活出来的那一条
+    const revived = await doingActors(repo, inst.id, 'b1')
+    assert.equal(revived.length, 2, `复活行应＝1 个 principal + 1 个代理人，实得 ${JSON.stringify(revived)}`)
+    assert.ok(revived.includes('rbk-agent'),
+      `条款 1「回退(ROLLBACK)」：复活行必须并入其 principal 的代理人，实得 ${JSON.stringify(revived)}`)
+    assert.ok(!revived.includes('rbk-wang') && !revived.includes('rbk-decoy'),
+      `复活行的参与者不能是执行回退的人或其代理人（血缘版），实得 ${JSON.stringify(revived)}`)
   })
 
   it('条款 1 路径 3/3 串行会签每一步推进：推进出的下一步任务并入该成员代理人（1.3 名册顺带钉）', async () => {
@@ -3429,3 +3438,39 @@ class CountDefineRepo extends MemoryRepository {
     return super.findDefineById(id)
   }
 }
+
+// ═══ issues/121 P2 退回上一步（血缘版）两格负向 ═══════════════════════════════
+describe('issues/121 P2 血缘回退负向：20010007 无血缘 / 20010008 守卫', () => {
+  it('首任务节点上退回 ⇒ 无血缘（parent 为 0）报 20010007，不得静默不建单', async () => {
+    const { engine, repo, def } = surrHarness('lin07', surrFlowJson('lin07',
+      [{ id: 'b1', assignee: 'ln-zhang' }, { id: 'b2', assignee: 'ln-wang' }]))
+    const inst = await engine.startProcessInstanceById(def.id, 'ln-boss')
+    const b1 = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'b1')!
+    assert.equal(b1.parentTaskId ?? '0', '0', '前置条件：发起那条 parent 应为 0')
+    await assert.rejects(() => engine.executeAndJumpTask(b1.id, 'ln-zhang', {}), /20010007/)
+  })
+
+  it('血缘前驱跨不过 fork（boot2 语义：遇 fork/join/start 跳过该入边不再深入）⇒ 报 20010008', async () => {
+    const nd = (id: string, type: string, properties: any = {}) => ({ id, type, properties, text: { value: id } })
+    const ed = (a: string, b: string) => ({ id: `e_${a}_${b}`, sourceNodeId: a, targetNodeId: b, properties: {} })
+    const content = JSON.stringify({
+      name: 'lin08', displayName: 'lin08', type: 'approval',
+      nodes: [nd('start', 'snaker:start'),
+        nd('apply', 'snaker:task', { assignee: 'fk-zhang', taskType: 0, performType: 0 }),
+        nd('fork1', 'snaker:fork'),
+        nd('taskA', 'snaker:task', { assignee: 'fk-a', taskType: 0, performType: 0 }),
+        nd('taskB', 'snaker:task', { assignee: 'fk-b', taskType: 0, performType: 0 }),
+        nd('join1', 'snaker:join'), nd('end', 'snaker:end')],
+      edges: [ed('start', 'apply'), ed('apply', 'fork1'), ed('fork1', 'taskA'), ed('fork1', 'taskB'),
+        ed('taskA', 'join1'), ed('taskB', 'join1'), ed('join1', 'end')],
+    })
+    const { engine, repo, def } = surrHarness('lin08', content)
+    const inst = await engine.startProcessInstanceById(def.id, 'fk-boss')
+    const apply = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'apply')!
+    await engine.executeProcessTask(apply.id, 'fk-zhang')
+    const branch = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'taskA')!
+    assert.ok(branch.parentTaskId && branch.parentTaskId !== '0',
+      '前置条件：分支行的 parent 应已由 P1 写入（否则这条红是因为"无血缘"而不是守卫）')
+    await assert.rejects(() => engine.executeAndJumpTask(branch.id, 'fk-a', {}), /20010008/)
+  })
+})
