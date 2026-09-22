@@ -1,0 +1,33 @@
+name: Verify Release
+# 单独可跑的发布核验（同一份 scripts/verify-npm-release.sh 也被 release.yml 的 verify 步复用）。
+# 存在的理由：npm publish 之后版本可能"URL 可拉但 npm i 仍 ETARGET"（元数据秒级尾，09-23 首跑踩过），
+# 而同号重跑 release.yml 会先死在 `npm publish` 上 ⇒ 需要一条只核验、不上传的通道。
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要核验的版本号（形如 v1.8.29）"
+        required: true
+        default: ""
+
+jobs:
+  verify:
+    name: npm 可安装核验
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 定版本
+        id: v
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "ver=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ver=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Verify pullable from npm
+        run: bash scripts/verify-npm-release.sh "${{ steps.v.outputs.ver }}"
