@@ -116,6 +116,10 @@ export interface ProcessExtRepository {
   removeSurrogate(id: string): Promise<void>
   pageSurrogates(pageNum?: number, pageSize?: number, filters?: Record<string, any>, conditions?: QueryCondition[]): Promise<[ProcessSurrogate[], number]>
 
-  // getSurrogate 查询指定时间生效中的委托（enabled=1 + 时间窗内；processName 精确优先，空值全流程兜底）
+  // getSurrogate 查询指定时间生效中的委托（06 §4.5 条款 1.4 + issues/123）：**先**按主键 id
+  // 取该流程作用域内**最新一条**（不带生效判据过滤），**再**由四判据裁决这一条
+  // （enabled 严格 1 / 自委托过滤 / 时间窗任一侧空=不限，at 为空则不比较窗口）。
+  // 该作用域无记录才兜底 processName 为空的"全流程委托"；最新一条不生效 ⇒ null，
+  // 同层内不回落更旧那条，但精确作用域判否后仍要看全流程作用域（条款 1.4 后半句）。见 src/surrogate-rule.ts。
   getSurrogate(operator: string, processName: string, at?: Date): Promise<ProcessSurrogate | null>
 }

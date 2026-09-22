@@ -21,7 +21,7 @@ import { PostgresAdapter } from '../src/jdbc/postgres.js'
 import { InstanceState, TaskState, ProcessInstance, type ProcessDefine } from '../src/model.js'
 import { JeeflowFacade } from '../src/facade.js'
 import type { IDGenerator, UserProvider } from '../src/spi.js'
-import { runParity, PARITY_CASES } from './surrparity.js'
+import { runParity, PARITY_CASES, parityAt } from './surrparity.js'
 
 const dbType = process.env.JEFFLOW_DB ?? 'mysql'
 const isPg = dbType === 'postgres'
@@ -715,6 +715,50 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
     }
   })
 
+  it('issues/123 最新一条不生效 ⇒ 不并入、不回落到更旧生效行（SQL 仓 + 真表读回）', async () => {
+    await cleanup()
+    try {
+      await applySchema(); await insertDefine(); await cleanupN116()
+      const repo = new JdbcRepository(makeAdapter(pool), new TsIDGenerator())
+      const engine = new EngineImpl(repo, userProv, new SeqIDGen())
+      const ext = new JdbcProcessExtRepository(makeAdapter(pool), new TsIDGenerator())
+      new JeeflowFacade(engine, repo, ext)
+
+      // 每轮：更旧一条「窗内 enabled=1」（旧形状会永远命中它）+ 更新一条按某判据不生效
+      const win = { startTime: new Date(Date.now() - DAY), endTime: new Date(Date.now() + DAY) }
+      const rounds: Array<[string, Record<string, any>, string, string[]]> = [
+        ['窗外（未到窗）', { ...win, startTime: new Date(Date.now() + 2 * DAY), endTime: new Date(Date.now() + 3 * DAY) }, 'n123-late', ['n123-zhang']],
+        ['窗外（已过期）', { startTime: new Date(Date.now() - 3 * DAY), endTime: new Date(Date.now() - 2 * DAY) }, 'n123-gone', ['n123-zhang']],
+        ['enabled=0', { ...win, enabled: 0 }, 'n123-off', ['n123-zhang']],
+        ['enabled=2 脏值（列是 INT，脏值以 2 落库）', { ...win, enabled: 2 }, 'n123-dirty', ['n123-zhang']],
+        ['自委托', { ...win }, 'n123-zhang', ['n123-zhang']],
+        ['正向对照：最新一条窗内 enabled=1', { ...win }, 'n123-on', ['n123-zhang', 'n123-on']],
+      ]
+      let i = 0
+      for (const [label, override, agent, expect] of rounds) {
+        i++
+        await q(pool, 'DELETE FROM wf_process_surrogate WHERE operator = ?', ['n123-zhang'])
+        // 更旧的一条（id 小）：窗内 + enabled=1
+        await ext.saveSurrogate(sur({ id: String((isPg ? 9116123000 : 9016123000) + i * 10),
+          operator: 'n123-zhang', surrogate: 'n123-older', processName: 'simple', ...win }))
+        // 更新的一条（id 大）：按某判据不生效（正向对照组则是生效的）
+        await ext.saveSurrogate(sur({ id: String((isPg ? 9116123000 : 9016123000) + i * 10 + 2),
+          operator: 'n123-zhang', surrogate: agent, processName: 'simple', enabled: 1, ...override }))
+        // 种子自证：两条都真落库
+        assert.equal(Number((await q(pool, 'SELECT COUNT(*) AS c FROM wf_process_surrogate WHERE operator = ?',
+          ['n123-zhang']))[0].c), 2, `${label}：台账应有两条`)
+
+        const inst = await engine.startProcessInstanceById(DEFINE_ID, 'n123-zhang')
+        const apply = (await repo.findDoingTasks(inst.id))[0]
+        assert.deepEqual(await actorsOf(apply.id), expect,
+          `${label}：先取 id 最新一条再由四判据裁决 ⇒ 期望参与者 ${JSON.stringify(expect)}`)
+      }
+    } finally {
+      await q(pool, 'DELETE FROM wf_process_surrogate WHERE operator = ?', ['n123-zhang']).catch(() => {})
+      await cleanup(); await cleanupN116()
+    }
+  })
+
   it('issues/116 用例26 装配形态（SQL 仓）：未配扩展仓储不打断建单 / 显式关闭回到仅台账', async () => {
     await cleanup()
     try {
@@ -778,7 +822,8 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
         sur({ operator: 'n116-dual', surrogate: 'd-off', processName: 'd-d', enabled: 0 }),
         sur({ operator: 'n116-dual', surrogate: 'n116-dual', processName: 'd-e' }),
         sur({ operator: 'n116-dual', surrogate: 'd-open', processName: 'd-f', startTime: new Date(Date.now() - DAY) }),
-        // 兜底组：精确行存在但全部不生效 → 落到空流程名行
+        // 兜底组（条款 1.4 后半句）：g-p 作用域里那条已过期 ⇒ 同层不复活，
+        // 但仍由空流程名那条兜底 ⇒ g-global（同操作人 g-x 探针同样拿 g-global 作对照）
         sur({ operator: 'n116-dualg', surrogate: 'g-global', processName: '' }),
         sur({ operator: 'n116-dualg', surrogate: 'g-past', processName: 'g-p', endTime: new Date(Date.now() - DAY) }),
         sur({ operator: 'n116-dualg', surrogate: 'g-hit', processName: 'g-s', enabled: 1 }),
@@ -801,6 +846,7 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
         ['n116-dual', 'd-f', 'd-open'],
         ['n116-dual', 'd-none', null],
         ['n116-dualg', 'g-x', 'g-global'],
+        // issues/123：精确作用域（g-p）那条已过期 ⇒ 同层不复活，但兜底仍接管 ⇒ g-global
         ['n116-dualg', 'g-p', 'g-global'],
         ['n116-dualg', 'g-s', 'g-hit'],
         ['n116-dualg', '', 'g-global'],
@@ -870,10 +916,11 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
       await runParity(memExt, baseId, (desc, ok, detail) => {
         if (!ok) failures.push(`[内存] ${desc}${detail ? `（${detail}）` : ''}`)
       })
-      // 两侧同答案：同一条 (授权人, 流程名) 查询，两仓必须命中同一条记录（id 一致）
+      // 两侧同答案：同一条 (授权人, 流程名, 判定时刻) 查询，两仓必须命中同一条记录（id 一致）
       for (const c of PARITY_CASES) {
-        const s = await sqlExt.getSurrogate(c.operator, c.processName)
-        const m = await memExt.getSurrogate(c.operator, c.processName)
+        const at = parityAt(Date.now(), c)
+        const s = await sqlExt.getSurrogate(c.operator, c.processName, at)
+        const m = await memExt.getSurrogate(c.operator, c.processName, at)
         assert.equal(m?.id ?? null, s?.id ?? null,
           `两仓同答案（${c.what}）：SQL=${s?.id ?? 'null'} 内存=${m?.id ?? 'null'}`)
       }

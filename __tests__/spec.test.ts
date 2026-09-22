@@ -3313,6 +3313,70 @@ describe('issues/116 委托代理自动生效（引擎内置·内存仓路径）
     assert.deepEqual(failures, [], '内存仓与共用期望表不一致：\n' + failures.join('\n'))
   })
 
+  /**
+   * issues/123 任务 A/B（内存仓 + 建单落库断言）：`条款 1.4 多条命中取 id 最大` 那条用例的
+   * 延长线 —— 同一授权人+同一流程先有一条「窗内 enabled=1」，之后再新建一条**更新**的
+   * 窗外 / enabled=0 / enabled=2 脏值 / 自委托记录 ⇒ 参与者读回**只有原人**
+   * （先按 id 取最新一条、再由四判据裁决这一条，不生效就不命中，**不回落**到更旧那条）。
+   * 每轮配正向对照（最新一条生效 ⇒ 必须并入），防判据写反成"恒不并入"后空转通过。
+   */
+  it('issues/123 最新一条不生效 ⇒ 建单不并入代理人、不回落到更旧生效行（内存仓）', async () => {
+    const t0 = Date.now()
+    const dt = (days: number) => fmtDt(new Date(t0 + days * dayMs))
+    const rounds: Array<[string, Record<string, any>, string, string[]]> = [
+      ['A1 最新一条窗外（未到窗）', { startTime: dt(3), endTime: dt(5) }, 'aLate', ['zhang']],
+      ['A2 最新一条窗外（已过期）', { startTime: dt(-5), endTime: dt(-3) }, 'aGone', ['zhang']],
+      ['A3 最新一条 enabled=0', { enabled: 0 }, 'aOff', ['zhang']],
+      ['A4 最新一条 enabled=2 脏值', { enabled: 2 }, 'aDirty', ['zhang']],
+      ['A5 最新一条自委托', {}, 'zhang', ['zhang']],
+      ['B 正向对照：最新一条窗内 enabled=1', {}, 'aOn', ['zhang', 'aOn']],
+    ]
+    for (const [label, override, agent, expect] of rounds) {
+      const { engine, repo, ext, def } =
+        surrHarness('surr123-a', surrFlowJson('surr123-a', [{ id: 't1', assignee: 'zhang' }]))
+      // 更旧的一条：窗内 + enabled=1 —— 旧形状（先滤生效再取最新）会把它当成命中行永远并入
+      await putSur(ext, { id: '123001', operator: 'zhang', surrogate: 'aOlder',
+        processName: 'surr123-a', startTime: dt(-1), endTime: dt(1) })
+      // 更新的一条：按某判据不生效（正向对照组则是生效的）
+      await putSur(ext, { id: '123002', operator: 'zhang', surrogate: agent,
+        processName: 'surr123-a', startTime: dt(-1), endTime: dt(1), enabled: 1, ...override })
+      // 种子自证：两条都真落库（否则"不并入"只是数据没进去）
+      assert.ok(await ext.findSurrogateById('123001'), `${label}：更旧那条未落库`)
+      assert.equal((await ext.findSurrogateById('123002'))?.surrogate, agent, `${label}：最新那条未落库`)
+      const inst = await engine.startProcessInstanceById(def.id, 'boss')
+      assert.deepEqual(await doingActors(repo, inst.id, 't1'), expect,
+        `${label}：期望参与者 ${JSON.stringify(expect)}`)
+    }
+  })
+
+  /**
+   * issues/123 判据 4（内存仓）：精确作用域最新一条停用 ⇒ 同层内不复活更旧那条，
+   * 但仍须由那条生效的全流程兜底委托接管（条款 1.4 后半句，对齐 Java 既有测试）。
+   * 末尾删净精确作用域两条后再发起一次，证明兜底路径本身是活的。
+   */
+  it('issues/123 精确作用域最新一条不生效 ⇒ 由生效的全流程委托兜底（内存仓）', async () => {
+    const t0 = Date.now()
+    const dt = (days: number) => fmtDt(new Date(t0 + days * dayMs))
+    const { engine, repo, ext, def } =
+      surrHarness('surr123-g', surrFlowJson('surr123-g', [{ id: 't1', assignee: 'zhang' }]))
+    await putSur(ext, { id: '123010', operator: 'zhang', surrogate: 'aAll', processName: '',
+      startTime: dt(-1), endTime: dt(1) })                              // 生效的全流程兜底行
+    await putSur(ext, { id: '123011', operator: 'zhang', surrogate: 'aOk', processName: 'surr123-g',
+      startTime: dt(-1), endTime: dt(1) })                              // 本流程窗内生效（更旧）
+    await putSur(ext, { id: '123012', operator: 'zhang', surrogate: 'aOff', processName: 'surr123-g',
+      startTime: dt(-1), endTime: dt(1), enabled: 0 })                   // 本流程最新一条：停用
+    const inst = await engine.startProcessInstanceById(def.id, 'boss')
+    assert.deepEqual(await doingActors(repo, inst.id, 't1'), ['zhang', 'aAll'],
+      '精确作用域最新一条停用 ⇒ 同层不复活 aOk/aOff，但由全流程兜底行 aAll 接管（条款 1.4）')
+
+    // 正向对照：删净精确作用域两条后，兜底路径必须照常接管
+    await ext.removeSurrogate('123012')
+    await ext.removeSurrogate('123011')
+    const inst2 = await engine.startProcessInstanceById(def.id, 'boss')
+    assert.deepEqual(await doingActors(repo, inst2.id, 't1'), ['zhang', 'aAll'],
+      '精确作用域清空后，空 processName 的兜底委托应并入代理人')
+  })
+
   it('条款 5 判据 d 写侧：脏 enabled 归 0 落库且不打断保存（读回持久值）', async () => {
     const { engine, repo, ext, facade } = setupExt()
     const defineId = await deploySimple(facade)

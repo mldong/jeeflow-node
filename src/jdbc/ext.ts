@@ -8,6 +8,7 @@ import {
 } from '../model.js'
 import type { IDGenerator, ProcessExtRepository, QueryCondition } from '../spi.js'
 import { TsIDGenerator, rowId, type SqlAdapter, type SqlConnection } from './shared.js'
+import { surrogateIsEffective, surrogateTimeMs } from '../surrogate-rule.js'
 
 const txStore = new AsyncLocalStorage<SqlConnection>()
 
@@ -277,34 +278,41 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
   }
 
   /**
-   * 生效委托查询（issues/116 判据 a~d 基准实现）：
-   *  a. processName 先精确命中，未命中再兜底 process_name IS NULL OR = '' （全流程委托）
-   *  b. 时间窗 start_time <= at <= end_time，任一侧 NULL = 该侧不限
-   *  c. 自委托过滤 surrogate <> operator
-   *  d. enabled 只认 1（INT 列，脏值进不来；NULL 也不生效）
-   * 多条命中取 id 最大（最新）一条 —— 内存仓须给出同结论（MemoryExtRepository.getSurrogate）
+   * 生效委托查询（issues/116 判据 a~d 基准实现 + issues/123 的取行/裁决顺序）：
+   *  a. 作用域：先在该流程名作用域内取记录，该作用域**一条都没有**才兜底
+   *     `process_name IS NULL OR = ''`（全流程委托）；精确作用域里只要有记录就由它裁决；
+   *  然后由 `surrogateIsEffective` 裁决**这一条**：
+   *  d. enabled 严格 1（'1'/1 同结论，NULL 不生效）、c. 自委托过滤、
+   *  b. 时间窗 start<=at<=end（任一侧 NULL = 该侧不限；`at` 传 null 则整段跳过窗比较）。
+   *
+   * ⚠️ 旧形状是 `WHERE operator=? AND enabled=1 AND surrogate<>? AND 窗口… ORDER BY id DESC LIMIT 1`
+   * ——先滤生效再取最新，等于"历史上留过一条窗内且 enabled=1 的记录就永久生效"，用户随后
+   * 新建的窗外 / enabled=0 / 脏值 / 自委托记录全都判不动它（issues/123，13 栈 L2-17/L2-18 全红）。
+   * 现在 WHERE 里**不带**任何生效判据，只 `ORDER BY id DESC LIMIT 1` 取最新一条；
+   * 最新一条不生效 ⇒ 同层内不回落更旧那条，转看全流程作用域的最新一条；两层都判否才返回 null。
+   * 内存仓须给出同结论（MemoryExtRepository.getSurrogate，共用 src/surrogate-rule.ts）。
    */
   async getSurrogate(operator: string, processName: string, at: Date = new Date()): Promise<ProcessSurrogate | null> {
     const name = processName ?? ''
-    if (name) {
-      const hit = await this.querySurrogate(operator, name, at)
-      if (hit) return hit
+    const ms = surrogateTimeMs(at)
+    let newest = await this.queryNewestSurrogate(operator, name)
+    if (!surrogateIsEffective(newest, operator, ms) && name) {
+      // 精确作用域判否（含池空）⇒ 仍要看全流程作用域的最新一条（条款 1.4 后半句）
+      newest = await this.queryNewestSurrogate(operator, '')
     }
-    return this.querySurrogate(operator, '', at)
+    return surrogateIsEffective(newest, operator, ms) ? newest : null
   }
 
-  private async querySurrogate(operator: string, processName: string, at: Date): Promise<ProcessSurrogate | null> {
-    let sql = `SELECT ${JdbcProcessExtRepository.SURROGATE_COLS} FROM wf_process_surrogate WHERE operator = ? AND enabled = 1 AND surrogate <> ?`
-    const args: any[] = [operator, operator]
+  /** 该授权人在指定流程作用域内**最新的一条**委托：只排序取首行，不滤任何生效判据。
+   *  processName 为 '' = 全流程委托作用域（process_name IS NULL OR = ''）。 */
+  private async queryNewestSurrogate(operator: string, processName: string): Promise<ProcessSurrogate | null> {
+    let sql = `SELECT ${JdbcProcessExtRepository.SURROGATE_COLS} FROM wf_process_surrogate WHERE operator = ?`
+    const args: any[] = [operator]
     if (!processName) {
       sql += " AND (process_name IS NULL OR process_name = '')"
     } else {
       sql += ' AND process_name = ?'
       args.push(processName)
-    }
-    if (at) {
-      sql += ' AND (start_time IS NULL OR start_time <= ?) AND (end_time IS NULL OR end_time >= ?)'
-      args.push(at, at)
     }
     sql += ' ORDER BY id DESC LIMIT 1'
     const conn = await this.c()
