@@ -3582,4 +3582,54 @@ describe('issues/122 审批记录行的可空时间列必须出键', () => {
     const stripped = JSON.parse(JSON.stringify(row, (_k, v) => (v === null ? undefined : v)))
     assert.ok('finishTime' in stripped, '过剥-null 序列化后仍要保住键')
   })
+
+  /**
+   * issues/122 的完整面：fmtTime 覆盖的是**所有行投影**（任务行/委托行/设计行/实例行），
+   * 逐个补 `?? ''` 迟早漏一处 ⇒ 归一放在 fmtTime 本身。本用例不写死键路径，
+   * 直接扫三条真实 action 的响应树：任何 *Time 键都必须是字符串（空即 ''），
+   * 且过一遍下游的剥-null 序列化后键集合不得变小。
+   */
+  it('全链时间列一律出键出空串（任务行 / 委托行 / 定义行三投影，含剥-null 反闸）', async () => {
+    const { engine, repo } = setup()
+    const ext = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, ext)
+    const def = loadFlow(repo, '02-multi-task.json')
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
+    // 委托行：不填起止时间 ⇒ 走的是"空值"那一支
+    await ext.saveSurrogate({
+      id: '1220001', operator: 'surr-op', surrogate: 'agent-a', processName: '', enabled: 1,
+    } as any)
+
+    const probes: Array<[string, any]> = [
+      ['processInstance/detail', await facade.flow('processInstance/detail', { id: inst.id })],
+      ['processSurrogate/page', await facade.flow('processSurrogate/page', { operator: 'surr-op' })],
+      ['processDefine/page', await facade.flow('processDefine/page', {})],
+    ]
+    const isTimeKey = (k: string) =>
+      /(?:Time|Time\w*)$/.test(k) && k !== 'expireTimeOut' && !/Timeout/i.test(k)
+    const scan = (node: any, path: string, keys: string[], bad: string[]) => {
+      if (node == null || typeof node !== 'object') return
+      for (const [k, v] of Object.entries(node)) {
+        const p = `${path}.${k}`
+        if (isTimeKey(k)) {
+          keys.push(p)
+          if (typeof v !== 'string') bad.push(`${p}=${JSON.stringify(v)}`)
+        }
+        scan(v, p, keys, bad)
+      }
+    }
+    for (const [action, r] of probes) {
+      assert.equal(r.code, 0, `${action} 应成功：${JSON.stringify(r)}`)
+      const keys: string[] = [], bad: string[] = []
+      scan(r, action, keys, bad)
+      assert.ok(keys.length > 0, `${action} 响应里一个时间列都没扫到 ⇒ 本用例空转（夹具失效）`)
+      assert.deepEqual(bad, [],
+        `${action}：时间列必须是字符串（空值出 ''），出 null 会被 mldong-nestjs 的剥-null 拦截器连键吞掉（issues/122）`)
+      // 反闸正向自证：过一遍剥-null 序列化，键集合必须一模一样
+      const after: string[] = [], afterBad: string[] = []
+      scan(JSON.parse(JSON.stringify(r, (_k, v) => (v === null ? undefined : v))), action, after, afterBad)
+      assert.deepEqual(after.sort(), keys.slice().sort(),
+        `${action}：剥-null 序列化后时间键集合变了 ⇒ 有键被整键吞掉`)
+    }
+  })
 })

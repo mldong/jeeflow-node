@@ -799,7 +799,7 @@ export class JeeflowFacade {
       // issues/122：可空时间列空值出 '' 不出 null——mldong-nestjs 全局 SmartNullStripping
       // 拦截器会把 null 值整键剥掉（本出口是对象字面量，拿不到 keepNull:fields 元数据），
       // 出 '' 才能让键恒在，形状也与 boot2 的 record 行一致。
-      finishTime: fmtTime(t.finishTime) ?? '', variable: t.variables ?? {},
+      finishTime: fmtTime(t.finishTime), variable: t.variables ?? {},
       ext: t.variables ?? {}, // issues/15：前端读 ext.tf_approvalComment
     }))
   }
@@ -1103,11 +1103,11 @@ export class JeeflowFacade {
         id: t.id, processInstanceId: t.processInstanceId, taskName: t.taskName,
         displayName: t.displayName, taskType: t.taskType ?? null,
         performType: t.performType ?? null, taskState: t.taskState,
-        operator: t.actorId ?? '', finishTime: t.finishTime,
-        expireTime: t.expireTime, formKey: t.formKey ?? '', taskParentId: t.parentTaskId ?? null,
+        operator: t.actorId ?? '', finishTime: fmtTime(t.finishTime),
+        expireTime: fmtTime(t.expireTime), formKey: t.formKey ?? '', taskParentId: t.parentTaskId ?? null,
         variable: JSON.stringify(t.variables ?? {}),
-        createTime: t.createTime, createUser: t.createUser,
-        updateTime: t.updateTime, updateUser: t.updateUser,
+        createTime: fmtTime(t.createTime), createUser: t.createUser,
+        updateTime: fmtTime(t.updateTime), updateUser: t.updateUser,
         taskActorIdList: t.actorIds ?? [],
         taskFormData: formDataOf(t.variables, 'tf_'), // issues/15
       }
@@ -1127,7 +1127,7 @@ export class JeeflowFacade {
       businessNo: inst.businessNo, operator: inst.operator,
       variables: inst.variables,
       formData: formDataOf(inst.variables, 'f_'), // issues/15
-      createTime: inst.createTime, createUser: inst.createUser,
+      createTime: fmtTime(inst.createTime), createUser: inst.createUser,
       jsonObject: graph, // issues/05
       tasks,
       activeTaskList,
@@ -1390,9 +1390,15 @@ function formDataOf(vars: Record<string, any> | undefined, prefix: string): Reco
   return out
 }
 
-/** Date → 'yyyy-MM-dd HH:mm:ss'（null/undefined → null） */
-function fmtTime(v: Date | undefined | null): string | null {
-  if (v == null) return null
+/**
+ * Date → 'yyyy-MM-dd HH:mm:ss'；**空值出 ''、不出 null**。
+ *
+ * 出 null 会被下游 `mldong-nestjs` 的全局剥-null 拦截器（SmartNullStripping）连键一起吞掉，
+ * 13 栈里就只有 nestjs 少这些列（issues/122 的机理）。规范 06 §2.4 的时间列是"必出键、空即空串"，
+ * 所以归一放在这一层：所有行投影共用它，逐个补 `?? ''` 迟早漏一处。
+ */
+function fmtTime(v: Date | undefined | null): string {
+  if (v == null) return ''
   const p = (n: number) => String(n).padStart(2, '0')
   return `${v.getFullYear()}-${p(v.getMonth() + 1)}-${p(v.getDate())} ${p(v.getHours())}:${p(v.getMinutes())}:${p(v.getSeconds())}`
 }
