@@ -3447,7 +3447,8 @@ describe('issues/121 P2 血缘回退负向：20010007 无血缘 / 20010008 守�
     const inst = await engine.startProcessInstanceById(def.id, 'ln-boss')
     const b1 = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'b1')!
     assert.equal(b1.parentTaskId ?? '0', '0', '前置条件：发起那条 parent 应为 0')
-    await assert.rejects(() => engine.executeAndJumpTask(b1.id, 'ln-zhang', {}), /20010007/)
+    await assert.rejects(() => engine.executeAndJumpTask(b1.id, 'ln-zhang', {}), (err: any) =>
+      String(err?.message).includes('上一步任务ID为空，无法驳回至上一步处理') && !String(err?.message).includes('2001000'))
 
     // 老行形状：P1 之前落的数据该列是 NULL（仓储读回 undefined），同样必须报错——
     // 不能因为"取不到 parent"就静默走"什么都不建单"那条路。
@@ -3457,7 +3458,8 @@ describe('issues/121 P2 血缘回退负向：20010007 无血缘 / 20010008 守�
     legacy.parentTaskId = undefined
     await repo.updateTask(legacy)
     const beforeRollback = (await repo.findDoingTasks(inst2.id)).length
-    await assert.rejects(() => engine.executeAndJumpTask(legacy.id, 'ln-zhang', {}), /20010007/)
+    await assert.rejects(() => engine.executeAndJumpTask(legacy.id, 'ln-zhang', {}), (err: any) =>
+      String(err?.message).includes('上一步任务ID为空，无法驳回至上一步处理') && !String(err?.message).includes('2001000'))
     assert.ok((await repo.findDoingTasks(inst2.id)).length <= beforeRollback,
       '报错即不建单：不该凭空多出进行中任务（内存仓储无事务，只断"不多"）')
 
@@ -3468,7 +3470,8 @@ describe('issues/121 P2 血缘回退负向：20010007 无血缘 / 20010008 守�
     dangling.parentTaskId = '9223372036854775807'
     await repo.updateTask(dangling)
     const before3 = (await repo.findDoingTasks(inst3.id)).length
-    await assert.rejects(() => engine.executeAndJumpTask(dangling.id, 'ln-zhang', {}), /20010007/)
+    await assert.rejects(() => engine.executeAndJumpTask(dangling.id, 'ln-zhang', {}), (err: any) =>
+      String(err?.message).includes('上一步任务ID为空，无法驳回至上一步处理') && !String(err?.message).includes('2001000'))
     assert.ok((await repo.findDoingTasks(inst3.id)).length <= before3,
       '"取不到历史行"也不得静默不建单')
   })
@@ -3494,6 +3497,7 @@ describe('issues/121 P2 血缘回退负向：20010007 无血缘 / 20010008 守�
     const branch = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'taskA')!
     assert.ok(branch.parentTaskId && branch.parentTaskId !== '0',
       '前置条件：分支行的 parent 应已由 P1 写入（否则这条红是因为"无血缘"而不是守卫）')
-    await assert.rejects(() => engine.executeAndJumpTask(branch.id, 'fk-a', {}), /20010008/)
+    await assert.rejects(() => engine.executeAndJumpTask(branch.id, 'fk-a', {}), (err: any) =>
+      String(err?.message).includes('无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务') && !String(err?.message).includes('2001000'))
   })
 })

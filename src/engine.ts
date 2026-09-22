@@ -425,12 +425,12 @@ export class EngineImpl implements Engine {
   /**
    * 退回上一步（血缘版，规范 04 · 退回上一步）：上一步来源＝当前行的 parentTaskId，
    * 复活那条历史行；不按模型入边拓扑推（拓扑版在分支/回环流会回到本实例没走过的节点，
-   * 还会静默留下"实例 DOING 却零待办"）。错码写在 msg 前缀（出口统一 99999999）。
+   * 还会静默留下"实例 DOING 却零待办"）。对外 msg 用固定中文文案、不含引擎内部码（出口统一 99999999）。
    */
   private async rollbackToParent(flow: FlowModel, inst: ProcessInstance,
                                   task: ProcessTask, operator: string): Promise<void> {
-    const NO_LINEAGE = '20010007: 上一步任务ID为空，无法驳回至上一步处理'
-    const GUARD = '20010008: 无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务'
+    const NO_LINEAGE = '上一步任务ID为空，无法驳回至上一步处理'
+    const GUARD = '无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务'
     const parentId = task.parentTaskId
     if (!parentId || parentId === '0') throw new Error(NO_LINEAGE)
     const his = await this.repo.findTaskById(parentId)
