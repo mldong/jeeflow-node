@@ -796,7 +796,10 @@ export class JeeflowFacade {
     return his.map(t => ({
       taskName: t.taskName, displayName: t.displayName, taskType: t.taskType ?? null,
       performType: t.performType ?? null, taskState: t.taskState, operator: t.actorId ?? '',
-      finishTime: fmtTime(t.finishTime), variable: t.variables ?? {},
+      // issues/122：可空时间列空值出 '' 不出 null——mldong-nestjs 全局 SmartNullStripping
+      // 拦截器会把 null 值整键剥掉（本出口是对象字面量，拿不到 keepNull:fields 元数据），
+      // 出 '' 才能让键恒在，形状也与 boot2 的 record 行一致。
+      finishTime: fmtTime(t.finishTime) ?? '', variable: t.variables ?? {},
       ext: t.variables ?? {}, // issues/15：前端读 ext.tf_approvalComment
     }))
   }

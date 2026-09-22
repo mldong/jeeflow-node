@@ -3501,3 +3501,21 @@ describe('issues/121 P2 血缘回退负向：20010007 无血缘 / 20010008 守�
       String(err?.message).includes('无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务') && !String(err?.message).includes('2001000'))
   })
 })
+describe('issues/122 审批记录行的可空时间列必须出键', () => {
+  it('进行中的那条：finishTime 出空串且经剥-null 序列化后键仍在', async () => {
+    const { engine, repo } = setup()
+    const def = loadFlow(repo, '02-multi-task.json')
+    const facade = new JeeflowFacade(engine, repo, undefined)
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
+    const doing = (await repo.findDoingTasks(inst.id))[0]
+    const r = await facade.flow('processInstance/approvalRecord', { id: inst.id })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    const row: any = r.data.find((x: any) => x.taskName === doing.taskName)
+    assert.ok(row, `记录行里应能找到进行中的那条: ${JSON.stringify(r.data)}`)
+    assert.ok('finishTime' in row, '可空时间列必须出键（不是整键省略）')
+    assert.equal(row.finishTime, '', "空值出 ''（与 boot2 同形），不能是 null")
+    // 反闸正向自证：套一遍 mldong-nestjs 的剥 null 规则，键必须活下来
+    const stripped = JSON.parse(JSON.stringify(row, (_k, v) => (v === null ? undefined : v)))
+    assert.ok('finishTime' in stripped, '过剥-null 序列化后仍要保住键')
+  })
+})
