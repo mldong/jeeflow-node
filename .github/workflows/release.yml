@@ -23,3 +23,28 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      # npm publish 退 0 之后注册表仍有一段传播尾；轮询到 200 + 干净目录里真装一次才算发出去
+      # （口径同 jeeflow-java 的 verify-maven-central.sh：CI 绿＝用户拉得到）。
+      - name: Verify pullable from npm
+        env:
+          VER: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          v="${VER#v}"
+          url="https://registry.npmjs.org/@mldong%2Fjeeflow/${v}"
+          deadline=$(( $(date +%s) + 900 ))   # 15 min
+          while :; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || echo 000)
+            if [ "$code" = "200" ]; then echo "✅ @mldong/jeeflow ${v} 公网可拉"; break; fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::超时 15min 仍 HTTP $code — @mldong/jeeflow ${v} 在 npm 上拉不到，别当已发版"
+              exit 1
+            fi
+            echo "等待 npm 分发（当前 $code，剩余 $(( (deadline - $(date +%s)) / 60 ))min）"
+            sleep 20
+          done
+          rm -rf /tmp/npmver && mkdir -p /tmp/npmver && cd /tmp/npmver
+          npm init -y >/dev/null 2>&1
+          npm i --no-audit --no-fund --registry=https://registry.npmjs.org/ "@mldong/jeeflow@${v}" >/dev/null
+          PKG_VERSION="$v" node -e "const p=require('@mldong/jeeflow/package.json'); if(p.version!==process.env.PKG_VERSION) throw new Error('干净目录装到 '+p.version+'，期望 '+process.env.PKG_VERSION); console.log('✅ 干净目录装到', p.version)"
+
