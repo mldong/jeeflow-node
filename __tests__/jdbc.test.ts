@@ -599,7 +599,7 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
       // ④ 审批记录（SQL findHistoryTasks）透出全量账本
       const rec = await facade.flow('processInstance/approvalRecord', { id: inst.id })
       const row = rec.data.find((x: any) => x.taskName === 'task1')
-      assert.equal(row?.variable?.tf_transferHistory?.length, 2, '审批记录透出两跳账本')
+      assert.equal(row?.ext?.tf_transferHistory?.length, 2, '审批记录透出两跳账本') // issues/124：行出口读 ext
     } finally {
       await cleanup()
     }

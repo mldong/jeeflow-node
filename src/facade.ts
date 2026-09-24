@@ -799,8 +799,8 @@ export class JeeflowFacade {
       // issues/122：可空时间列空值出 '' 不出 null——mldong-nestjs 全局 SmartNullStripping
       // 拦截器会把 null 值整键剥掉（本出口是对象字面量，拿不到 keepNull:fields 元数据），
       // 出 '' 才能让键恒在，形状也与 boot2 的 record 行一致。
-      finishTime: fmtTime(t.finishTime), variable: t.variables ?? {},
-      ext: t.variables ?? {}, // issues/15：前端读 ext.tf_approvalComment
+      finishTime: fmtTime(t.finishTime),
+      ext: t.variables ?? {}, // issues/15：前端读 ext.tf_approvalComment；issues/124 variable 原串出口下线
     }))
   }
 
@@ -1105,7 +1105,6 @@ export class JeeflowFacade {
         performType: t.performType ?? null, taskState: t.taskState,
         operator: t.actorId ?? '', finishTime: fmtTime(t.finishTime),
         expireTime: fmtTime(t.expireTime), formKey: t.formKey ?? '', taskParentId: t.parentTaskId ?? null,
-        variable: JSON.stringify(t.variables ?? {}),
         createTime: fmtTime(t.createTime), createUser: t.createUser,
         updateTime: fmtTime(t.updateTime), updateUser: t.updateUser,
         taskActorIdList: t.actorIds ?? [],
@@ -1125,7 +1124,7 @@ export class JeeflowFacade {
       id: inst.id, parentId: inst.parentId, processDefineId: inst.defineId,
       state: inst.state, parentNodeName: inst.parentNodeName,
       businessNo: inst.businessNo, operator: inst.operator,
-      variables: inst.variables,
+      ext: inst.variables ?? {}, // issues/124：变量唯一对外出口，空变量出 {} 而非 null
       formData: formDataOf(inst.variables, 'f_'), // issues/15
       createTime: fmtTime(inst.createTime), createUser: inst.createUser,
       jsonObject: graph, // issues/05
@@ -1487,7 +1486,7 @@ function instanceRowToMap(r: InstanceRow): Record<string, any> {
     id: r.id, parentId: r.parentId ?? null, processDefineId: r.defineId,
     state: r.state, parentNodeName: r.parentNodeName, businessNo: r.businessNo,
     operator: r.operator, expireTime: fmtTime(r.expireTime),
-    variable: r.variables, createTime: fmtTime(r.createTime), createUser: r.createUser,
+    createTime: fmtTime(r.createTime), createUser: r.createUser,
     updateTime: fmtTime(r.updateTime), updateUser: r.updateUser,
     processDefineName: r.defineName, processDefineDisplayName: r.defineDisplayName,
     processDefineVersion: r.defineVersion,
@@ -1501,7 +1500,7 @@ function ccRowToMap(r: CcInstanceRow): Record<string, any> {
     id: r.id, parentId: r.parentId ?? null, processDefineId: r.defineId,
     state: r.state, parentNodeName: r.parentNodeName, businessNo: r.businessNo,
     operator: r.operator, expireTime: fmtTime(r.expireTime),
-    variable: r.variables, createTime: fmtTime(r.createTime), createUser: r.createUser,
+    createTime: fmtTime(r.createTime), createUser: r.createUser,
     updateTime: fmtTime(r.updateTime), updateUser: r.updateUser,
     processDefineName: r.defineName, processDefineDisplayName: r.defineDisplayName,
     processDefineVersion: r.defineVersion,
@@ -1521,10 +1520,10 @@ function taskRowToMap(r: TaskRow): Record<string, any> {
     displayName: r.displayName, taskType: r.taskType, performType: r.performType,
     taskState: r.taskState, operator: r.operator, finishTime: fmtTime(r.finishTime),
     expireTime: fmtTime(r.expireTime), formKey: r.formKey, taskParentId: r.taskParentId ?? null,
-    variable: r.variables, createTime: fmtTime(r.createTime), createUser: r.createUser,
+    createTime: fmtTime(r.createTime), createUser: r.createUser,
     updateTime: fmtTime(r.updateTime), updateUser: r.updateUser,
     processDefineName: r.processDefineName, processDefineDisplayName: r.processDefineDisplayName,
-    instanceVariable: r.instanceVariable, instanceCreateTime: fmtTime(r.instanceCreateTime),
+    instanceCreateTime: fmtTime(r.instanceCreateTime),
     ext, instanceExt, version: r.defineVersion,
     taskFormData: formDataOf(r.variables, 'tf_'), // issues/15
   }

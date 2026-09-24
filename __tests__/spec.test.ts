@@ -1776,9 +1776,9 @@ describe('jeeflow compliance tests', () => {
     const rec = await facade.flow('processInstance/approvalRecord', { id: iid })
     assert.equal(rec.code, 0, JSON.stringify(rec))
     const recRow = rec.data.find((x: any) => x.taskName === 'task1')
-    assert.ok(String(recRow?.variable?.tf_approvalComment ?? recRow?.ext?.tf_approvalComment ?? '')
+    assert.ok(String(recRow?.ext?.tf_approvalComment ?? '')
       .includes('leader 转办给 lisi'), `审批记录文案可读转办: ${JSON.stringify(recRow)}`)
-    assert.equal(recRow?.variable?.submitType, SubmitType.Transfer, '审批记录 submitType=7')
+    assert.equal(recRow?.ext?.submitType, SubmitType.Transfer, '审批记录 submitType=7') // issues/124：行出口读 ext
     // ⑤ 转办后 B 能正常办理（prepareExecuteTask 合并任务变量时 submitType 被 execute 入参覆盖）
     const rEx = await facade.flow('processTask/execute', { processTaskId: taskId, operator: 'lisi', submitType: 1 })
     assert.equal(rEx.code, 0, JSON.stringify(rEx))
@@ -1873,8 +1873,8 @@ describe('jeeflow compliance tests', () => {
     // 审批记录读回（前端唯一读取路径）同样带全量账本
     const rec = await facade.flow('processInstance/approvalRecord', { id: iid })
     const row = rec.data.find((x: any) => x.taskName === 'task1')
-    assert.equal(row?.variable?.tf_transferHistory?.length, 2, '审批记录透出两跳账本')
-    assert.equal(row?.variable?.submitType, SubmitType.Agree, '审批记录槽位读作办结动作')
+    assert.equal(row?.ext?.tf_transferHistory?.length, 2, '审批记录透出两跳账本') // issues/124：行出口读 ext
+    assert.equal(row?.ext?.submitType, SubmitType.Agree, '审批记录槽位读作办结动作')
   })
 
   it('34 契约06 transfer⚠️：转办不覆写 actor_id——撤回后「我已办」不冒单（内存路契约回归）', async () => {
