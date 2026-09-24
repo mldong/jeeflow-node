@@ -50,15 +50,71 @@ const SURROGATES: Array<[string, string]> = [
   ['leader', 'manager'], ['manager', 'director'], ['director', 'boss'], ['boss', 'user1'],
 ]
 
+// 申请信息表单：f_ 前缀 = 实例变量，前端「申请信息」区按 apply 节点 formKey 取 f_* 回显。
+// 键 = defineId（13 = 11-assignment-handler 无 apply 节点，故表里没有 '13'）。
+// ⚠️ 八语言 demo 必须同表同值同序——跨栈字节级一致是生态硬规则，勿改措辞、勿重排。
+// ⚠️ 日期写死字面量，绝不按当前时钟算：八栈跑的机器时区/系统时间各异，
+//    算出来的日期会漂移，横评时数据就不再可比。
+// ⚠️ 字段名严禁叫 amount / finalAmount：它们是 03-decision-expr、10-mixed-mode
+//    条件表达式里的判定变量（IN_PROGRESS/FINISHED 的 extra.amount 走的就是这条线），
+//    撞上会改变流程走向。
+const FORM_BY_DEFINE: Record<string, Record<string, unknown>> = {
+  '1': { f_reason: '家中有事需请假', f_days: 3, f_leaveType: 'annual', f_startDate: '2026-09-01', f_endDate: '2026-09-03' },
+  '2': { f_reason: '项目上线后调休', f_days: 2, f_leaveType: 'annual', f_startDate: '2026-09-07', f_endDate: '2026-09-08' },
+  '3': { f_reason: '出差报销申请', f_days: 1, f_leaveType: 'personal', f_startDate: '2026-09-10', f_endDate: '2026-09-10' },
+  '4': { f_reason: '培训进修请假', f_days: 5, f_leaveType: 'sick', f_startDate: '2026-09-14', f_endDate: '2026-09-18' },
+  '5': { f_reason: '年假出行', f_days: 4, f_leaveType: 'annual', f_startDate: '2026-09-21', f_endDate: '2026-09-24' },
+  '6': { f_reason: '婚假申请', f_days: 10, f_leaveType: 'personal', f_startDate: '2026-09-28', f_endDate: '2026-10-07' },
+  '7': { f_reason: '病假休养', f_days: 6, f_leaveType: 'sick', f_startDate: '2026-10-12', f_endDate: '2026-10-17' },
+  '8': { f_reason: '产检假', f_days: 3, f_leaveType: 'sick', f_startDate: '2026-10-19', f_endDate: '2026-10-21' },
+  '9': { f_reason: '陪产假', f_days: 5, f_leaveType: 'personal', f_startDate: '2026-10-26', f_endDate: '2026-10-30' },
+  '10': { f_reason: '事假处理家务', f_days: 2, f_leaveType: 'personal', f_startDate: '2026-11-02', f_endDate: '2026-11-03' },
+  '11': { f_bizType: 'purchase', f_budget: 12000, f_urgency: 'normal', f_desc: '采购一批开发板与传感器' },
+  '12': { f_reason: '部门例行调休', f_days: 1, f_leaveType: 'annual', f_startDate: '2026-11-09', f_endDate: '2026-11-09' },
+  '14': { f_reason: '外派学习请假', f_days: 7, f_leaveType: 'annual', f_startDate: '2026-11-16', f_endDate: '2026-11-22' },
+  '15': { f_reason: '丧假', f_days: 3, f_leaveType: 'personal', f_startDate: '2026-11-23', f_endDate: '2026-11-25' },
+}
+
+// 办理表单：tf_ 前缀 = 任务变量，前端「办理表单」区读 taskFormData 回显。
+// 键 = 审批节点的 formKey（properties.form）；表里没有的 formKey 只落通用意见，不臆造字段。
+// 同样八栈同表同值——勿改勿重排。
+const TF_BY_FORM: Record<string, Record<string, unknown>> = {
+  'leave-form': { tf_approvedDays: 3, tf_needExtra: 'no', tf_remark: '按项目排期核准，注意工作交接' },
+  'review-form': { tf_riskLevel: 'low', tf_needLegalDoc: 'no', tf_reviewOpinion: '条款与预算均无风险' },
+  'boss-form': { tf_finalDecision: 'agree', tf_finalAmount: 8000, tf_bossNote: '同意，走年度预算' },
+  'check-form': { tf_invoiceOk: 'yes', tf_amountChecked: 8000, tf_checkNote: '票据齐全，计入差旅科目' },
+  'countersign-form': { tf_signVote: 'support', tf_signAmount: 5000, tf_signOpinion: '本条线无异议' },
+  'seq-form': { tf_seqStage: 'first', tf_seqVote: 'pass', tf_seqOpinion: '初审通过，转下一人' },
+  'approve-form': { tf_approveResult: 'ok', tf_approveAmount: 8000, tf_approveNote: '审批通过' },
+  'ratio-form': { tf_ratioVote: 'agree', tf_ratioOpinion: '达到比例即可通过' },
+  'veto-form': { tf_vetoResult: 'pass', tf_vetoReason: '无异议' },
+  'form-a': { tf_branchA: 'a1', tf_branchANote: 'A 分支选方案 A1' },
+  'form-b': { tf_branchB: 'b1', tf_branchBNote: 'B 分支选方案 B1' },
+  'field-form': { tf_ownerName: '张三', tf_field: 'tech', tf_fieldNote: '技术域评估通过' },
+  'operator-form': { tf_selfCheck: 'done', tf_operatorNote: '发起人自查无误' },
+  'dept-form': { tf_deptAgree: 'yes', tf_deptQuota: 8000, tf_deptNote: '同意占用本部门额度' },
+  'role-form': { tf_roleResult: 'pass', tf_roleNote: '角色审批通过' },
+}
+
 type Resp = Record<string, any>
 
 function isOk(r: Resp | undefined): boolean {
   return !!r && Number(r.code) === 0
 }
 
+// 办理表单落库：先给通用意见，再按该节点的 formKey 覆盖专属字段。
+// 抽成 helper 是因为两处 execute 调用点（advance 循环 / I14 特例）必须同口径，
+// 否则八栈横评里同一节点会填出不一样的数据。
+function withTaskForm(ex: Record<string, unknown>, formKey: unknown): void {
+  ex.tf_approvalComment = '同意，情况已核实'
+  Object.assign(ex, TF_BY_FORM[String(formKey ?? '')] ?? {})
+}
+
 async function startInstance(f: Facade, row: Row): Promise<unknown> {
   const resp: Resp = await f.flow('processDefine/startAndExecute', {
-    processDefineId: row.defineId, operator: row.operator, ...(row.extra ?? {}),
+    processDefineId: row.defineId, operator: row.operator,
+    // 先铺申请信息，再铺 row.extra：已有的流程变量（amount / deptLeader）优先，不被表单值盖掉
+    ...(FORM_BY_DEFINE[String(row.defineId)] ?? {}), ...(row.extra ?? {}),
   })
   if (!isOk(resp)) {
     console.error(`[seed] startAndExecute define=${row.defineId} op=${row.operator} 失败:`, resp)
@@ -88,9 +144,9 @@ async function advance(f: Facade, iid: unknown): Promise<number> {
     for (const t of doing) {
       const actor = (t.operator as string) || ((t.taskActorIdList ?? [])[0] as string | undefined)
       if (!actor) continue
-      const r: Resp = await f.flow('processTask/execute', {
-        processTaskId: t.id, operator: actor, submitType: 1,
-      })
+      const ex: Record<string, unknown> = { processTaskId: t.id, operator: actor, submitType: 1 }
+      withTaskForm(ex, t.formKey)
+      const r: Resp = await f.flow('processTask/execute', ex)
       if (isOk(r)) progress = true
       else console.error(`[seed] advance execute iid=${iid} actor=${actor} 失败:`, r)
     }
@@ -118,7 +174,12 @@ export async function seedBusiness(f: Facade): Promise<void> {
     if (row.defineId === '2' && row.operator === 'userA') {
       for (const actor of ['leader', 'manager']) {
         const t = await todoRow(f, actor, iid)
-        if (t) await f.flow('processTask/execute', { processTaskId: t.id, operator: actor, submitType: 1 })
+        if (t) {
+          // todoList 行同样带 formKey（facade taskRowToMap），照 advance 同口径填办理表单
+          const ex: Record<string, unknown> = { processTaskId: t.id, operator: actor, submitType: 1 }
+          withTaskForm(ex, t.formKey)
+          await f.flow('processTask/execute', ex)
+        }
         else console.error(`[seed] I14 todoRow actor=${actor} iid=${iid} 未找到`)
       }
     }
