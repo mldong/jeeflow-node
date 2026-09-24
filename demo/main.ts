@@ -178,7 +178,8 @@ app.post('/api/reset', async (_req, res) => {
 // ─── 统一门面转发（v1.5.0）：/wf/{action}，action 多段（如 processDefine/page）──────────────
 app.post('/wf/*', async (req, res) => {
   try {
-    const action = String(req.params[0] ?? '').replace(/^\//, '')
+    // 通配路由下 Express 把捕获段填进 params[0]，但类型上 params 是 {}（无命名段）⇒ 只做断言，运行时不变
+    const action = String((req.params as unknown as Record<string, string>)[0] ?? '').replace(/^\//, '')
     const body = req.body ?? {}
     res.json(await facade.flow(action, body))
   } catch (e: any) {

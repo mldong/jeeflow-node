@@ -1,0 +1,10 @@
+{
+  "//": "只检查、不产出：把 demo 纳入类型门禁。tsconfig.json 的 rootDir=./src 决定了它只能装 src（直接往 include 里加 demo 会撞 TS6059），而 build/prepublishOnly 走的都是 tsconfig.json ⇒ 发版链零影响（package.json 的 files 只白名单 dist/LICENSE/README）。",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true,
+    "declaration": false
+  },
+  "include": ["src", "demo"]
+}

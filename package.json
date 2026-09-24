@@ -18,6 +18,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc -p tsconfig.check.json",
     "test": "node --import tsx __tests__/spec.test.ts",
     "test-mysql": "node --import tsx --test __tests__/jdbc.test.ts",
     "demo": "node --import tsx demo/main.ts",
