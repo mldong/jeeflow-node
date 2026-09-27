@@ -104,6 +104,13 @@ export class MemoryExtRepository implements ProcessExtRepository {
   }
 
   async pageSurrogates(_pageNum = 1, _pageSize = 10, filters?: Record<string, any>, conditions?: QueryCondition[]): Promise<[ProcessSurrogate[], number]> {
+    // issues/129 案 A 第二层：filters 的 operator 键 = 归属谓词列（t.operator），空值 ⇒ **空页**。
+    // 原来靠下面那句 `val === '' continue` 把这条条件整条丢掉 ⇒ 空 operator 读出全库委托；
+    // 只收归属列——surrogate / process_name / enabled 三个可选过滤仍走"空值当作没填"。
+    // conditions 那一路（m_ 条件）由 matchConditions 的归属兜底覆盖（SURROGATE_FIELDS 带 t.operator）。
+    const blankOwnershipFilter = Object.entries(filters ?? {})
+      .some(([col, val]) => col === 'operator' && (val == null || String(val).trim() === ''))
+    if (blankOwnershipFilter) return [[], 0]
     const rows = [...this.surrogates.values()].filter(s => {
       for (const [col, val] of Object.entries(filters ?? {})) {
         if (val == null || val === '') continue

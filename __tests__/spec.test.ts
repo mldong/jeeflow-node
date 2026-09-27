@@ -5,6 +5,9 @@ import { EngineImpl, KeyAutoGenTitle, KeyRealName, KeyUserID } from '../src/engi
 import { HandlerRegistry, registerBuiltinAssignments } from '../src/index.js'
 import { MemoryRepository } from '../src/memory.js'
 import { MemoryExtRepository } from '../src/memory-ext.js'
+// issues/129：SQL 仓那半在 T0 用**零连接探针**验（只取 buildWhere/位置参短路，不连任何数据库）
+import { JdbcRepository } from '../src/jdbc/shared.js'
+import { JdbcProcessExtRepository } from '../src/jdbc/ext.js'
 import { JeeflowFacade } from '../src/facade.js'
 import { InstanceState, TaskState, SubmitType, type ProcessDefine, ProcessInstance, ProcessTask } from '../src/model.js'
 import type { ExpressionEvaluator, UserProvider } from '../src/spi.js'
@@ -3653,5 +3656,323 @@ describe('issues/122 审批记录行的可空时间列必须出键', () => {
           `${action}：时间列 ${k} 在出口 JSON 里整键不见了`)
       }
     }
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// issues/129 案 A · operator「空串 ≡ 缺键」+ 仓储归属兜底（两层收口）
+//
+// 症状（2026-09-28 实测 node 栈，同一份库三档并排）：`{"operator":""}` 的 processInstance/page
+// 出 25 行（返回的全是别人的实例），而 `{"operator":"user1"}` 4 行、`{"operator":"__nobody__"}` 0 行
+// ⇒ "空串条件"被**整条丢掉**，等价于"不过滤 = 读全库"。
+// 裁定语义（jeeflow-doc `spec/06-facade.md` §2.5）：
+//   ① 门面归一化：空串/全空白 ≡ 缺键 ⇒ 一并回落 demo 缺省 `user1`；
+//   ② 仓储兜底：动态 WHERE 里「归属谓词列 + 空值」⇒ **空页**，绝不允许变成"这条条件不加"；
+//   ③ 只收归属列（`t.operator` / `pi.operator` / `pta.actor_id` / `cc.actor_id`）的 EQ——
+//      `m_LIKE_*` 等**可选过滤**的"空值当作没填"通用放行不动（整体改掉会把可选过滤一起改坏）。
+// 参考实现：java `JeeflowFacade.operatorArg` + `JdbcProcessRepository.buildWhere`(OWNERSHIP_COLUMNS)。
+// 本栈形状差异：门面把"我是谁"作为**位置参**下发（java 下发的是 EQ 条件），且内存仓/SQL 仓两套实现
+// ⇒ 第二层落点比 java 多：memory.ts（位置参×4 + matchConditions）、jdbc/shared.ts（buildWhere +
+// 位置参×3）、jdbc/ext.ts（buildExtWhere + surrogate filters）、memory-ext.ts（surrogate filters）。
+// T0 只用内存仓跑真数据；SQL 仓那半用**零连接探针**钉（不连任何数据库）。
+// ─────────────────────────────────────────────────────────────────────────────
+describe('issues/129 operator 空档两层收口（门面归一化 + 仓储归属兜底）', () => {
+  const ME = 'user1'            // 门面缺省档：空串/全空白必须归到这一档
+  const OTHER = 'n129-other'    // 另一个用户：证明"空档 ≠ 别人的档 / ≠ 全库"
+  const NOBODY = 'n129-nobody'  // 对照档：谁都没有 ⇒ 必须 0 行（证明过滤真的生效，不是恒定放行）
+
+  // 夹具行数刻意做成 ME ≠ OTHER ≠ 全库，且 ME 档非空——否则"0 == 0"是自等假绿
+  const N = { meInst: 3, otherInst: 5, meTodo: 2, otherTodo: 3, meCc: 2, otherCc: 3 }
+
+  /**
+   * 本组专用装配：idGen 换成**严格递增**的发号器。
+   * 不复用 setup() 的 `Date.now()*1000 + random(1000)`——本夹具一口气造 8 个实例 + 16 个任务，
+   * 同一毫秒内撞号会把 MemoryRepository 的 Map 行**静默覆盖**（实测偶发 doneList 少 1 行），
+   * 那种红与本 issue 无关，会污染变异对照的读数。
+   */
+  function setup129() {
+    const repo = new MemoryRepository()
+    const userProv: UserProvider = {
+      async getUser(userId) {
+        return { userId, realName: '用户' + userId, deptId: 'D01', deptName: '测试部门', postId: 'P01', postName: '测试岗位' }
+      },
+    }
+    let issued = 1_700_000_000_000_000 // 2^53 内（9.0e15），且与 Date.now()*1000 同量级不冲突
+    const idGen = { nextId() { return String(++issued) } }
+    const exprEval: ExpressionEvaluator = { async eval() { return false } }
+    return { engine: new EngineImpl(repo, userProv, idGen, exprEval), repo }
+  }
+
+  async function fixture129() {
+    const { engine, repo } = setup129()
+    const extRepo = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, extRepo)
+    const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    const dep = await facade.flow('processDefine/deploy', { content })
+    assert.equal(dep.code, 0, JSON.stringify(dep))
+    const defineId = dep.data.processDefineId
+
+    // 实例：startAndExecute 会自动办结 apply（t.operator=发起人）⇒ 顺带造出「我已办」行
+    const mine: string[] = []
+    const theirs: string[] = []
+    for (let i = 0; i < N.meInst; i++) {
+      const r = await facade.flow('processInstance/startAndExecute', { processDefineId: defineId, operator: ME })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      mine.push(String(r.data.processInstanceId))
+    }
+    for (let i = 0; i < N.otherInst; i++) {
+      const r = await facade.flow('processInstance/startAndExecute', { processDefineId: defineId, operator: OTHER })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      theirs.push(String(r.data.processInstanceId))
+    }
+    // 待办：把各自加进 doing 的 task1 参与者名册
+    const mineTodoTasks: string[] = []
+    const theirsTodoTasks: string[] = []
+    for (const id of mine.slice(0, N.meTodo)) {
+      const doing = await repo.findDoingTasks(id)
+      await repo.addTaskActor(doing[0].id, [ME])
+      mineTodoTasks.push(String(doing[0].id))
+    }
+    for (const id of theirs.slice(0, N.otherTodo)) {
+      const doing = await repo.findDoingTasks(id)
+      await repo.addTaskActor(doing[0].id, [OTHER])
+      theirsTodoTasks.push(String(doing[0].id))
+    }
+    // 抄送：各占不同实例 ⇒ cc 全库行数 = meCc + otherCc
+    for (const id of mine.slice(0, N.meCc)) await repo.createCcInstance(id, ME, ME)
+    for (const id of theirs.slice(0, N.otherCc)) await repo.createCcInstance(id, OTHER, OTHER)
+
+    const all = repo.allTasks()
+    return {
+      engine, repo, extRepo, facade, mine, theirs, mineTodoTasks, theirsTodoTasks,
+      libInstances: repo.allInstances().length,
+      libDoing: all.filter(t => t.taskState === TaskState.Doing).length,
+      libDone: all.filter(t => t.taskState !== TaskState.Doing).length,
+      libCc: N.meCc + N.otherCc,
+    }
+  }
+  type Fix129 = Awaited<ReturnType<typeof fixture129>>
+
+  /** 四个「我的」出口：归属列 / 门面 action / 三档读数器（正向、负向共用一张表） */
+  function outlets(f: Fix129) {
+    return [
+      {
+        action: 'processInstance/page', col: 't.operator',
+        me: N.meInst, other: N.otherInst, library: f.libInstances,
+        rows: async (args: Record<string, any>) => (await f.facade.flow('processInstance/page', { pageSize: 100, ...args })).data.rows,
+        // 实例行归属列 = operator（发起人）
+        isMine: (r: any) => String(r.operator) === ME,
+      },
+      {
+        action: 'processTask/todoList', col: 'pta.actor_id',
+        me: N.meTodo, other: N.otherTodo, library: f.libDoing,
+        rows: async (args: Record<string, any>) => (await f.facade.flow('processTask/todoList', { pageSize: 100, ...args })).data.rows,
+        isMine: (r: any) => f.mineTodoTasks.includes(String(r.id)),
+      },
+      {
+        action: 'processTask/doneList', col: 't.operator',
+        me: N.meInst, other: N.otherInst, library: f.libDone,
+        rows: async (args: Record<string, any>) => (await f.facade.flow('processTask/doneList', { pageSize: 100, ...args })).data.rows,
+        isMine: (r: any) => String(r.operator) === ME,
+      },
+      {
+        action: 'processInstance/ccList', col: 'cc.actor_id',
+        me: N.meCc, other: N.otherCc, library: f.libCc,
+        rows: async (args: Record<string, any>) => (await f.facade.flow('processInstance/ccList', { pageSize: 100, ...args })).data.rows,
+        isMine: (r: any) => f.mine.slice(0, N.meCc).includes(String(r.id)),
+      },
+    ]
+  }
+
+  it('正向 · 四个出口：{"operator":""} ≡ 全空白 ≡ 缺键 ≡ 显式 user1，且该档非空、无归属用户档为 0', async () => {
+    const f = await fixture129()
+    for (const o of outlets(f)) {
+      const explicit = (await o.rows({ operator: ME })).length
+      const missing = (await o.rows({})).length
+      const blank = (await o.rows({ operator: '' })).length
+      const spaces = (await o.rows({ operator: ' \t ' })).length
+      const nobody = (await o.rows({ operator: NOBODY })).length
+      assert.ok(explicit > 0, `${o.action}：夹具没让 ${ME} 有行 ⇒ 三档同为 0 是自等假绿（夹具失效）`)
+      assert.equal(explicit, o.me, `${o.action}：显式 ${ME} 档应 ${o.me} 行`)
+      assert.equal(missing, explicit, `${o.action}：缺键档应等于显式 ${ME} 档（spec 06 §2.5 缺省回落）`)
+      assert.equal(blank, explicit,
+        `${o.action}：{"operator":""} 应与缺键同档（回落 ${ME}），实读 ${blank} vs ${explicit} ⇒ 空串又漏进仓储了`)
+      assert.equal(spaces, explicit, `${o.action}：全空白串应与缺键同档（trim 后判空）`)
+      assert.equal(nobody, 0, `${o.action}：谁都没有的归属者必须空页（对照组）`)
+    }
+  })
+
+  it('负向 · 空串档不得折叠成"不过滤"：既不等于别人的档、也不等于全库，行内不混别人的归属', async () => {
+    const f = await fixture129()
+    for (const o of outlets(f)) {
+      const rows = await o.rows({ operator: '' })
+      const blank = rows.length
+      // A 口径下"空串 ⇒ 空页"（php/moon 当时那档）同样是错档：空串必须与缺键同档 = user1 的行
+      assert.ok(blank > 0,
+        `${o.action}：空串档出 0 行 ⇒ 把空串当真实归属值过滤了（该档应回落 ${ME} 的 ${o.me} 行）`)
+      assert.ok(blank < o.library,
+        `${o.action}：空串档读出 ${blank} 行，全库才 ${o.library} 行 ⇒ 只要 ≥ 全库就是"空即不过滤"旁路复活（issues/129）`)
+      assert.notEqual(blank, o.library, `${o.action}：空串档不得等于全库行数 ${o.library}`)
+      assert.notEqual(blank, o.other, `${o.action}：空串档不得等于另一用户（${OTHER}）的档 ${o.other}`)
+      const foreign = rows.filter(r => !o.isMine(r)).map(r => `${r.id}/${r.operator}`)
+      assert.deepEqual(foreign, [],
+        `${o.action}：空串档混进非 ${ME} 归属的行（${o.col} 过滤没生效）：${JSON.stringify(foreign)}`)
+    }
+  })
+
+  it('仓储层 · 绕过门面直连内存仓：归属位置参传空串/全空白/null/undefined ⇒ 空页（旧写法 `if (operator && …)` 读全库）', async () => {
+    const f = await fixture129()
+    const blanks: any[] = ['', '   ', '\t\n', null, undefined]
+    for (const v of blanks) {
+      const tag = `${JSON.stringify(v)}`
+      const inst = await f.repo.pageInstances(1, 100, v)
+      const todo = await f.repo.pageTodoTasks(1, 100, v)
+      const done = await f.repo.pageDoneTasks(1, 100, v)
+      const cc = await f.repo.pageCcInstances(1, 100, v)
+      assert.equal(inst.rows.length, 0, `pageInstances 归属值 ${tag} ⇒ 空页，实读 ${inst.rows.length}`)
+      assert.equal(inst.total, 0, `pageInstances total 也要归 0（${tag}）`)
+      assert.equal(todo.rows.length, 0, `pageTodoTasks 归属值 ${tag} ⇒ 空页`)
+      assert.equal(done.rows.length, 0, `pageDoneTasks 归属值 ${tag} ⇒ 空页（issues/129 §2 点名的内存仓落点）`)
+      assert.equal(cc.rows.length, 0, `pageCcInstances 归属值 ${tag} ⇒ 空页`)
+    }
+    // 对照：非空归属值照常（证明"空页"没把四个分页一起做废）
+    assert.equal((await f.repo.pageInstances(1, 100, ME)).rows.length, N.meInst)
+    assert.equal((await f.repo.pageTodoTasks(1, 100, ME)).rows.length, N.meTodo)
+    assert.equal((await f.repo.pageDoneTasks(1, 100, ME)).rows.length, N.meInst)
+    assert.equal((await f.repo.pageCcInstances(1, 100, ME)).rows.length, N.meCc)
+  })
+
+  it('仓储层 · 动态条件：归属列 EQ + 空值 ⇒ 空页；非归属列空值仍被忽略（可选过滤照旧的哨兵）', async () => {
+    const f = await fixture129()
+    const OWNERSHIP = ['t.operator', 'pi.operator', 'pta.actor_id', 'cc.actor_id']
+    const pagers: Array<[string, (op: string, c: any[]) => Promise<{ rows: any[]; total: number }>]> = [
+      ['pageInstances', (op, c) => f.repo.pageInstances(1, 100, op, c)],
+      ['pageTodoTasks', (op, c) => f.repo.pageTodoTasks(1, 100, op, c)],
+      ['pageDoneTasks', (op, c) => f.repo.pageDoneTasks(1, 100, op, c)],
+      ['pageCcInstances', (op, c) => f.repo.pageCcInstances(1, 100, op, c)],
+    ]
+    // 四个归属列 × 三种空值 × 四个分页：位置参给的是合法归属者，只有条件那一路能把行全吃掉
+    for (const [name, pager] of pagers) {
+      for (const col of OWNERSHIP) {
+        for (const val of ['', '   ', null]) {
+          const r = await pager(ME, [{ column: col, operator: 'EQ', value: val }])
+          assert.equal(r.rows.length, 0, `${name}：归属列 ${col} + 空值(${JSON.stringify(val)}) 必须空页，不能"这条条件不加"`)
+          assert.equal(r.total, 0, `${name}：归属列 ${col} 空值档 total 也要归 0`)
+        }
+      }
+    }
+    // 哨兵①：非归属列（可选过滤）空串/空值仍"当作没填"⇒ 行数与不带条件一致
+    const base = (await f.repo.pageInstances(1, 100, ME)).rows.length
+    for (const c of [
+      { column: 't.business_no', operator: 'LIKE', value: '' },
+      { column: 't.business_no', operator: 'EQ', value: null },
+      { column: 'pd.name', operator: 'LIKE', value: '' },
+    ]) {
+      const r = await f.repo.pageInstances(1, 100, ME, [c])
+      assert.equal(r.rows.length, base, `哨兵：可选过滤 ${c.column}(${c.operator}) 传空值应被忽略，不该折叠成空页`)
+    }
+    // 哨兵②：只收 EQ——归属列 NE + 空值不收紧（对齐 java 那句只判 "EQ"）
+    const ne = await f.repo.pageInstances(1, 100, ME, [{ column: 't.operator', operator: 'NE', value: '' }])
+    assert.equal(ne.rows.length, base, '哨兵：归属列 NE + 空值不该被收进空页（本次只收 EQ）')
+    // 哨兵③：门面那一路的 m_ 可选过滤同样不动
+    const viaFacade = await f.facade.flow('processInstance/page', { operator: ME, pageSize: 100, m_LIKE_businessNo: '' })
+    assert.equal(viaFacade.code, 0, JSON.stringify(viaFacade))
+    assert.equal(viaFacade.data.rows.length, base, '哨兵：m_LIKE_* 传空串按"没填"处理（通用放行未被我改动）')
+  })
+
+  it('仓储层 · SQL 仓（零连接探针，T0 不连库）：buildWhere 出 `AND 1=0`、位置参空值不取连接', async () => {
+    const noConn: any = {
+      placeholder: '?',
+      acquire() { throw new Error('探针不该取连接（T0 无数据库）') },
+      release() { throw new Error('探针不该释放连接') },
+    }
+    // buildWhere 是 protected ⇒ 用子类暴露；不改产品代码可见性
+    class WhereProbe extends JdbcRepository {
+      where(conditions: any[], whitelist: string[]) { return this.buildWhere(conditions, new Set(whitelist)) }
+    }
+    const p = new WhereProbe(noConn)
+    const WL = ['t.operator', 'pi.operator', 'pta.actor_id', 'cc.actor_id', 't.business_no', 'pd.name', 't.task_name']
+    const cond = (column: string, value: any, operator = 'EQ') => ({ column, operator, value })
+    for (const col of ['t.operator', 'pi.operator', 'pta.actor_id', 'cc.actor_id']) {
+      for (const val of ['', '   ', null]) {
+        const w = p.where([cond(col, val)], WL)
+        assert.equal(w.sql, ' AND 1=0', `SQL 仓：归属列 ${col} + 空值(${JSON.stringify(val)}) ⇒ 空页谓词`)
+        assert.deepEqual(w.params, [], '空页谓词不绑参数')
+      }
+    }
+    // 归属列非空 ⇒ 正常谓词（证明 1=0 不是无条件加）
+    assert.equal(p.where([cond('t.operator', ME)], WL).sql, ' AND t.operator = ?')
+    assert.deepEqual(p.where([cond('t.operator', ME)], WL).params, [ME])
+    // 哨兵：非归属列空值仍整条忽略（可选过滤不动）+ 归属列 NE 不收
+    assert.equal(p.where([cond('t.business_no', '', 'LIKE')], WL).sql, '', '哨兵：可选过滤空串仍被忽略')
+    assert.equal(p.where([cond('t.business_no', null)], WL).sql, '', '哨兵：可选过滤 null 仍被忽略')
+    assert.equal(p.where([cond('t.operator', '', 'NE')], WL).sql, '', '哨兵：归属列 NE + 空值不收紧（只收 EQ）')
+    // 位置参那一路：空值直接空页，且**不取连接**（短路在 SQL 之前）
+    for (const v of ['', '   ', null, undefined]) {
+      assert.deepEqual(await p.pageInstances(1, 10, v as any), { rows: [], total: 0 }, `SQL 仓 pageInstances 归属值 ${JSON.stringify(v)} ⇒ 空页`)
+      assert.deepEqual(await p.pageTodoTasks(1, 10, v as any), { rows: [], total: 0 }, 'SQL 仓 pageTodoTasks 空归属 ⇒ 空页')
+      assert.deepEqual(await p.pageDoneTasks(1, 10, v as any), { rows: [], total: 0 }, 'SQL 仓 pageDoneTasks 空归属 ⇒ 空页')
+      assert.deepEqual(await p.pageCcInstances(1, 10, v as any), { rows: [], total: 0 }, 'SQL 仓 pageCcInstances 空归属 ⇒ 空页')
+    }
+    // 反闸：非空归属值会去取连接并抛错 ⇒ 证明上面四组真是短路，不是探针本身失效
+    await assert.rejects(() => p.pageInstances(1, 10, ME), /探针不该取连接/,
+      '反闸：非空归属值应照常下查询（否则上面那 16 格空页断言是空转）')
+
+    // 扩展仓储（委托分页）同判据：buildExtWhere + filters 两路
+    const extProbe: any = new JdbcProcessExtRepository(noConn)
+    const extWhere = (conditions: any[], whitelist: string[]) =>
+      extProbe.buildExtWhere(conditions, new Set(whitelist)) as { sql: string; params: any[] }
+    assert.equal(extWhere([cond('t.operator', '')], ['t.operator', 't.process_name']).sql, ' AND 1=0',
+      'SQL 扩展仓：委托归属列 t.operator + 空值 ⇒ 空页谓词')
+    assert.equal(extWhere([cond('t.operator', ME)], ['t.operator']).sql, ' AND t.operator = ?')
+    assert.equal(extWhere([cond('t.process_name', '', 'LIKE')], ['t.operator', 't.process_name']).sql, '',
+      '哨兵：设计/委托的 process_name 可选过滤空串仍被忽略')
+    for (const v of ['', '   ', null]) {
+      assert.deepEqual(await extProbe.pageSurrogates(1, 10, { operator: v }), [[], 0],
+        `SQL 扩展仓 pageSurrogates：filters.operator=${JSON.stringify(v)} ⇒ 空页（与内存仓同判据）`)
+    }
+    await assert.rejects(() => extProbe.pageSurrogates(1, 10, { operator: ME }), /探针不该取连接/,
+      '反闸：非空 filters.operator 应照常下查询')
+  })
+
+  it('委托分页 · {"operator":""} 与缺键同档；直连仓储空归属 ⇒ 空页（内存仓与 SQL 仓一个答案）', async () => {
+    const f = await fixture129()
+    await f.extRepo.saveSurrogate({
+      id: '1290001', operator: ME, surrogate: 'agent-a', processName: '', enabled: 1,
+    } as any)
+    await f.extRepo.saveSurrogate({
+      id: '1290002', operator: OTHER, surrogate: 'agent-b', processName: '', enabled: 1,
+    } as any)
+    const count = async (args: Record<string, any>) =>
+      (await f.facade.flow('processSurrogate/page', { pageSize: 100, ...args })).data.rows.length
+    // 本 action 在 java 门面里不下发归属条件 ⇒ 同档 = 空串与缺键都"不过滤"（不是回落 user1）
+    assert.equal(await count({}), 2, '夹具：两条委托（两人各一条）')
+    assert.equal(await count({ operator: '' }), await count({}), 'processSurrogate/page：{"operator":""} 应与缺键同档')
+    assert.equal(await count({ operator: ' \t ' }), await count({}), 'processSurrogate/page：全空白同缺键')
+    assert.equal(await count({ operator: ME }), 1, '显式归属者档照常过滤（没顺手放宽）')
+    // 仓储档：直连空 operator ⇒ 空页（不是"条件丢掉"读全库）
+    assert.equal((await f.extRepo.pageSurrogates(1, 10, { operator: '' }))[0].length, 0, '内存仓 filters.operator="" ⇒ 空页')
+    assert.equal((await f.extRepo.pageSurrogates(1, 10, { operator: '   ' }))[0].length, 0, '内存仓 filters.operator 全空白 ⇒ 空页')
+    assert.equal((await f.extRepo.pageSurrogates(1, 10, { operator: null }) as any)[0].length, 0, '内存仓 filters.operator null ⇒ 空页')
+    // m_ 条件那一路由 matchConditions 的归属兜底覆盖（SURROGATE_FIELDS 带 t.operator）
+    assert.equal((await f.extRepo.pageSurrogates(1, 10, undefined, [{ column: 't.operator', operator: 'EQ', value: '' }]))[0].length, 0,
+      '内存仓 conditions：t.operator EQ "" ⇒ 空页')
+    // 哨兵：非归属 filter 键的空值仍当作没填
+    assert.equal((await f.extRepo.pageSurrogates(1, 10, { surrogate: '' }))[0].length, 2,
+      '哨兵：surrogate（非归属）传空串仍被忽略 ⇒ 两条都在')
+  })
+
+  it('issues/114 硬必填未被本次改动污染：withdraw/transfer 的空串与缺键仍报「operator 必填」，绝不回落 user1', async () => {
+    const f = await fixture129()
+    for (const args of [{ id: f.mine[0] }, { id: f.mine[0], operator: '' }, { id: f.mine[0], operator: '  ' }]) {
+      const r = await f.facade.flow('processInstance/withdraw', args)
+      assert.equal(r.code, 99999999, `${JSON.stringify(args)} ⇒ ${JSON.stringify(r)}`)
+      assert.ok(String(r.msg).includes('operator 必填'),
+        `withdraw 空串/缺键必须硬报错（issues/114），不该被 operatorArg 兜成 ${ME}：${JSON.stringify(r)}`)
+    }
+    const tr = await f.facade.flow('processTask/transfer',
+      { processTaskId: f.mineTodoTasks[0], fromActor: ME, toActor: OTHER, operator: '' })
+    assert.equal(tr.code, 99999999, JSON.stringify(tr))
+    assert.ok(String(tr.msg).includes('operator 必填'), `transfer 同样保持硬必填：${JSON.stringify(tr)}`)
   })
 })

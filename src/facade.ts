@@ -170,7 +170,7 @@ export class JeeflowFacade {
 
   private async startAndExecute(args: Record<string, any>): Promise<Record<string, any>> {
     const defineId = toId(args.processDefineId)
-    const operator = String(args.operator ?? 'user1')
+    const operator = operatorArg(args)
     const flowArgs: Record<string, any> = {}
     for (const [k, v] of Object.entries(args)) {
       if (k === 'processDefineId' || k === 'operator') continue
@@ -312,7 +312,7 @@ export class JeeflowFacade {
 
   private async execute(args: Record<string, any>): Promise<void> {
     const taskId = toId(args.processTaskId)
-    const operator = String(args.operator ?? 'user1')
+    const operator = operatorArg(args)
     const submitType = toInt(args.submitType ?? SUBMIT_AGREE)
     const flowArgs: Record<string, any> = {}
     for (const [k, v] of Object.entries(args)) {
@@ -537,7 +537,7 @@ export class JeeflowFacade {
 
   private async designSave(args: Record<string, any>): Promise<Record<string, any>> {
     const ext = this.ext()
-    const operator = String(args.operator ?? 'user1')
+    const operator = operatorArg(args)
     const designId = args.id != null ? toId(args.id) : ''
     let design: ProcessDesign
     if (!designId) {
@@ -585,7 +585,12 @@ export class JeeflowFacade {
   // ── 委托代理（需扩展仓储） ───────────────────────────────────────────────
 
   private async surrogatePage(args: Record<string, any>): Promise<Record<string, any>> {
-    const filters = args.operator != null ? { operator: String(args.operator) } : undefined
+    // issues/129 案 A 第一层（同档原则）：空串/全空白 operator ≡ 缺键 ⇒ **不带**归属过滤。
+    // 旧写法 `args.operator != null` 让 "" 变成"带了一个空值过滤"，两仓给两种答案
+    // （JDBC 侧 `t.operator = ''` 出 0 行、内存侧把条件整条丢掉出全库）。本 action 在 java
+    // 门面里不下发归属条件，故回落点不是 user1 而是"与缺键一样不过滤"——只把两档并成一档。
+    const opArg = toStr(args.operator).trim()
+    const filters = opArg !== '' ? { operator: toStr(args.operator) } : undefined
     const pageNum = toInt(args.pageNum ?? 1)
     const pageSize = toInt(args.pageSize ?? 10)
     const [rows, total] = await this.ext().pageSurrogates(
@@ -596,7 +601,7 @@ export class JeeflowFacade {
 
   private async surrogateSave(args: Record<string, any>): Promise<Record<string, any>> {
     const ext = this.ext()
-    const operator = String(args.operator ?? 'user1')
+    const operator = operatorArg(args)
     const surrogateId = args.id != null ? toId(args.id) : ''
     let surrogate: ProcessSurrogate
     if (!surrogateId) {
@@ -624,7 +629,7 @@ export class JeeflowFacade {
     const surrogateId = toId(args.id)
     const surrogate = await ext.findSurrogateById(surrogateId)
     if (!surrogate) throw new Error('委托记录不存在')
-    const operator = String(args.operator ?? 'user1')
+    const operator = operatorArg(args)
     this.applySurrogateFields(surrogate, args, operator)
     await ext.updateSurrogate(surrogate)
     return { id: surrogate.id }
@@ -820,7 +825,7 @@ export class JeeflowFacade {
 
   private async createCCInstance(args: Record<string, any>): Promise<void> {
     const instanceId = toId(args.processInstanceId)
-    const operator = String(args.operator ?? 'user1')
+    const operator = operatorArg(args)
     const actors = toStringList2(args.actorIds)
     if (actors.length === 0) throw new Error('actorIds 缺失')
     await this.repo.createCcInstance(instanceId, operator, ...actors)
@@ -832,7 +837,7 @@ export class JeeflowFacade {
 
   private async updateCCStatus(args: Record<string, any>): Promise<void> {
     const instanceId = toId(args.processInstanceId)
-    const operator = String(args.operator ?? 'user1')
+    const operator = operatorArg(args)
     await this.repo.updateCcStatus(instanceId, operator)
   }
 
@@ -840,14 +845,14 @@ export class JeeflowFacade {
   private async ccList(args: Record<string, any>): Promise<Record<string, any>> {
     const pageNum = toInt(args.pageNum ?? 1)
     const pageSize = toInt(args.pageSize ?? 10)
-    const actorId = String(args.operator ?? 'user1')
+    const actorId = operatorArg(args)
     const { rows, total } = await this.repo.pageCcInstances(pageNum, pageSize, actorId, parseMQuery(args))
     return pageData(pageNum, pageSize, total, rows.map(r => ccRowToMap(r)))
   }
 
   private async taskDetail(args: Record<string, any>): Promise<any> {
     const taskId = toId(args.id)
-    const operator = String(args.operator ?? 'user1')
+    const operator = operatorArg(args)
     const task = await this.repo.findTaskById(taskId)
     if (!task) throw new Error('任务不存在')
     const actors = await this.repo.findTaskActors(taskId)
@@ -1083,7 +1088,7 @@ export class JeeflowFacade {
   private async instancePage(args: Record<string, any>): Promise<Record<string, any>> {
     const pageNum = toInt(args.pageNum ?? 1)
     const pageSize = toInt(args.pageSize ?? 10)
-    const operator = String(args.operator ?? 'user1')
+    const operator = operatorArg(args)
     const { rows, total } = await this.repo.pageInstances(pageNum, pageSize, operator, parseMQuery(args))
     return pageData(pageNum, pageSize, total, rows.map(r => instanceRowToMap(r)))
   }
@@ -1150,7 +1155,7 @@ export class JeeflowFacade {
   private async todoList(args: Record<string, any>): Promise<Record<string, any>> {
     const pageNum = toInt(args.pageNum ?? 1)
     const pageSize = toInt(args.pageSize ?? 10)
-    const actorId = String(args.operator ?? 'user1')
+    const actorId = operatorArg(args)
     const { rows, total } = await this.repo.pageTodoTasks(pageNum, pageSize, actorId, parseMQuery(args))
     return pageData(pageNum, pageSize, total, rows.map(r => taskRowToMap(r)))
   }
@@ -1158,7 +1163,7 @@ export class JeeflowFacade {
   private async doneList(args: Record<string, any>): Promise<Record<string, any>> {
     const pageNum = toInt(args.pageNum ?? 1)
     const pageSize = toInt(args.pageSize ?? 10)
-    const operator = String(args.operator ?? 'user1')
+    const operator = operatorArg(args)
     const { rows, total } = await this.repo.pageDoneTasks(pageNum, pageSize, operator, parseMQuery(args))
     return pageData(pageNum, pageSize, total, rows.map(r => taskRowToMap(r)))
   }
@@ -1572,6 +1577,25 @@ function toStr(v: any): string {
   // 对象/数组（content 等字段前端直接传 JSON 对象）：序列化为 JSON 字符串
   if (typeof v === 'object') return JSON.stringify(v)
   return String(v)
+}
+
+/**
+ * issues/129 案 A 第一层（门面归一化）：operator 取值，**空串与缺键同档**。
+ *
+ * 逐字对齐 java `JeeflowFacade.operatorArg`（`s != null && !s.trim().isEmpty() ? s : "user1"`）。
+ * 旧写法 `String(args.operator ?? 'user1')` 的 `??` 只在 null/undefined 兜缺省 ⇒ 显式传
+ * `{"operator":""}` 会原样穿过门面落到仓储，再被仓储「空值不加条件」的通用放行**整条丢掉**
+ * ⇒「我的实例/待办/已办/抄送」读出全库（2026-09-28 实测 node 栈 25 行 vs user1 的 4 行，
+ * 返回行带着 userA/userB/manager/director 等**别人的** operator）。
+ * 归一化放门面是第一层，仓储的归属兜底是第二层（`spi.ts` OWNERSHIP_COLUMNS → memory.ts /
+ * jdbc/shared.ts buildWhere / jdbc/ext.ts buildExtWhere），两层都要在；只留门面那半不算修完。
+ *
+ * ⚠️ 本 helper 不适用撤回（withdraw）/转办（transfer）族——那两处是 issues/114 的
+ * 「operator 硬必填、严禁回落 user1」，保持原样。
+ */
+function operatorArg(args: Record<string, any>): string {
+  const s = toStr(args.operator)
+  return s.trim() !== '' ? s : 'user1'
 }
 
 function toId(v: any): string {

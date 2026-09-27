@@ -7,6 +7,35 @@ export interface QueryCondition {
   value: any
 }
 
+// ═══ 归属谓词基建（issues/129 案 A · 第二层「仓储兜底」）═══
+
+/**
+ * 归属谓词列：这几列定义「这条记录属于谁」，空值**绝不能**等于「不过滤」。
+ * 取自门面实际下发的那四条（逐字对齐 java `JdbcProcessRepository.OWNERSHIP_COLUMNS`，
+ * 本栈列名写法与 java 相同——`wf_process_task.operator` / 实例 join 出的 `pi.operator` /
+ * 任务参与者表 `wf_process_task_actor.actor_id` / 抄送表 `wf_process_cc.actor_id`）：
+ *   processInstance/page → t.operator、processTask/todoList → pta.actor_id、
+ *   processTask/doneList → t.operator（+ pi.operator 带出的实例发起人）、processInstance/ccList → cc.actor_id
+ * 口径见 jeeflow-doc `spec/06-facade.md` §2.5。
+ */
+export const OWNERSHIP_COLUMNS: ReadonlySet<string> = new Set([
+  't.operator', 'pi.operator', 'pta.actor_id', 'cc.actor_id',
+])
+
+/** 空值判定（对齐 java `val == null || ((String) val).trim().isEmpty()`）：null/undefined/全空白串 */
+export function isBlankValue(val: unknown): boolean {
+  return val == null || (typeof val === 'string' && val.trim() === '')
+}
+
+/**
+ * 归属谓词 + 空值 ⇒ **空页**（issues/129 案 A 第二层）。
+ * 只收 `OWNERSHIP_COLUMNS` 上的 EQ 条件：动态 where 里「空值当作没填」那句是 PageQuery 对
+ * `m_LIKE_*` 等**可选过滤**的通用放行，整体改掉会把可选过滤一起改坏（spec 06-facade.md §2.5 ⚠️）。
+ */
+export function isBlankOwnership(column: string, operator: string, val: unknown): boolean {
+  return OWNERSHIP_COLUMNS.has(column) && operator.toUpperCase() === 'EQ' && isBlankValue(val)
+}
+
 // ── 统计行类型（v1.8.25，issues/103）──
 
 export interface InstanceStatsRow {

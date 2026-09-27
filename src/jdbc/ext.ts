@@ -7,6 +7,7 @@ import {
   ProcessDesign, ProcessDesignHis, ProcessSurrogate,
 } from '../model.js'
 import type { IDGenerator, ProcessExtRepository, QueryCondition } from '../spi.js'
+import { isBlankOwnership, isBlankValue } from '../spi.js'
 import { TsIDGenerator, rowId, type SqlAdapter, type SqlConnection } from './shared.js'
 import { surrogateIsEffective, surrogateTimeMs } from '../surrogate-rule.js'
 
@@ -129,6 +130,13 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
     for (const c of conditions) {
       if (!whitelist.has(c.column)) continue
       const val = c.value
+      // issues/129 案 A 第二层（与 shared.ts buildWhere 同形，在原有那句通用放行之前）：
+      // 归属谓词列（委托分页的 t.operator）+ 空值 ⇒ **空页**，不是"这条条件不加"。
+      // ⚠️ 只收归属列，下面那句"空值当作没填"是设计名/流程名等**可选过滤**的通用放行，不动。
+      if (isBlankOwnership(c.column, c.operator, val)) {
+        sql += ' AND 1=0'
+        continue
+      }
       if (val == null || val === '') continue
       switch (c.operator.toUpperCase()) {
         case 'EQ': sql += ` AND ${c.column} = ?`; params.push(val); break
@@ -248,6 +256,10 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
   async pageSurrogates(pageNum = 1, pageSize = 10, filters?: Record<string, any>, conditions?: QueryCondition[]): Promise<[ProcessSurrogate[], number]> {
     let sql = `SELECT ${JdbcProcessExtRepository.SURROGATE_COLS} FROM wf_process_surrogate t WHERE 1=1`
     let countSql = 'SELECT COUNT(*) FROM wf_process_surrogate t WHERE 1=1'
+    // issues/129 案 A 第二层：filters.operator 是归属谓词（"这条委托属于谁"），空值 ⇒ **空页**。
+    // 与内存仓 memory-ext.ts pageSurrogates 同判据（否则同一个空 operator 两仓一个出 0 行、
+    // 一个把条件丢掉出全库）；门面已把空串归一化成缺键（surrogatePage），这一道防直连仓储的调用方。
+    if ('operator' in (filters ?? {}) && isBlankValue(filters!.operator)) return [[], 0]
     const args: any[] = []
     const args2: any[] = []
     for (const [col, val] of Object.entries(filters ?? {})) {

@@ -2,6 +2,7 @@ import { TaskState } from './model.js'
 import type { CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDefine } from './model.js'
 import { cloneInstance, cloneTask, type ProcessInstance, type ProcessTask } from './model.js'
 import type { ProcessRepository, QueryCondition } from './spi.js'
+import { isBlankOwnership } from './spi.js'
 
 // ═══ 条件匹配基建（issues/05-5，对齐 JDBC 白名单语义） ═══
 
@@ -43,6 +44,12 @@ export function matchConditions(conditions: QueryCondition[] | undefined, fields
   for (const c of conditions ?? []) {
     const v = fields[c.column]
     const expect = c.value
+    // issues/129 案 A 第二层（在**原有那句通用放行之前**，与 java JdbcProcessRepository.buildWhere 同位置）：
+    // 归属谓词列 + 空值 ⇒ 空页，绝不折叠成"这条条件不加"。门面已把空串归一化成缺省（facade operatorArg），
+    // 这一道防的是绕过门面直连仓储的调用方与下一版门面改动。
+    // ⚠️ 只收 OWNERSHIP_COLUMNS 那四列：下面那句 expect == null 放行 + 空串按"没填"处理是
+    // m_LIKE_* 等**可选过滤**的通用行为，整体改成"空值即空页"会把可选过滤一起改坏。
+    if (isBlankOwnership(c.column, c.operator, expect)) return false
     if (v == null || expect == null) continue
     switch (c.operator.toUpperCase()) {
       case 'EQ': if (!eqValue(v, expect)) return false; break
@@ -65,6 +72,23 @@ export function matchConditions(conditions: QueryCondition[] | undefined, fields
 export function eqValue(v: any, expect: any): boolean {
   if (Array.isArray(v)) return v.includes(expect)
   return String(v) === String(expect)
+}
+
+/**
+ * issues/129 案 A 第二层 · 位置参归属过滤（内存仓）。
+ *
+ * 本栈门面把"我是谁"作为**位置参**下发给 pageInstances/pageTodoTasks/pageDoneTasks/pageCcInstances
+ * （java 下发的是 `t.operator EQ` 条件，形状不同、义务相同：归属值为空 ⇒ 空页）。
+ * 旧写法 `if (operator && …) continue` 把空串折叠成"这条条件不加" ⇒ 绕过门面的调用方一读就是**全库**
+ * （issues/129 §2 点名的 node 落点 `src/memory.ts:273` 就是 doneList 那一句）。
+ * 现按拍板一律「空（null/undefined/全空白）⇒ 空页」，与 rust 1.0.17 内存仓
+ * （`!op.is_empty()` 判据）同形；非空值**原样比较、不 trim**，与 java `t.operator = ?`
+ * 及本栈 SQL 侧 `= ?` 的取值口径一致（不借机放宽成模糊匹配）。
+ * 返回 null 表示"归属值为空"，调用方据此让每一行都不匹配。
+ */
+function ownershipKey(wanted: string | null | undefined): string | null {
+  const op = wanted ?? ''
+  return op.trim() === '' ? null : op
 }
 
 export class MemoryRepository implements ProcessRepository {
@@ -232,8 +256,10 @@ export class MemoryRepository implements ProcessRepository {
 
   async pageInstances(pageNum = 1, pageSize = 10, operator: string, conditions?: QueryCondition[]) {
     const rows: InstanceRow[] = []
+    // issues/129 案 A 第二层：归属值为空 ⇒ 空页（原来 `if (operator && …)` 是"空即不过滤"，读出全库）
+    const op = ownershipKey(operator)
     for (const inst of this.instances.values()) {
-      if (operator && inst.operator !== operator) continue
+      if (op == null || inst.operator !== op) continue
       const def = this.defines.get(inst.defineId)
       const r: InstanceRow = {
         id: inst.id, parentId: inst.parentId, defineId: inst.defineId, state: inst.state,
@@ -253,9 +279,10 @@ export class MemoryRepository implements ProcessRepository {
 
   async pageTodoTasks(pageNum = 1, pageSize = 10, actorId: string, conditions?: QueryCondition[]) {
     const rows: TaskRow[] = []
+    const op = ownershipKey(actorId) // issues/129 案 A 第二层：空 ⇒ 空页，不再"空即不过滤"
     for (const t of this.tasks.values()) {
       if (t.taskState !== TaskState.Doing) continue
-      if (actorId && !(this.actors.get(t.id) ?? []).includes(actorId)) continue
+      if (op == null || !(this.actors.get(t.id) ?? []).includes(op)) continue
       const r = this.taskRow(t)
       const fields = pickFields(r, TASK_FIELDS)
       fields['pta.actor_id'] = this.actors.get(t.id) ?? []
@@ -268,9 +295,10 @@ export class MemoryRepository implements ProcessRepository {
 
   async pageDoneTasks(pageNum = 1, pageSize = 10, operator: string, conditions?: QueryCondition[]) {
     const rows: TaskRow[] = []
+    const op = ownershipKey(operator) // issues/129 案 A 第二层：空 ⇒ 空页（本 issue §2 点名的内存仓落点）
     for (const t of this.tasks.values()) {
       if (t.taskState === TaskState.Doing) continue
-      if (operator && t.actorId !== operator) continue
+      if (op == null || t.actorId !== op) continue
       const r = this.taskRow(t)
       if (matchConditions(conditions, pickFields(r, TASK_FIELDS))) rows.push(r)
     }
@@ -299,8 +327,9 @@ export class MemoryRepository implements ProcessRepository {
   // pageCcInstances 我的抄送分页（v1.3.0）：按抄送人 actorId 过滤，join 实例 + 定义
   async pageCcInstances(pageNum = 1, pageSize = 10, actorId: string, conditions?: QueryCondition[]) {
     const rows: CcInstanceRow[] = []
+    const op = ownershipKey(actorId) // issues/129 案 A 第二层：空 ⇒ 空页（cc.actor_id 为归属列）
     for (const [instId, actors] of this.ccInstances) {
-      if (actorId && !actors.includes(actorId)) continue
+      if (op == null || !actors.includes(op)) continue
       const inst = this.instances.get(instId)
       if (!inst) continue
       const def = this.defines.get(inst.defineId)

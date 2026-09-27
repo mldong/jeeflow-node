@@ -13,6 +13,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { ProcessInstance, ProcessTask, type ProcessDefine, type CcInstanceRow, type DefineRow, type InstanceRow, type TaskRow } from '../model.js'
 import { InstanceState, TaskState } from '../model.js'
 import type { IDGenerator, ProcessRepository, QueryCondition, InstanceStatsRow, TaskStatsRow } from '../spi.js'
+import { isBlankOwnership, isBlankValue } from '../spi.js'
 
 // ═══ 列白名单（issues/05-5，与 mldong-boot2 别名一致） ═══
 
@@ -533,6 +534,10 @@ export class JdbcRepository implements ProcessRepository {
   }
 
   async pageInstances(pageNum: number, pageSize: number, operator: string, conditions?: QueryCondition[]): Promise<{ rows: InstanceRow[]; total: number }> {
+    // issues/129 案 A 第二层：位置参归属过滤（t.operator）为空 ⇒ 空页。
+    // 不短路的话 `WHERE t.operator = ''` 会去匹配 operator 列恰为空串的行，与内存仓（空 ⇒ 空页）、
+    // 与 java（归属列空值 ⇒ `AND 1=0`）都不同答案；两仓同一份数据必须给同一个结论。
+    if (isBlankValue(operator)) return { rows: [], total: 0 }
     const cond = this.buildWhere(conditions ?? [], INSTANCE_WHITELIST)
     const where = ' FROM wf_process_instance t' +
       ' LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id' +
@@ -562,6 +567,9 @@ export class JdbcRepository implements ProcessRepository {
   }
 
   private async pageTasks(pageNum: number, pageSize: number, done: boolean, filter: string, conditions?: QueryCondition[]): Promise<{ rows: TaskRow[]; total: number }> {
+    // issues/129 案 A 第二层：位置参归属过滤（done=t.operator / todo=pta.actor_id）为空 ⇒ 空页，
+    // 与内存仓同判据（两仓同一份数据一个答案），也让 `= ''` 不去匹配归属列恰为空串的行。
+    if (isBlankValue(filter)) return { rows: [], total: 0 }
     const cond = this.buildWhere(conditions ?? [], TASK_WHITELIST)
     const where = ' FROM wf_process_task t' +
       ' LEFT JOIN wf_process_instance pi ON t.process_instance_id = pi.id' +
@@ -613,6 +621,16 @@ export class JdbcRepository implements ProcessRepository {
     for (const c of conditions) {
       if (!whitelist.has(c.column)) continue // 不在白名单，丢弃
       const val = c.value
+      // issues/129 案 A 第二层（在**原有那句通用放行之前**，逐字对照 java JdbcProcessRepository.buildWhere）：
+      // 归属谓词列 + 空值 ⇒ **空页**（`AND 1=0`），绝不能变成"这条条件不加"。
+      // 门面已把空串归一化成缺省（facade `operatorArg`），这一道防的是绕过门面直接调仓储的调用方
+      // 与将来的门面改动——只留门面那半不算修完（rust 1.0.17 同为两层）。
+      // ⚠️ 只收归属列：下面那句"空值当作没填"是 QueryCondition 对 m_LIKE_* 等**可选过滤**的通用放行，
+      // 照字面改成"空值即空页"会把可选过滤一起改坏。
+      if (isBlankOwnership(c.column, c.operator, val)) {
+        sql += ' AND 1=0'
+        continue
+      }
       if (val == null || val === '') continue
       switch (c.operator.toUpperCase()) {
         case 'EQ': sql += ` AND ${c.column} = ?`; params.push(val); break
@@ -659,6 +677,8 @@ export class JdbcRepository implements ProcessRepository {
 
   // pageCcInstances 我的抄送分页（v1.3.0）：cc 表 join 实例 + 定义，按抄送人过滤（对齐 Java pageCcInstances）
   async pageCcInstances(pageNum: number, pageSize: number, actorId: string, conditions?: QueryCondition[]): Promise<{ rows: CcInstanceRow[]; total: number }> {
+    // issues/129 案 A 第二层：位置参归属过滤（cc.actor_id）为空 ⇒ 空页（与内存仓/java 同判据）
+    if (isBlankValue(actorId)) return { rows: [], total: 0 }
     const cond = this.buildWhere(conditions ?? [], CC_WHITELIST)
     const where = ' FROM wf_process_instance t' +
       ' LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id' +
