@@ -78,8 +78,17 @@ const userProv: UserProvider = {
   },
 }
 
+// STACK_SEQ：本栈 T1 测试 id 的栈位（issues/118 §2.5）——三栈并行连同一台 160 MySQL 时，
+// 旧式 Date.now()*1000 + 序号 会在同一毫秒生成同样的 id ⇒ 主键冲突随机复现。
+// 统一公式 id = ts_ms*4000 + 栈位*1000 + 序号（n<1000）；python=1 / node=2 / go=3。
+// 乘数为什么是 4000：Date.now()*100000 达 1.77e17 超了 JS 双精度安全整数（2^53≈9.007e15），
+// 序号会被浮点抹平⇒同毫秒自撞主键（本轮实测踩过）；*4000 上限 7.16e15 仍在安全区内，
+// 且每毫秒切 4000 个槽、三栈各占 1000，互不重叠。
+// 注：persist.test.ts / spec.test.ts 走内存仓与 SQLite，不参与共享库撞车，故不加此常量。
+const STACK_SEQ = 2
+
 class SeqIDGen implements IDGenerator {
-  private base = Date.now() * 1000
+  private base = (Date.now() * 4000 + STACK_SEQ * 1000)
   private n = 0
   nextId(): string { this.n += 1; return String(this.base + this.n) }
 }
