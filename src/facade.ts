@@ -1396,8 +1396,15 @@ function formDataOf(vars: Record<string, any> | undefined, prefix: string): Reco
  * 13 栈里就只有 nestjs 少这些列（issues/122 的机理）。规范 06 §2.4 的时间列是"必出键、空即空串"，
  * 所以归一放在这一层：所有行投影共用它，逐个补 `?? ''` 迟早漏一处。
  */
-function fmtTime(v: Date | undefined | null): string {
-  if (v == null) return ''
+// issues/133（拍板 B）：可空时间列空值出 `null`，不出 ''。
+//   · spec 06-facade.md:93 钉的是"空值返回 null"；
+//   · boot2 参考实现的 ProcessTaskVO 直接继承 entity 的 `Date finishTime` ⇒ Jackson 出 null；
+//   · 历史上这里回 ''（commit 448f902）是为绕 issues/122 宿主侧全局剥-null，
+//     该根因已由 mldong-nestjs `@KeepNullResponse()`（WfController 类级）收口，
+//     引擎侧不该再替宿主兜底——那会把"键恒在、值 null"的形状换成"值空串"，
+//     前端 `x ? 显示 : 隐藏` 这类判空在 '' 上恒假，等于把缺值伪装成有值。
+function fmtTime(v: Date | undefined | null): string | null {
+  if (v == null) return null
   const p = (n: number) => String(n).padStart(2, '0')
   return `${v.getFullYear()}-${p(v.getMonth() + 1)}-${p(v.getDate())} ${p(v.getHours())}:${p(v.getMinutes())}:${p(v.getSeconds())}`
 }

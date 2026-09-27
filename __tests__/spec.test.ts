@@ -3577,19 +3577,28 @@ describe('issues/122 审批记录行的可空时间列必须出键', () => {
     const row: any = r.data.find((x: any) => x.taskName === doing.taskName)
     assert.ok(row, `记录行里应能找到进行中的那条: ${JSON.stringify(r.data)}`)
     assert.ok('finishTime' in row, '可空时间列必须出键（不是整键省略）')
-    assert.equal(row.finishTime, '', "空值出 ''（与 boot2 同形），不能是 null")
-    // 反闸正向自证：套一遍 mldong-nestjs 的剥 null 规则，键必须活下来
-    const stripped = JSON.parse(JSON.stringify(row, (_k, v) => (v === null ? undefined : v)))
-    assert.ok('finishTime' in stripped, '过剥-null 序列化后仍要保住键')
+    // issues/133 拍板 B：这里曾断 ''（理由写的是"与 boot2 同形"，实为错——boot2 的
+    // ProcessTaskVO 继承 entity 的 Date 字段，Jackson 出 null），真实动机是绕 issues/122
+    // 的宿主剥-null；根因已由 mldong-nestjs @KeepNullResponse 类级豁免收口 ⇒ 引擎收回 null。
+    assert.strictEqual(row.finishTime, null, "空值出 null（spec 06-facade.md:93）")
+    // 只留引擎侧那一半：序列化后键必须还在且值是 null。
+    // 宿主剥不剥 null 不是引擎能证的（那是壳层 @KeepNullResponse 的义务，见 122 收口）。
+    assert.ok(/"finishTime":\s*null/.test(JSON.stringify(row)),
+      `出口 JSON 应保留 finishTime 键且值为 null: ${JSON.stringify(row)}`)
   })
 
   /**
-   * issues/122 的完整面：fmtTime 覆盖的是**所有行投影**（任务行/委托行/设计行/实例行），
-   * 逐个补 `?? ''` 迟早漏一处 ⇒ 归一放在 fmtTime 本身。本用例不写死键路径，
-   * 直接扫三条真实 action 的响应树：任何 *Time 键都必须是字符串（空即 ''），
-   * 且过一遍下游的剥-null 序列化后键集合不得变小。
+   * issues/133（拍板 B）的完整面：fmtTime 覆盖的是**所有行投影**（任务行/委托行/设计行/实例行），
+   * 逐个补 `?? null` 迟早漏一处 ⇒ 归一放在 fmtTime 本身。本用例不写死键路径，
+   * 直接扫三条真实 action 的响应树：任何 *Time 键必须**出键**，值只能是
+   * `yyyy-MM-dd HH:mm:ss` 串或 `null`，绝不允许 ''（'' 是 122 时代的宿主兜底残留）。
+   *
+   * 原本这里还有一道"剥-null 反闸"（把响应过一遍 v===null?undefined:v 再比键集合）——
+   * 那验的是**宿主**的序列化行为，引擎负不了这个责；宿主那半的正解是
+   * mldong-nestjs `@KeepNullResponse()`（挂 WfController 类级，拦 /wf/** 全部出口）。
+   * ⇒ 换成引擎侧可证的那半：raw JSON 里键在、空值是 null。
    */
-  it('全链时间列一律出键出空串（任务行 / 委托行 / 定义行三投影，含剥-null 反闸）', async () => {
+  it('全链时间列一律出键、空值出 null（任务行 / 委托行 / 定义行三投影）', async () => {
     const { engine, repo } = setup()
     const ext = new MemoryExtRepository()
     const facade = new JeeflowFacade(engine, repo, ext)
@@ -3607,13 +3616,24 @@ describe('issues/122 审批记录行的可空时间列必须出键', () => {
     ]
     const isTimeKey = (k: string) =>
       /(?:Time|Time\w*)$/.test(k) && k !== 'expireTimeOut' && !/Timeout/i.test(k)
+    /** 单格判据：null 合法、'' 非法、非串非法（键缺失由 scan 的另一半管）。 */
+    const badTimeCell = (p: string, v: any): string | null => {
+      if (v === null) return null
+      if (typeof v === 'string' && v !== '') return null
+      return `${p}=${JSON.stringify(v)}`
+    }
+    // 判据自身的三格内联自证：少了它，"改了判据方向"与"判据坏了"读起来一模一样
+    assert.ok(badTimeCell('x.finishTime', ''), "自证①：'' 必须判坏（133 收的就是它）")
+    assert.equal(badTimeCell('x.finishTime', null), null, "自证②：null 必须判好（spec 06:93）")
+    assert.equal(badTimeCell('x.finishTime', '2026-01-01 00:00:00'), null, "自证③：正常串必须判好")
     const scan = (node: any, path: string, keys: string[], bad: string[]) => {
       if (node == null || typeof node !== 'object') return
       for (const [k, v] of Object.entries(node)) {
         const p = `${path}.${k}`
         if (isTimeKey(k)) {
           keys.push(p)
-          if (typeof v !== 'string') bad.push(`${p}=${JSON.stringify(v)}`)
+          const hit = badTimeCell(p, v)
+          if (hit) bad.push(hit)
         }
         scan(v, p, keys, bad)
       }
@@ -3624,12 +3644,14 @@ describe('issues/122 审批记录行的可空时间列必须出键', () => {
       scan(r, action, keys, bad)
       assert.ok(keys.length > 0, `${action} 响应里一个时间列都没扫到 ⇒ 本用例空转（夹具失效）`)
       assert.deepEqual(bad, [],
-        `${action}：时间列必须是字符串（空值出 ''），出 null 会被 mldong-nestjs 的剥-null 拦截器连键吞掉（issues/122）`)
-      // 反闸正向自证：过一遍剥-null 序列化，键集合必须一模一样
-      const after: string[] = [], afterBad: string[] = []
-      scan(JSON.parse(JSON.stringify(r, (_k, v) => (v === null ? undefined : v))), action, after, afterBad)
-      assert.deepEqual(after.sort(), keys.slice().sort(),
-        `${action}：剥-null 序列化后时间键集合变了 ⇒ 有键被整键吞掉`)
+        `${action}：时间列只能出 null 或 yyyy-MM-dd HH:mm:ss 串，出 '' 即违 spec 06-facade.md:93（issues/133）`)
+      // 引擎侧那一半：序列化后键不能整键消失（宿主剥-null 是壳层义务，见 @KeepNullResponse）
+      const raw = JSON.stringify(r)
+      for (const p of keys) {
+        const k = p.split('.').pop() as string
+        assert.ok(raw.includes(`"${k}":`),
+          `${action}：时间列 ${k} 在出口 JSON 里整键不见了`)
+      }
     }
   })
 })
