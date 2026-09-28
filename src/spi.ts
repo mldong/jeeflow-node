@@ -147,7 +147,10 @@ export interface ProcessExtRepository {
 
   // getSurrogate 查询指定时间生效中的委托（06 §4.5 条款 1.4 + issues/123）：**先**按主键 id
   // 取该流程作用域内**最新一条**（不带生效判据过滤），**再**由四判据裁决这一条
-  // （enabled 严格 1 / 自委托过滤 / 时间窗任一侧空=不限，at 为空则不比较窗口）。
+  // （enabled 只认**数值** 1 / 自委托过滤 / 时间窗任一侧空=不限，at 为空则不比较窗口）。
+  // issues/130 案 A：判据不吃串，所以整数列被驱动字符串化（回读成 '1'）必须在**实现侧**交判据前
+  // 还原（内置 SQL 仓走 surrogateHydrateEnabled；自定义 SPI 仓储不还原则按停用处理）；
+  // '1.0' / ' 1' / 'abc' / true / 0 / 2 / null 一律不生效，不得顺手放宽成 Number(v)===1。
   // 该作用域无记录才兜底 processName 为空的"全流程委托"；最新一条不生效 ⇒ null，
   // 同层内不回落更旧那条，但精确作用域判否后仍要看全流程作用域（条款 1.4 后半句）。见 src/surrogate-rule.ts。
   getSurrogate(operator: string, processName: string, at?: Date): Promise<ProcessSurrogate | null>

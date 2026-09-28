@@ -14,6 +14,8 @@ import type { ExpressionEvaluator, UserProvider } from '../src/spi.js'
 import { type FlowInterceptor, EventType, type EngineExtensions } from '../src/extensions.js'
 import { dir as flowsResolverDir } from '../flows-resolver.js'
 import { runParity } from './surrparity.js'
+// issues/130 案 A：判据（只认数值 1）与**边界还原**（驱动串化）分属两层，测试要分别钉住
+import { surrogateEnabled, surrogateHydrateEnabled } from '../src/surrogate-rule.js'
 
 const flowDir = flowsResolverDir() + '/'
 
@@ -3009,6 +3011,181 @@ describe('issues/116 委托代理自动生效（引擎内置·内存仓路径）
       updateTime: new Date(), updateUser: 't', ...s,
     } as any)
   }
+
+  /**
+   * issues/130 案 A · T0 enabled 脏值矩阵（内存仓路径，判据打在「委托是否命中」的**行为**上，
+   * 不只看内部谓词返回值）。每格独立 processName 作用域、窗不限、代理人非空且≠授权人
+   * ⇒ 命中与否只由 enabled 决定。严判据只认整数 1：正向整数 1 命中，0/2 及一切字符串/布尔/
+   * null/undefined 落空。
+   *
+   * ⚠️ 台账原值必须**绕过两层写侧归一**才测得到判据本身：① 门面 `processSurrogate/*` 的入参归一
+   * （`parseSurrogateEnabled`，issues/130 明令保留不动）、② 内存仓 `saveSurrogate` 的台账边界
+   * （案 A 补的那一段：本表 enabled 建模 INT 列，`'1'` 直写就该落成数值 1，用例 27 的 p2 档靠它）。
+   * 姿势同 PHP `SurrogateAutoApplyTest::testEnabledAcceptsOnlyIntegerOneAndNoEquivalentForms`：
+   * 先 save 一条 enabled=1 的行，再用**不做归一的** `updateSurrogate` 把原值盖回台账——这恰好就是
+   * issue §2 说的唯一显形路径（业务方自定义 SPI 仓储回行时传非整数 enabled）。
+   * 每档先自检"台账里真的是这个值、这个类型"，否则负向断言只是空转。
+   *
+   * ⚠️ 关于「浮点 1.0」：JS 只有一个 Number 类型，字面量 `1.0 === 1` 且 `Number.isInteger(1.0) === true`，
+   * 与整数 1 **在运行期无法区分**。issues/130 里"停用浮点 1.0"是 Python/PHP 的类型级概念
+   * （Java/Go 用 `Integer`/`int` 静态列，1.0 根本存不进来，本栈无对应脏值可喂）。故本矩阵把
+   * `1.0` 归入正向整数 1 一档（命中），与五栈严阵营的实际可观测行为一致，并在此钉死这个事实。
+   */
+  it('issues/130 案 A T0：enabled 脏值矩阵逐档不命中、整数 1 命中（内存仓·只认整数 1）', async () => {
+    const ext = new MemoryExtRepository()
+    let seq = 100
+    const probe = async (label: string, enabled: any): Promise<boolean> => {
+      const pn = `e130-${label}`
+      const id = String(seq++)
+      await putSur(ext, { id, operator: 'opE', surrogate: `agent-${label}`, processName: pn })
+      const row = await ext.findSurrogateById(id)
+      assert.ok(row, `${label}：委托行未落库（负向会空转）`)
+      // 盖回台账原值：updateSurrogate 不归一（saveSurrogate 的写侧边界会把 '1' 落成数值 1）
+      await ext.updateSurrogate({ ...row, enabled } as any)
+      const ledger = await ext.findSurrogateById(id)
+      assert.ok(ledger && 'enabled' in ledger, `${label}：前置自检失败——台账行没有 enabled 键`)
+      assert.ok(Object.is(enabled, ledger!.enabled),
+        `${label}：前置自检——台账里须真的是 ${String(enabled)}(${typeof enabled})，`
+        + `实际是 ${String(ledger!.enabled)}(${typeof ledger!.enabled})，否则本档等于没测`)
+      const hit = await ext.getSurrogate('opE', pn)
+      return hit !== null && hit.surrogate === `agent-${label}`
+    }
+    // 正向：整数 1 → 命中
+    assert.equal(await probe('int-1', 1), true, '整数 1 必须命中（正向对照，防判据写反成恒不命中）')
+    // ⚠️ JS 里 1.0 === 1 ⇒ 与整数 1 同值，归入正向（见上注释）
+    assert.equal(await probe('num-1.0', 1.0), true, 'JS 数值 1.0 与整数 1 无法区分 ⇒ 命中')
+    // 逐档脏值 → 全部不命中（只认整数 1）
+    const dirty: Array<[string, any]> = [
+      ['int-0', 0],           // 停用合法值
+      ['int-2', 2],           // 其它整数（阳性对照，issues/130 §4）
+      ['str-1', '1'],         // 案 A 关键收窄：字符串 '1' 不再等价 1（判据层面；台账写侧边界另见 T1）
+      ['str-1.0', '1.0'],     // 半宽病灶：'1.0' 曾经 Number.isInteger(Number(s)) 蒙混过关
+      ['bool-true', true],
+      ['str-x', 'x'],         // 阳性对照：不可解析串（issues/130 §4）
+      ['undefined', undefined],
+      ['null', null],
+      ['empty-str', ''],
+    ]
+    for (const [label, v] of dirty) {
+      assert.equal(await probe(label, v), false, `脏值 enabled(${label}) 不得命中（只认整数 1，issues/130 案 A）`)
+    }
+  })
+
+  /**
+   * issues/130 案 A · T1 **内存仓写侧台账边界**：`enabled` 列建模的是 INT（tests/schema/*.sql），
+   * 直写台账的规范整数串必须落成数值（＝用例 27 里 `'1'` 与整数 1 同结论的那一段；摘掉它 :2971 翻红）。
+   * 同一段不许顺手放宽：非规范串（`'1.0'` / `' 1'` / `'01'` / `'+1'` / `''` / `'abc'`）与非字符串
+   * （`true` / `2` / `null`）原样留在台账里，交判据判停用——那才是"只认数值 1"而不是"换个地方强转"。
+   */
+  it('issues/130 案 A T1：内存仓写侧边界只把规范整数串落成数值，非规范值原样留着判停用', async () => {
+    const ext = new MemoryExtRepository()
+    await putSur(ext, { id: 'w-str1', operator: 'opW1', surrogate: 'agStr', processName: 'f', enabled: '1' })
+    const led = await ext.findSurrogateById('w-str1')
+    assert.equal(typeof led?.enabled, 'number',
+      "INT 列语义：台账直写 '1' 须在写侧边界落成数值（不还原＝严判据把这类台账整体判废，用例 27 即红）")
+    assert.equal(led?.enabled, 1, "台账里应是数值 1，而不是 '1' 也不是别的")
+    assert.equal((await ext.getSurrogate('opW1', 'f'))?.surrogate, 'agStr',
+      "'1' 经写侧边界后与整数 1 同结论（用例 27 d 档）")
+    const keep: Array<[string, any]> = [
+      ['1.0', '1.0'], ['空格1', ' 1'], ['尾空格1', '1 '], ['前导零', '01'], ['加号', '+1'],
+      ['空串', ''], ['不可解析', 'abc'], ['布尔', true], ['其它整数', 2], ['null', null],
+    ]
+    for (const [label, v] of keep) {
+      const id = `w-${label}`
+      await putSur(ext, { id, operator: `opK-${label}`, surrogate: `agK-${label}`, processName: 'f', enabled: v })
+      const row = await ext.findSurrogateById(id)
+      assert.ok(Object.is(v, row?.enabled), `非规范值 ${label} 不得被写侧边界改写（改写＝把接受集合放宽回去）`)
+      assert.equal(await ext.getSurrogate(`opK-${label}`, 'f'), null,
+        `写侧边界后 ${label} 仍须判停用（只认数值 1，issues/130 案 A）`)
+    }
+  })
+
+  /**
+   * issues/130 案 A · T2 边界纯函数语法：`surrogateHydrateEnabled` 只认规范整数串 `-?(0|[1-9]\d*)`。
+   * 钉住"这不是把判据的宽松转换换个地方做"——`'1.0'` / `'01'` / `' 1'` / `'1 '` / `'+1'` / `'1abc'`
+   * 一律原样返回且交判据必停；非字符串入参原样透传（案 A 三条口径之②：驱动串化由边界还原，
+   * 不为此放宽判据）。
+   */
+  it('issues/130 案 A T2：surrogateHydrateEnabled 只认规范整数串，非规范串原样返回且仍判停用', () => {
+    for (const [text, num] of [['1', 1], ['0', 0], ['2', 2], ['-1', -1], ['123', 123]] as Array<[string, number]>) {
+      assert.equal(surrogateHydrateEnabled(text), num, `规范整数串 '${text}' 应还原为数值`)
+      assert.equal(typeof surrogateHydrateEnabled(text), 'number', `还原后须是数值型：'${text}'`)
+    }
+    assert.equal(surrogateEnabled(surrogateHydrateEnabled('1')), true, "'1' 经边界还原后判据才认")
+    assert.equal(surrogateEnabled(surrogateHydrateEnabled('0')), false, "还原成数值 0 照样判停用")
+    assert.equal(surrogateEnabled(surrogateHydrateEnabled('2')), false, "还原成数值 2 照样判停用")
+    for (const text of ['1.0', '01', ' 1', '1 ', '+1', '1abc', 'abc1', 'x', '', '  ', 'abc', '1_0']) {
+      assert.equal(surrogateHydrateEnabled(text), text, `非规范整数串 '${text}' 不得被还原（还原＝放宽接受集合）`)
+      assert.equal(surrogateEnabled(surrogateHydrateEnabled(text)), false, `非规范串经边界后仍须判停用: [${text}]`)
+    }
+    for (const v of [1, 0, 2, -1, true, false, null, undefined, {}, [], Number.NaN]) {
+      assert.ok(Object.is(v, surrogateHydrateEnabled(v)), `非字符串入参原样透传: ${String(v)}`)
+    }
+    assert.equal(surrogateEnabled(surrogateHydrateEnabled(1)), true, '数值 1 透传后照旧命中')
+    assert.equal(surrogateEnabled(surrogateHydrateEnabled(true)), false, '布尔 true 不被还原成 1')
+  })
+
+  /**
+   * issues/130 案 A · T3 **SQL 仓读侧驱动边界**：`enabled` 是 INT 列，但驱动不保证回读成数值
+   * （mysql2 关 typeCast、pg 的 int8/numeric 一律给字符串）。判据只认数值 1 之后不在这里还原，
+   * 这类宿主的委托会**整体判废且零告警** ⇒ 本格用假驱动复现"给串"的形态（真机 MySQL 那一路在
+   * `__tests__/jdbc.test.ts`，本机无库跑不到）。摘掉 `queryNewestSurrogate` 里的还原 ⇒ 本格翻红。
+   * 同用例钉住边界**不是**换个地方做宽松转换：文本列值 `'abc'` / 半宽 `'1.0'` 仍判停用，
+   * 台账回显（findSurrogateById）仍给列原值，且与内存仓同答案（条款 6 / 用例 27）。
+   */
+  it('issues/130 案 A T3：SQL 仓读侧还原驱动串化的 INT 列，非规范串仍停用且与内存仓同答案', async () => {
+    const now = new Date()
+    const dbRow = (id: string, operator: string, surrogate: string, enabled: any, processName: string) => ({
+      id, process_name: processName, operator, surrogate, start_time: null, end_time: null,
+      enabled, create_time: now, create_user: 't', update_time: now, update_user: 't',
+    })
+    const rows = [
+      dbRow('13001', 'n130-opStr', 'sStrOne', '1', 'flowStr'),     // 驱动把 INT 列串化成 '1'
+      dbRow('13002', 'n130-opTxt', 'sTxtOff', 'abc', 'flowTxt'),   // 真表里就是文本脏值
+      dbRow('13003', 'n130-opSemi', 'sSemiOff', '1.0', 'flowSemi'), // 半宽串
+    ]
+    // 零连接假驱动：只复刻 SQL 形状（args = [operator] 为兜底作用域、[operator, processName] 为精确作用域，
+    // ORDER BY id DESC LIMIT 1 取首行），不碰任何数据库/端口
+    const conn: any = {
+      async execute() {},
+      async fetchOne(sql: string, args: any[]) {
+        if (sql.includes('WHERE id = ?')) return rows.find(r => String(r.id) === String(args[0])) ?? null
+        return (await this.fetchAll(sql, args))[0] ?? null
+      },
+      async fetchAll(_sql: string, args: any[]) {
+        const [operator, processName] = args
+        const inScope = rows.filter(r => r.operator === operator && (processName === undefined
+          ? (r.process_name === null || r.process_name === '')
+          : r.process_name === processName))
+        return inScope.length ? [inScope[inScope.length - 1]] : []
+      },
+      async begin() {}, async commit() {}, async rollback() {},
+    }
+    const sqlExt = new JdbcProcessExtRepository({
+      placeholder: '?', async acquire() { return conn }, async release() {},
+    } as any)
+
+    const hit = await sqlExt.getSurrogate('n130-opStr', 'flowStr')
+    assert.ok(hit, "驱动把 INT 列回读成字符串 '1' 时 SQL 路仍须命中（漏还原＝这类宿主的委托整体判废）")
+    assert.equal(hit!.surrogate, 'sStrOne')
+    assert.equal(typeof (hit as any).enabled, 'number', '交判据之前，行里的 enabled 须已在仓储读侧边界还原成数值')
+    assert.equal((hit as any).enabled, 1)
+    assert.equal(await sqlExt.getSurrogate('n130-opTxt', 'flowTxt'), null,
+      "边界只还原规范整数串：真表列值是文本 'abc' 仍判停用（不是把宽松转换换个地方做）")
+    assert.equal(await sqlExt.getSurrogate('n130-opSemi', 'flowSemi'), null,
+      "'1.0' 不是规范整数串，读侧边界不许还原")
+    assert.equal((await sqlExt.findSurrogateById('13001') as any)?.enabled, '1',
+      '还原只做在裁决读上；台账回显（findSurrogateById）仍是列原值，不替调用方改写数据')
+
+    // 双仓同答案（条款 6 / 用例 27）：同一份 INT 列数据，内存仓与 SQL 仓命中同一个代理人
+    const mem = new MemoryExtRepository()
+    await mem.saveSurrogate({
+      id: '13001', operator: 'n130-opStr', surrogate: 'sStrOne', processName: 'flowStr',
+      enabled: '1' as any, createTime: now, createUser: 't', updateTime: now, updateUser: 't',
+    } as any)
+    assert.equal((await mem.getSurrogate('n130-opStr', 'flowStr'))?.surrogate, 'sStrOne',
+      '双仓同答案：内存仓同档（写侧边界落数值 1）同样命中')
+  })
 
   it('契约 1.1 取值口径：define.name ≠ 模型 name 时取模型 name（诱饵行钉住）', async () => {
     const { engine, repo } = setup()

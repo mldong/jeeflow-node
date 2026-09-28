@@ -6,7 +6,7 @@ import {
 } from './model.js'
 import type { ProcessExtRepository, QueryCondition } from './spi.js'
 import { matchConditions } from './memory.js'
-import { surrogateIsEffective, surrogateTimeMs, newestOf } from './surrogate-rule.js'
+import { surrogateIsEffective, surrogateTimeMs, surrogateHydrateEnabled, newestOf } from './surrogate-rule.js'
 
 // ═══ 条件匹配基建（issues/05-5） ═══
 
@@ -91,9 +91,18 @@ export class MemoryExtRepository implements ProcessExtRepository {
     if (!s.createTime) s.createTime = now
     if (!s.updateTime) s.updateTime = now
     // 显式 enabled=0 是合法值（停用委托）；缺省由门面处理（对齐 Java/Go/Python，issues/82-7）
+    // issues/130 案 A 的**写侧台账边界**：本表 enabled 建模的是 INT 列（tests/schema/*.sql），
+    // 把 `'1'` 直写进 INT 列，落进去的就是数值 1——SQL 仓由数据库做这一步，内存仓没人做，
+    // 于是绕过门面的仓储直写会把文本 `'1'` 原样留在台账里，读侧严判据（只认数值 1）必然判废。
+    // ⚠️ 只还原**规范整数串**（`surrogateHydrateEnabled`），`'abc'` / `'1.0'` / `true` 原样留着
+    // 交判据停用（用例 27 p3~p6 钉的就是这一半）；这不是把接受集合放宽回去，也不动门面写侧归一。
+    s.enabled = surrogateHydrateEnabled(s.enabled)
     this.surrogates.set(s.id, { ...s })
   }
 
+  /** 整行覆盖，**不做**写侧归一（与 saveSurrogate 有意不对称，对齐 PHP InMemoryProcessExtRepository::updateSurrogate）：
+   *  这里是"台账里就是调用方给的原始值"的唯一显形路径＝业务方自定义 SPI 仓储回行传非整数 enabled
+   *  （issues/130 §2 的分叉源，案 A 由实现侧自己归一 ⇒ 本栈严判据判停用）。issues/130 脏值矩阵走这一路。 */
   async updateSurrogate(s: ProcessSurrogate) {
     s.updateTime = new Date()
     this.surrogates.set(s.id, { ...s })
@@ -129,7 +138,8 @@ export class MemoryExtRepository implements ProcessExtRepository {
    *     精确作用域里只要有记录就由它裁决，**不跨作用域回落**；
    *  b. 时间窗 start_time <= at <= end_time，任一侧为空 = 该侧不限；`at` 解析不出时刻则整段跳过窗比较
    *     （保留 `at: Date = new Date()` 显式传 null 的老语义）；
-   *  c. 自委托过滤 surrogate <> operator；d. enabled 只认整数 1。
+   *  c. 自委托过滤 surrogate <> operator；d. enabled 只认**数值** 1（`'1'`/`true` 一律停用；
+   *     直写台账的规范整数串由 {@link saveSurrogate} 的写侧边界先归一，判据本身不吃串）。
    *
    * ⚠️ 顺序是「**先**按主键 id 取最新一条 → **再**由四判据裁决这一条」（条款 1.4 + issues/123）：
    * 反过来（先滤生效、剩下的才取最新）等于"历史上留过一条窗内委托就永久生效"，

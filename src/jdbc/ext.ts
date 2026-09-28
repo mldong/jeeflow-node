@@ -9,7 +9,7 @@ import {
 import type { IDGenerator, ProcessExtRepository, QueryCondition } from '../spi.js'
 import { isBlankOwnership, isBlankValue } from '../spi.js'
 import { TsIDGenerator, rowId, type SqlAdapter, type SqlConnection } from './shared.js'
-import { surrogateIsEffective, surrogateTimeMs } from '../surrogate-rule.js'
+import { surrogateIsEffective, surrogateTimeMs, surrogateHydrateEnabled } from '../surrogate-rule.js'
 
 const txStore = new AsyncLocalStorage<SqlConnection>()
 
@@ -294,7 +294,11 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
    *  a. 作用域：先在该流程名作用域内取记录，该作用域**一条都没有**才兜底
    *     `process_name IS NULL OR = ''`（全流程委托）；精确作用域里只要有记录就由它裁决；
    *  然后由 `surrogateIsEffective` 裁决**这一条**：
-   *  d. enabled 严格 1（'1'/1 同结论，NULL 不生效）、c. 自委托过滤、
+   *  d. enabled **只认数值 1**（'1'/'1.0'/true/null 一律停用，issues/130 案 A；不与 SQL 侧
+   *     `enabled = 1` 的隐式转换"等价"——那是驱动/连接层改写列值的包袱，非运行期口径）。
+   *     INT 列被驱动回读成字符串（`'1'`）由**本仓储的读侧边界**在交判据前还原成数值
+   *     （{@link queryNewestSurrogate} 调 `surrogateHydrateEnabled`），判据本身不吃串；
+   *     c. 自委托过滤、
    *  b. 时间窗 start<=at<=end（任一侧 NULL = 该侧不限；`at` 传 null 则整段跳过窗比较）。
    *
    * ⚠️ 旧形状是 `WHERE operator=? AND enabled=1 AND surrogate<>? AND 窗口… ORDER BY id DESC LIMIT 1`
@@ -330,7 +334,16 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
     const conn = await this.c()
     try {
       const rows = await conn.fetchAll(this.sql(sql), args)
-      return rows.length > 0 ? this.mapSurrogate(rows[0]) : null
+      if (rows.length === 0) return null
+      const newest = this.mapSurrogate(rows[0])
+      // issues/130 案 A 的**驱动边界**还原：`enabled` 是 INT 列（tests/schema/schema-mysql.sql），
+      // 而驱动不保证回读成数值——mysql2 关掉 typeCast、pg 的 int8/numeric、文本协议驱动一律给字符串
+      // '1'。判据 d 只认数值 1 之后不在这里还原，就会让这类宿主的委托**整体判废且零告警**
+      // （Java rs.getInt / Go Scan(&int) / C# GetFieldValue<int> / PHP hydrateEnabled 干的是同一件事）。
+      // ⚠️ 只规范整数串被还原（'1.0' / 'abc' / ' 1' 原样交判据 ⇒ 停用），不是把宽接受集合放回去；
+      // 也**不动** findSurrogateById / pageSurrogates 的台账回显（那里要看到的是列原值）。
+      newest.enabled = surrogateHydrateEnabled(newest.enabled)
+      return newest
     } finally {
       await this.done(conn)
     }

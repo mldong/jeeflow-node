@@ -163,7 +163,11 @@ deploy 自动版本管理，execute 按 submitType 全分发，操作人由 `arg
   - 只读自检：`engine.isSurrogateEnabled()`
 - **查询判据（内存仓与 SQL 仓必须同结论）**：空 `processName` 全流程兜底（先精确后兜底）/
   时间窗 `start<=now<=end`（任一侧空 = 该侧不限）/ `surrogate <> operator` 自委托过滤 /
-  `enabled` 只认 1（脏值不当启用，**门面写侧也把脏值归 0 落库**）
+  `enabled` 只认**数值 1**（issues/130 案 A，与 Java `Integer.valueOf(1).equals(enabled)` 同阵营）：
+  `'1'` / `'1.0'` / `true` 这类"等价写法"与 `0` / `2` / 脏值 / `null` 一律不生效。判据不吃串，
+  整数列被驱动回读成字符串时在**仓储读侧边界**还原（`surrogateHydrateEnabled`，内置 SQL 仓已接；
+  自定义 SPI 仓储不还原则按停用）；直写台账的规范整数串由内存仓写侧边界归一，
+  **门面写侧**另把缺键归 1、脏值归 0 落库（两者都不放宽判据）
 - **多条命中取主键 id 最大一条**（判据 1.4）：SQL 侧 `ORDER BY id DESC LIMIT 1`，内存侧显式比 id
   （雪花串按 BigInt 比数值），**不得按 Map 插入序取首条/末条**——乱序写入时两仓结论就分叉了
 - **`processName` 取值口径**（判据 1.1）：以**流程模型 `name`**（流程 JSON）为准，模型未带时才回落
