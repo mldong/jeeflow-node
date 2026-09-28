@@ -295,6 +295,12 @@ export class EngineImpl implements Engine {
             const pn = await this.surrogateProcessName(flow, inst)
             const eff = mergeAgents([actors[lc + 1]], await this.surrogateAgents([actors[lc + 1]], pn))
             if (eff.length > 1) nt.actorIds = eff
+            // issues/126 案 A · **第五处写点**：这一支绕过 createTask helper 直建任务行，所以必须显式补一次
+            // ——基准侧 boot2 的串行推进是回调 createCountersignTask（ProcessTaskServiceImpl:485，
+            // 内含 :524 那处到期写）⇒ 基准形状里"推进出的第二/第三位成员"同样带到期时间；
+            // 不补就是"首成员有到期、后续没有"（对齐 Java CountersignHandler.applyNodeExpireTime @ cb541d4）。
+            // 变量源＝实例变量（与建单同档），取时基准＝本行 createTime 用的同一个 now。
+            applyNodeExpireTime(nt, curNode.properties?.expireTime, inst.variables, now)
             await this.repo.saveTask(nt)
             // TASK_CREATE：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler / Rust）
             await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: curNode.id, operator })
@@ -442,11 +448,17 @@ export class EngineImpl implements Engine {
     const isFirst = his.variables?.isFirstTaskNode === true
     let actor = isFirst ? String(his.variables?.u_userId ?? '') || inst.operator : his.actorId
     if (!actor) throw new Error(NO_LINEAGE)
+    // 取时基准只取一次：本行 createTime 与 expire_time 共用同一个 Date（写点内不另起时钟）
+    const now = new Date()
     const nt = inst.createTask(this.nextId(), prev.id, prev.text.value, actor,
-      his.createUser ?? '', prev.properties?.form ?? '', new Date(),
+      his.createUser ?? '', prev.properties?.form ?? '', now,
       his.parentTaskId ?? '0', isFirst, his.performType)
     // 复活行只带数据类键：tf_*（上次表单提交）与 csv_*/会签簿记都是"上次提交"的残留
     nt.variables = { ...lineageVars(his.variables), isFirstTaskNode: isFirst }
+    // issues/126 案 A · 回退新建写点：表达式取**被回退掉的那个节点**（＝当前节点）的 expireTime，
+    // 变量源用随行拷贝那份（boot2 的 hisVariable）——两点都与 Java rejectTask 逐字一致。
+    // 取时基准 now 同时是本行 createTime 的值，勿另起时钟（否则同行 create→expire 差值带偏差）。
+    applyNodeExpireTime(nt, findNode(flow, task.taskName)?.properties?.expireTime, nt.variables, now)
     const agents = await this.surrogateAgents([actor], await this.surrogateProcessName(flow, inst))
     const eff = mergeAgents([actor], agents)
     if (eff.length > 1) nt.actorIds = eff
@@ -487,6 +499,10 @@ export class EngineImpl implements Engine {
     const ct = node.properties?.countersignType as string | undefined
     const now = new Date()
     const form = node.properties?.form ?? ''
+    // issues/126 案 A：与 createTask 同一把尺子。本函数当前**零调用者**（issues/121 P2 把回退改成血缘版后
+    // 就没人调它了），按 §1.9 第 1 条口径"接线但不为它造测试"——接线是为了将来复活时不再漏。
+    const expireExpr = node.properties?.expireTime
+    const expireArgs = inst.variables
     if (isCountersign(node.properties?.performType) && ct) {
       switch (ct) {
         case 'PARALLEL':
@@ -495,6 +511,7 @@ export class EngineImpl implements Engine {
             const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, parentId, isFirst, 1)
             const eff = mergeAgents([actor], agents)
             if (eff.length > 1) nt.actorIds = eff
+            applyNodeExpireTime(nt, expireExpr, expireArgs, now)
             await this.repo.saveTask(nt)
             await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
           }
@@ -508,6 +525,7 @@ export class EngineImpl implements Engine {
           }
           const eff = mergeAgents([actors[0]], agents)
           if (eff.length > 1) nt.actorIds = eff
+          applyNodeExpireTime(nt, expireExpr, expireArgs, now)
           await this.repo.saveTask(nt)
           await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
           return
@@ -517,6 +535,7 @@ export class EngineImpl implements Engine {
             const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, parentId, isFirst, 1)
             const eff = mergeAgents([actor], agents)
             if (eff.length > 1) nt.actorIds = eff
+            applyNodeExpireTime(nt, expireExpr, expireArgs, now)
             await this.repo.saveTask(nt)
             await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
           }
@@ -526,6 +545,7 @@ export class EngineImpl implements Engine {
     const effActors = mergeAgents(actors, agents)
     const nt = inst.createTask(this.nextId(), node.id, node.text.value, effActors[0], operator, form, now, parentId, isFirst)
     if (effActors.length > 1) nt.actorIds = effActors
+    applyNodeExpireTime(nt, expireExpr, expireArgs, now)
     await this.repo.saveTask(nt)
     await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
   }
@@ -645,6 +665,10 @@ export class EngineImpl implements Engine {
     const ct = node.properties?.countersignType as string | undefined
     const now = new Date()
     const form = node.properties?.form ?? ''
+    // issues/126 案 A：节点到期表达式（properties.expireTime）+ 实例变量 + 本函数取时基准 now
+    // —— 三处写点（串行首位 / 并行全员 / 普通建单）共用 applyNodeExpireTime 这一把尺子
+    const expireExpr = node.properties?.expireTime
+    const expireArgs = inst.variables
 
     if (isCountersign(node.properties?.performType) && ct) {
       switch (ct) {
@@ -653,6 +677,7 @@ export class EngineImpl implements Engine {
             const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, parentId, isFirst, 1)
             const eff = mergeAgents([actor], agents)
             if (eff.length > 1) nt.actorIds = eff
+            applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 并行会签全员
             await this.repo.saveTask(nt)
             // TASK_CREATE：任务落库后逐个 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
             await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
@@ -669,6 +694,7 @@ export class EngineImpl implements Engine {
           }
           const eff = mergeAgents([actors[0]], agents)
           if (eff.length > 1) nt.actorIds = eff
+          applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 串行会签首位成员
           await this.repo.saveTask(nt)
           await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
           return
@@ -678,6 +704,7 @@ export class EngineImpl implements Engine {
             const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, parentId, isFirst, 1)
             const eff = mergeAgents([actor], agents)
             if (eff.length > 1) nt.actorIds = eff
+            applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 未配会签类型＝全员预创建，与并行同档
             await this.repo.saveTask(nt)
             await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
           }
@@ -688,6 +715,7 @@ export class EngineImpl implements Engine {
     const effActors = mergeAgents(actors, agents)
     const nt = inst.createTask(this.nextId(), node.id, node.text.value, effActors[0], operator, form, now, parentId, isFirst)
     if (effActors.length > 1) nt.actorIds = effActors
+    applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 普通建单
     await this.repo.saveTask(nt)
     await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
   }
@@ -876,4 +904,95 @@ function filterFieldByPerm(args: Record<string, any>, node: FlowNode | undefined
     out[k] = v
   }
   return out
+}
+
+// ─── issues/126 案 A · 任务行到期时间（expire_time）求值与写入 ────────────────────
+
+/** 绝对时刻格式 "yyyy-MM-dd HH:mm:ss"（Java SimpleDateFormat / C# TimeFormat 同串） */
+const ABS_TIME_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/
+
+/** 按 "yyyy-MM-dd HH:mm:ss" 严格解析（本地时区）；不合规/越界一律 null。
+ *  越界判据取 C# 的 TryParseExact（拒 13 月 / 25 时），不取 Java 的 SimpleDateFormat 宽松进位——
+ *  本案的硬要求是"解析不出 ⇒ 这一列留空"，宽松进位会把误配的值算成一个真时刻。 */
+function parseAbsTime(s: string): Date | null {
+  const m = ABS_TIME_RE.exec(s)
+  if (!m) return null
+  const [, ys, mos, ds, hs, mis, ss] = m
+  const mo = Number(mos), d = Number(ds), h = Number(hs), mi = Number(mis), sec = Number(ss)
+  if (mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || sec > 59) return null
+  const dt = new Date(Number(ys), mo - 1, d, h, mi, sec, 0)
+  // 2 月 30 日这类"字段合法但日历上不存在"的值会被 JS 进位，回读校验挡掉
+  if (dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null
+  return dt
+}
+
+/** 相对档前缀取整：必须是**纯整数**且落在 int32 内（C# int.TryParse 同判据），否则返回 null ⇒ 落穿。
+ *  与 Java 的差异是故意的：Java 的 Integer.parseInt 遇 "xh" 会抛异常**打断建单**，
+ *  owner 2026-09-28 定的口径是按 C# 落穿→NULL（配置写错不该让流程卡死）；要改回"跟 Java 一样抛"必须八栈同批改。 */
+function intPrefix(s: string): number | null {
+  if (!/^[-+]?\d+$/.test(s)) return null
+  const n = Number(s)
+  return Number.isSafeInteger(n) && Math.abs(n) <= 2147483647 ? n : null
+}
+
+/**
+ * 解析期待完成时间（逐字移植 Java `FlowUtil.processTime` / C# `FlowUtil.ProcessTime`，本栈原先没有）。
+ *
+ * 三档语义，**顺序不能变**：
+ *  1. `args` 里存在键名等于 expr 原串的项 ⇒ 取该项的值：Date / 毫秒时间戳 / `"yyyy-MM-dd HH:mm:ss"`
+ *     → 该时刻；字符串解析失败 → **null**（不是 now）；其它类型（布尔/数组/对象/小数）→ **落穿**到下面两档
+ *     （Java/C# 都是落穿，不许当"解析失败"提前 return null）。
+ *  2. 否则 expr 以 `s`/`m`/`h`/`d` 结尾且前缀是整数 ⇒ now + N 秒/分/时/天（`d` 走**日历加天**，不乘 86400 秒）。
+ *  3. 否则把 expr 本身按 `"yyyy-MM-dd HH:mm:ss"` 解析 → 时刻；失败 → null。
+ *
+ * ⚠️ 任何一档都不得退回 now()——"算不出来就写当前时间"正是 issues/126 的病灶（建单即逾期，逾期统计恒失真）。
+ *
+ * @param now 取时基准＝**本栈写 createTime 用的同一个 Date**（本栈无时钟槽，与 Java 直接用系统钟同档）
+ */
+export function processTime(expr: string, args: Record<string, any> | undefined, now: Date): Date | null {
+  const a = args ?? {}
+  // ① 变量档：优先于相对档（args 里真有个键叫 "2h" 时取变量值）
+  if (Object.prototype.hasOwnProperty.call(a, expr)) {
+    const v = a[expr]
+    if (v instanceof Date) return new Date(v.getTime())
+    if (typeof v === 'number' && Number.isSafeInteger(v)) return new Date(v)
+    if (typeof v === 'string') return parseAbsTime(v)
+    // 其它类型 ⇒ 落穿
+  }
+  if (expr.trim() === '') return null
+  // ② 相对档
+  const n = intPrefix(expr.slice(0, -1))
+  if (n !== null) {
+    switch (expr.charAt(expr.length - 1)) {
+      case 's': return new Date(now.getTime() + n * 1000)
+      case 'm': return new Date(now.getTime() + n * 60000)
+      case 'h': return new Date(now.getTime() + n * 3600000)
+      case 'd': {
+        const d = new Date(now.getTime())
+        d.setDate(d.getDate() + n)   // 日历加天（跨夏令时/月末按天进位，对齐 Java Calendar.add）
+        return d
+      }
+      default: break
+    }
+  }
+  // ③ 绝对档
+  return parseAbsTime(expr)
+}
+
+/**
+ * issues/126 案 A · 任务行 expire_time 的**唯一**写入口（五处写点共用同一把尺子）：
+ * 普通建单 / 串行会签首位成员 / 并行会签全员 / 回退新建 / 串行会签推进出的下一位成员。
+ *
+ * 节点没配（undefined / null / 空串 / 纯空白）⇒ **该列保持空**：不写 now()、不写 ''、不写 0
+ * （owner 2026-09-28 口径，对齐 boot2 `if(StrUtil.isNotEmpty(expireTime))` 的先判再写）。
+ *
+ * 变量源两档：建单路径＝**实例变量**（boot2 的 `execution.getArgs()`），
+ * 回退新建＝**随行拷贝那份变量**（boot2 的 `hisVariable`）。搞混会让"表达式是个变量名"这一档跨栈得到不同答案。
+ */
+function applyNodeExpireTime(task: ProcessTask, expr: unknown, args: Record<string, any> | undefined, now: Date): void {
+  if (!task) return
+  const s = expr == null ? '' : String(expr)
+  if (s.trim() === '') return
+  const at = processTime(s, args, now)
+  if (at) task.expireTime = at
 }

@@ -3976,3 +3976,213 @@ describe('issues/129 operator 空档两层收口（门面归一化 + 仓储归�
     assert.ok(String(tr.msg).includes('operator 必填'), `transfer 同样保持硬必填：${JSON.stringify(tr)}`)
   })
 })
+
+// ═══ issues/126 案 A · 任务行 expire_time 由**建单路径**按节点表达式真算 ═══════════
+// 契约：jeeflow-hub/docs/goal-126-到期时间七引擎-启动词.md §1 / §1.5 / §1.8 / §1.9
+// 基准＝boot2 内置版 ProcessTaskServiceImpl 的三处写（:213 普通建单 / :386 回退新建 / :524 会签建单），
+// 参照实现＝jeeflow-java @ cb541d4（applyExpireTime / applyNodeExpireTime 一把尺子，五处写点）。
+// 本栈原形状：engine.ts 各建单分支从不给 task.expireTime 赋值（只有回退那支例外都没有），
+// 于是"配了到期表达式的节点"这一列恒空 ⇒ 逾期统计在常规流上恒 0。
+// 节点没配（undefined / null / 空串）⇒ 该列保持空，不造默认值（owner 2026-09-28 口径）。
+describe('issues/126 案 A 任务行到期时间：建单五处写点按节点表达式真算（T0 四格 + §1.8 两格）', () => {
+
+  /** start → 单任务节点 task1（properties 原样落 JSON，expire 键不给＝节点没配）→ end */
+  function expireFlow(props: Record<string, any>, name = 'expire126'): string {
+    return JSON.stringify({
+      name, displayName: '到期时间测试', type: 'approval',
+      nodes: [
+        { id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } },
+        { id: 'task1', type: 'snaker:task',
+          properties: { assignee: 'userA', taskType: 0, performType: 0, ...props }, text: { value: '审批' } },
+        { id: 'end', type: 'snaker:end', properties: {}, text: { value: '结束' } },
+      ],
+      edges: [
+        { id: 'e1', sourceNodeId: 'start', targetNodeId: 'task1', properties: {} },
+        { id: 'e2', sourceNodeId: 'task1', targetNodeId: 'end', properties: {} },
+      ],
+    })
+  }
+
+  /** start → 三任务线性流（specs 各自带 assignee/expire/countersign），回退与并行格用 */
+  function expireFlowMulti(specs: Array<{ id: string; assignee: string; props?: Record<string, any> }>, name: string): string {
+    const nodes: any[] = [{ id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } }]
+    const edges: any[] = []
+    let prev = 'start'
+    for (const s of specs) {
+      nodes.push({ id: s.id, type: 'snaker:task',
+        properties: { assignee: s.assignee, taskType: 0, performType: 0, ...(s.props ?? {}) }, text: { value: s.id } })
+      edges.push({ id: `e_${prev}_${s.id}`, sourceNodeId: prev, targetNodeId: s.id, properties: {} })
+      prev = s.id
+    }
+    nodes.push({ id: 'end', type: 'snaker:end', properties: {}, text: { value: '结束' } })
+    edges.push({ id: `e_${prev}_end`, sourceNodeId: prev, targetNodeId: 'end', properties: {} })
+    return JSON.stringify({ name, displayName: '到期时间测试', type: 'approval', nodes, edges })
+  }
+
+  function seedExpireDefine(repo: MemoryRepository, content: string, name: string): ProcessDefine {
+    const def = {
+      id: '', name, displayName: '到期时间测试', type: 'test', state: 1, content, version: 1,
+      createTime: new Date(), createUser: 't', updateTime: new Date(), updateUser: 't',
+    } as ProcessDefine
+    repo.addDefine(def)
+    return def
+  }
+
+  /** 发起一条单节点流程，读回 task1 的进行中行**持久值**（行不在 ⇒ null，便于把"没读到行"与"值为空"分开断） */
+  async function rowAfterStart(props: Record<string, any>, args: Record<string, any> = {}) {
+    const repo = new MemoryRepository()
+    const engine = new EngineImpl(repo, undefined, seqIdGen('e126'))
+    const def = seedExpireDefine(repo, expireFlow(props), 'expire126')
+    const inst = await engine.startProcessInstanceById(def.id, 'userA', args)
+    const doing = (await repo.findDoingTasks(inst.id)).filter(t => t.taskName === 'task1')
+    assert.equal(doing.length, 1, `夹具自证：task1 进行中行应恰好 1 条，实得 ${doing.length}`)
+    return await repo.findTaskById(doing[0].id)
+  }
+
+  /** 同行 create→expire 差值≈2h。带宽 [2h−5s, 2h+60s]：只判"非空"就会被 now() 占位蒙过
+   *  （那正是 issues/126 病灶的形状），不许放宽成"非空" */
+  function assertExpireAbout2h(expire: unknown, create: unknown, who: string): void {
+    assert.ok(expire != null, `${who} 必须带到期时间（实得 ${String(expire)}）`)
+    assert.ok(create != null, `${who} 的 createTime 应有值（内部对照）`)
+    const delta = (new Date(expire as Date | string).getTime() - new Date(create as Date | string).getTime()) / 1000
+    assert.ok(delta >= 2 * 3600 - 5 && delta <= 2 * 3600 + 60,
+      `${who} 同行 create→expire 差值应≈2h，实得 ${delta}s（占位写法算出≈0 ⇒ 新建即逾期）`)
+  }
+
+  /** 取该实例里参与者含某用户的那条 DOING 行本身（读不到返回 null） */
+  async function memberRow(repo: MemoryRepository, instId: string, actor: string) {
+    const doing = await repo.findDoingTasks(instId)
+    const hit = doing.find(t => (t.actorIds ?? []).includes(actor))
+    return hit ? await repo.findTaskById(hit.id) : null
+  }
+
+  // ── T0 四格（照 Java ExpireTimeOnCreateTest 的形状，走本栈真实建单路径）────────
+  it('T0① 相对档 "2h"：同一行 create→expire 差值≈2h（不是 now、不是 0）', async () => {
+    const row = await rowAfterStart({ expireTime: '2h' })
+    assert.ok(row, 'T0① task1 行没读到（夹具或建单路径本身出问题）')
+    assertExpireAbout2h(row!.expireTime, row!.createTime, 'T0① 普通建单（2h）')
+  })
+
+  it('T0② 表达式是变量名：取实例变量那份值当到期时间（"yyyy-MM-dd HH:mm:ss" 串 + 毫秒整数两形态）', async () => {
+    const str = await rowAfterStart({ expireTime: 'dueAt' }, { dueAt: '2026-12-31 10:00:00' })
+    assert.ok(str, 'T0② 行没读到')
+    assert.equal(new Date(str!.expireTime as Date).getTime(), new Date(2026, 11, 31, 10, 0, 0).getTime(),
+      '变量档应取该变量的值（本地时区解析），而不是把变量名当表达式解析')
+
+    const ms = 1767147600000   // 2026-12-31 10:00:00（本地）——毫秒时间戳档
+    const num = await rowAfterStart({ expireTime: 'dueMs' }, { dueMs: ms })
+    assert.ok(num, 'T0② 毫秒档行没读到')
+    assert.equal(new Date(num!.expireTime as Date).getTime(), ms, '毫秒时间戳变量 ⇒ 该时刻')
+  })
+
+  it('T0③ 节点没配（键缺失 / null / 空串 / 纯空白）：该列保持空，绝不写 now()', async () => {
+    for (const props of [{}, { expireTime: null }, { expireTime: '' }, { expireTime: '   ' }]) {
+      const row = await rowAfterStart(props)
+      assert.ok(row, `T0③ 行本身要读到（否则"值为空"这条恒真）：${JSON.stringify(props)}`)
+      assert.ok(row!.createTime, `T0③ 对照：createTime 应有值 ${JSON.stringify(props)}`)
+      assert.equal(row!.expireTime ?? null, null,
+        `未配到期表达式的行不得被赋任何时间（实得 ${String(row!.expireTime)}）：${JSON.stringify(props)}`)
+    }
+  })
+
+  it('T0④ 解析不出 ⇒ 留空而不是 now()（含 §1.9 第 3 条"相对档前缀非整数"落穿档）', async () => {
+    for (const expr of ['not-a-time', 'xh', '12x3h', '2O26-12-31 10:00:00', '2026-13-31 10:00:00']) {
+      const row = await rowAfterStart({ expireTime: expr })
+      assert.ok(row, 'T0④ 行没读到')
+      assert.ok(row!.createTime, 'T0④ 对照：createTime 应有值')
+      assert.equal(row!.expireTime ?? null, null,
+        `"${expr}" 解析不出必须留空；退回 now() 等于静默造一个"建单即逾期"的值（本案病灶）`)
+    }
+    // 变量档内解析失败 ⇒ null（Java/C# 同形：字符串值解析不出即终止，不落穿到相对/绝对档）
+    const badVar = await rowAfterStart({ expireTime: 'dueAt' }, { dueAt: 'not-a-time' })
+    assert.ok(badVar, 'T0④ 变量档负向行没读到')
+    assert.equal(badVar!.expireTime ?? null, null, '变量值是字符串但解析不出 ⇒ null')
+    // 落穿自证：变量存在但类型不认识（布尔）⇒ 继续走相对/绝对档，最终 null，而不是提前 return
+    const boolVar = await rowAfterStart({ expireTime: 'dueAt' }, { dueAt: true })
+    assert.ok(boolVar, 'T0④ 落穿档行没读到')
+    assert.equal(boolVar!.expireTime ?? null, null, '变量值类型不认识 ⇒ 落穿 ⇒ 最终 null')
+  })
+
+  // ── §1.8 第五处写点：串行会签**推进出的下一位成员**（绕过建单 helper 直建行）────
+  it('§1.8 串行会签首成员 ∧ 推进出的第二成员都带到期（夹具 06-countersign-sequential-expire.json）', async () => {
+    const { engine, repo } = setup()
+    const def = loadFlow(repo, '06-countersign-sequential-expire.json')   // 只有 task1 配 expireTime:"2h"
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
+
+    const first = await memberRow(repo, inst.id, 'userA')
+    assert.ok(first, '串行会签首成员行没读到')
+    assert.equal(first!.taskName, 'task1', '自证：断言对象是 task1 的会签行')
+    assertExpireAbout2h(first!.expireTime, first!.createTime, '§1.8 首成员（createTask SEQUENTIAL 分支）')
+
+    await engine.executeProcessTask(first!.id, 'userA')
+    const second = await memberRow(repo, inst.id, 'userB')
+    assert.ok(second, '推进后的第二成员行没读到')
+    assert.equal(second!.taskName, 'task1', '自证：第二行仍是同一会签节点（串行推进，不是下游新节点）')
+    assert.equal(String(second!.variables['loopCounter_task1']), '1',
+      '自证：断言对象必须是串行会签第 2 步（loopCounter=1），不是第一步残留')
+    assertExpireAbout2h(second!.expireTime, second!.createTime, '§1.8 推进新建的第二成员（第五处写点）')
+  })
+
+  it('§1.8 同夹具去掉 expireTime（原 06-countersign-sequential.json）⇒ 首成员与第二成员两行都留空', async () => {
+    const { engine, repo } = setup()
+    const def = loadFlow(repo, '06-countersign-sequential.json')          // 与上格唯一差异：task1 不带 expireTime
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
+
+    const first = await memberRow(repo, inst.id, 'userA')
+    assert.ok(first, '首成员行本身要读到（否则这条负向恒真）')
+    assert.ok(first!.createTime, '对照：首成员 createTime 应有值')
+    assert.equal(first!.expireTime ?? null, null, '未配到期表达式的会签节点，首成员行不该有到期时间')
+
+    await engine.executeProcessTask(first!.id, 'userA')
+    const second = await memberRow(repo, inst.id, 'userB')
+    assert.ok(second, '推进后的第二成员行本身要读到（否则这条负向恒真）')
+    assert.ok(second!.createTime, '对照：第二成员 createTime 应有值')
+    assert.equal(second!.expireTime ?? null, null, '推进出的第二成员同样不该有到期时间')
+  })
+
+  // ── 其余两处写点（并行全员 / 回退新建）各一格：本轮改动含它们，无格即无牙 ─────────
+  it('并行会签全员：每位成员的行都带到期（写点：createTask PARALLEL 分支）', async () => {
+    const repo = new MemoryRepository()
+    const engine = new EngineImpl(repo, undefined, seqIdGen('p126'))
+    const def = seedExpireDefine(repo, expireFlow(
+      { assignee: 'pA,pB,pC', performType: '1', countersignType: 'PARALLEL', expireTime: '2h' }), 'expire126p')
+    const inst = await engine.startProcessInstanceById(def.id, 'pA')
+    const rows = (await repo.findDoingTasks(inst.id)).filter(t => t.taskName === 'task1')
+    assert.equal(rows.length, 3, `并行会签应恰好 3 条进行中行，实得 ${rows.length}`)
+    for (const r of rows) {
+      const persisted = await repo.findTaskById(r.id)
+      assert.ok(persisted, `并行成员 ${JSON.stringify(r.actorIds)} 的行没读到`)
+      assertExpireAbout2h(persisted!.expireTime, persisted!.createTime,
+        `并行全员（参与者 ${JSON.stringify(r.actorIds)}）`)
+    }
+  })
+
+  it('回退新建：表达式取**被回退掉的那个节点**、变量源取随行那份（写点：rollbackToParent）', async () => {
+    const repo = new MemoryRepository()
+    const engine = new EngineImpl(repo, undefined, seqIdGen('r126'))
+    // b1 不配到期；b2 配 dueAt（变量名档）⇒ 从 b2 回退复活的 b1 行必须按 **b2 的表达式** 算
+    const def = seedExpireDefine(repo, expireFlowMulti(
+      [{ id: 'b1', assignee: 'rbkA' }, { id: 'b2', assignee: 'rbkB', props: { expireTime: 'dueAt' } }], 'expire126r'),
+      'expire126r')
+    const inst = await engine.startProcessInstanceById(def.id, 'rbkA', { dueAt: '2026-12-31 10:00:00' })
+    const b1 = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'b1')!
+    const b1Row = await repo.findTaskById(b1.id)
+    assert.ok(b1Row, 'b1 原始行没读到')
+    assert.equal(b1Row!.expireTime ?? null, null, 'b1 节点未配到期 ⇒ 原始行留空（本格内部对照）')
+    await engine.executeProcessTask(b1.id, 'rbkA')
+
+    const b2 = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'b2')!
+    const b2Row = await repo.findTaskById(b2.id)
+    assert.ok(b2Row, 'b2 行没读到')
+    assert.equal(new Date(b2Row!.expireTime as Date).getTime(), new Date(2026, 11, 31, 10, 0, 0).getTime(),
+      'b2 行按变量档取 dueAt 的值（发起时并入实例变量）')
+
+    await engine.executeAndJumpTask(b2.id, 'rbkB', {})   // 空 target = ROLLBACK 血缘版
+    const revived = (await repo.findDoingTasks(inst.id)).filter(t => t.taskName === 'b1')
+    assert.equal(revived.length, 1, `复活出的 b1 行应恰好 1 条，实得 ${revived.length}`)
+    const row = await repo.findTaskById(revived[0].id)
+    assert.ok(row, '回退新建的行本身要读到（否则下面"值为空"恒真）')
+    assert.equal(new Date(row!.expireTime as Date).getTime(), new Date(2026, 11, 31, 10, 0, 0).getTime(),
+      '回退新建按当前节点（b2）表达式 + 随行变量重算——与 boot2 :386 / Java rejectTask 逐字一致')
+  })
+})
