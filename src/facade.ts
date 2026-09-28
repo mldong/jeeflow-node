@@ -290,6 +290,11 @@ export class JeeflowFacade {
     const isStarter = operator === String(inst.operator ?? '')
     const isActor = withdrawn.some(t => (t.actorIds ?? []).includes(operator))
     if (!isSystem && !isStarter && !isActor) throw new Error('无权限撤回该流程实例')
+    // issues/53 E25：撤回状态应为 Withdraw(30) 而非 Reject(45)（对齐 Java）
+    // issues/134 案 A：实例状态守卫在聚合根 withdraw 内（state≠10 ⇒ 抛 20010009 固定文案），
+    // 故排在任务行改写**之前**——被拒时任务行与实例一行都不动，下方两次落库也走不到。
+    inst.withdraw(now)
+    inst.updateUser = operator
     for (const t of withdrawn) {
       // issues/113：撤回写 Withdraw(30)，不用 Abandoned(99)——99 是引擎废弃码
       // （会签一票否决 / abandonAllDoing 用它），混用会让撤回单与废弃单在任务表里塌成同值
@@ -297,9 +302,6 @@ export class JeeflowFacade {
       // issues/114：进行中任务的 update_user 同样回写为撤回人（与实例口径一致）
       t.updateUser = operator
     }
-    // issues/53 E25：撤回状态应为 Withdraw(30) 而非 Reject(45)（对齐 Java）
-    inst.withdraw(now)
-    inst.updateUser = operator
     // 级联覆盖防护（issues/57 补正）：撤回副本同步回聚合——updateInstance 级联会用
     // 聚合内旧任务覆盖已撤回状态（memory 加载 tasks 时必现）；已完成(20)/已终止(40)
     // 任务行不在 withdrawn 内，天然不被改写

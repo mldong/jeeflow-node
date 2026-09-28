@@ -226,8 +226,19 @@ export class ProcessInstance {
     this.updateTime = now
   }
 
-  /** 撤回流程（issues/53 E25：withdraw 用 Withdraw(30)，与 reject 区分） */
+  /** 撤回流程（issues/53 E25：withdraw 用 Withdraw(30)，与 reject 区分）
+   *
+   *  issues/134 案 A（owner 2026-09-28 拍板 A）：撤回作用于**实例**时，实例状态不是
+   *  10(进行中) 一律拒——守卫排在改写之前，被拒时实例 state 不被改写、不落库
+   *  （改前对已办结(20)/已终止(40)的实例调撤回会静默改写成 30，已办列表与按状态
+   *  聚合的统计口径凭空改历史且用户看不到任何报错）。
+   *  内部码 20010009（八栈同码；本栈既有形状 20010007/20010008 同样是"码进注释、
+   *  msg 只出固定中文文案"，见 engine.ts rollbackToParent）。出口按 issues/121 口径：
+   *  门面吞内部码 ⇒ code=99999999 + msg 逐字 `流程实例非进行中，无法撤回`，不拼码。
+   *  任务行层面既有保护（20/40 任务行不得被撤回改写）保持原样，实例级守卫排在它之前。 */
   withdraw(now: Date): void {
+    const NOT_DOING = '流程实例非进行中，无法撤回'   // 内部码 20010009
+    if (this.state !== InstanceState.Doing) throw new Error(NOT_DOING)
     this.state = InstanceState.Withdraw
     this.updateTime = now
   }

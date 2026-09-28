@@ -4186,3 +4186,128 @@ describe('issues/126 案 A 任务行到期时间：建单五处写点按节点�
       '回退新建按当前节点（b2）表达式 + 随行变量重算——与 boot2 :386 / Java rejectTask 逐字一致')
   })
 })
+
+// ═══ issues/134 案 A · 撤回的实例状态守卫（内部码 20010009）═══════════════════════
+// 契约：jeeflow-doc `docs/spec/06-facade.md` §processInstance/withdraw ＋
+//       jeeflow-hub `issues/134-….md` §5.1（owner 2026-09-28 拍板 A，八栈同形）。
+// 判据：撤回作用于**实例**时，实例 state ≠ 10(进行中) 一律拒；被拒时 state 不被改写、不落库。
+// 出口＝issues/121 口径：门面吞内部码 ⇒ code=99999999 ＋ msg **逐字**等值
+//       「流程实例非进行中，无法撤回」，不拼码、不加前缀。
+// ⚠️ state=40 那一档本栈引擎没有常规流转路径，且集成侧 gate 造不出 40 行（issues/134 §5.2 注：
+//    L2-15 已证壳侧造不出）⇒ 40 由本栈引擎单测钉；L2-28 只钉 20 ＋ 正向 10。
+// 任务行层面的既有保护（20/40 任务行不得被撤回改写）保持原样，实例级守卫排在它之前。
+describe('issues/134 案 A 撤回实例状态守卫 20010009：非 10 一律拒且不改写、不落库', () => {
+  const NOT_DOING = '流程实例非进行中，无法撤回'   // 逐字八栈一致，L2-28 按等值断言
+
+  /** 01-simple 夹具：deploy 一次，start() 起一条由 zhangsan 发起、停在 task1(leader) 的进行中实例 */
+  async function harness134() {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const r0 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const start = async () => {
+      const r = await facade.flow('processInstance/startAndExecute',
+        { processDefineId: r0.data.processDefineId, operator: 'zhangsan' })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      return r.data.processInstanceId as string
+    }
+    return { repo, facade, start }
+  }
+
+  it('聚合根 withdraw：state≠10 逐档抛逐字文案，且 state/updateTime 一行不动（20/30/40/45/50/99）', () => {
+    for (const state of [InstanceState.Done, InstanceState.Withdraw, InstanceState.Interrupt,
+      InstanceState.Reject, InstanceState.Pending, InstanceState.Abandon]) {
+      const inst = ProcessInstance.create(`i134-agg-${state}`, 'd134', 'zhangsan', {}, new Date())
+      inst.state = state   // 夹具：非进行中态直钉（本栈引擎无 40/45/50/99 的撤回前置流转）
+      const beforeUpdate = new Date(inst.updateTime).getTime()
+      let thrown: any = null
+      try { inst.withdraw(new Date()) } catch (e) { thrown = e }
+      assert.ok(thrown, `state=${state} 的实例撤回必须被拒（未抛＝守卫没牙）`)
+      assert.equal(String(thrown.message), NOT_DOING,
+        `state=${state} 的拒绝文案要逐字等值（宽松"包含 撤回"判据不许放宽）`)
+      assert.ok(!String(thrown.message).includes('20010009'),
+        `内部码不得进 msg（issues/121 口径）：${thrown.message}`)
+      assert.equal(inst.state, state, `被抛后实例 state 不得被改写（state=${state} 实测 ${inst.state}）`)
+      assert.equal(new Date(inst.updateTime).getTime(), beforeUpdate, `被抛后 updateTime 也不该动（state=${state}）`)
+    }
+    // 正向对照：同一条聚合根路径，state=10 必须仍落 30（防守卫条件写反把正常路径也拦了）
+    const doing = ProcessInstance.create('i134-agg-10', 'd134', 'zhangsan', {}, new Date())
+    assert.equal(doing.state, InstanceState.Doing, '夹具自证：create 出来就是进行中(10)')
+    doing.withdraw(new Date())
+    assert.equal(doing.state, InstanceState.Withdraw, '正向：进行中实例撤回应落 30（WITHDRAW，不是 99）')
+  })
+
+  it('门面负向 state=20（已办结）：code=99999999 + msg 逐字等值，再读实例仍 20、任务行仍 20', async () => {
+    const { repo, facade, start } = await harness134()
+    const iid = await start()
+    const task1 = (await repo.findDoingTasks(iid)).find(t => t.taskName === 'task1')
+    assert.ok(task1, '夹具自证：发起后应有 task1 进行中行（否则下面办结那步打空）')
+    assert.equal((await facade.flow('processTask/execute',
+      { processTaskId: task1!.id, operator: 'leader', submitType: 1 })).code, 0, '前置：leader 办结 task1')
+
+    const done = await repo.findInstanceById(iid)
+    assert.equal(done?.state, InstanceState.Done, '夹具自证：办结后实例应=20（否则本档负向判据没有对象）')
+    const beforeUpdate = new Date(done!.updateTime).getTime()
+    const beforeUpdateUser = done!.updateUser
+
+    const r = await facade.flow('processInstance/withdraw', { id: iid, operator: 'zhangsan' })
+    assert.equal(r.code, 99999999, `已办结(20)实例撤回必须被拒: ${JSON.stringify(r)}`)
+    assert.equal(r.msg, NOT_DOING, `出口 msg 逐字等值，不拼码不加前缀: ${r.msg}`)
+    assert.ok(!String(r.msg).includes('20010009'), `内部码不进 msg（issues/121 口径）: ${r.msg}`)
+
+    // 病灶判据：改前这条会被静默改写成 30，用户看不到任何报错
+    const after = await repo.findInstanceById(iid)
+    assert.equal(after?.state, InstanceState.Done, '被拒后实例 state 仍是 20，不得静默改写')
+    assert.equal(new Date(after!.updateTime).getTime(), beforeUpdate, '被拒后 updateTime 未被改写（未落库）')
+    assert.equal(after!.updateUser, beforeUpdateUser, '被拒后 update_user 没被污染成撤回人')
+    // 任务行层面既有保护原样
+    assert.equal((await repo.findTaskById(task1!.id))?.taskState, TaskState.Done, '已完成(20)任务行不被撤回改写')
+  })
+
+  it('门面负向 state=40（已终止）：同样逐字拒绝，实例仍 40 且进行中任务行一条都不动', async () => {
+    const { repo, facade, start } = await harness134()
+    const iid = await start()
+    const doing = await repo.findDoingTasks(iid)
+    assert.ok(doing.length >= 1, '夹具自证：本档要有进行中任务行，才验得出"守卫排在任务改写之前"')
+    // 造 40：本栈引擎无常规"终止"流转，集成侧 gate 也造不出 40 行 ⇒ 引擎栈内直钉（issues/134 §5.2）
+    const inst40 = await repo.findInstanceById(iid)
+    inst40!.state = InstanceState.Interrupt
+    await repo.updateInstance(inst40!)
+    assert.equal((await repo.findInstanceById(iid))?.state, InstanceState.Interrupt,
+      '夹具自证：40 档已就位且落库（否则本档只是又跑了 10 的正向路径）')
+
+    const r = await facade.flow('processInstance/withdraw', { id: iid, operator: 'zhangsan' })
+    assert.equal(r.code, 99999999, `已终止(40)实例撤回必须被拒: ${JSON.stringify(r)}`)
+    assert.equal(r.msg, NOT_DOING, `出口 msg 逐字等值: ${r.msg}`)
+    assert.ok(!String(r.msg).includes('20010009'), `内部码不进 msg: ${r.msg}`)
+
+    assert.equal((await repo.findInstanceById(iid))?.state, InstanceState.Interrupt,
+      '被拒后实例 state 仍是 40（不得被静默改写成 30）')
+    for (const t of doing) {
+      assert.equal((await repo.findTaskById(t.id))?.taskState, TaskState.Doing,
+        `被拒后进行中任务行仍 10（守卫排在任务改写与 updateTask 落库之前），实测行 ${t.id}`)
+    }
+  })
+
+  it('正向对照 state=10：撤回仍 code=0 并落 30；再次撤回（state=30）被同一文案拒绝', async () => {
+    const { repo, facade, start } = await harness134()
+    const iid = await start()
+    const doing = await repo.findDoingTasks(iid)
+    assert.ok(doing.length >= 1, '夹具自证：进行中实例有 doing 行')
+
+    const ok = await facade.flow('processInstance/withdraw', { id: iid, operator: 'zhangsan' })
+    assert.equal(ok.code, 0, `进行中(10)实例的正常撤回不得被新守卫拦掉: ${JSON.stringify(ok)}`)
+    assert.equal((await repo.findInstanceById(iid))?.state, InstanceState.Withdraw, '正向：实例落 30')
+    for (const t of doing) {
+      assert.equal((await repo.findTaskById(t.id))?.taskState, TaskState.Withdraw,
+        `正向：进行中任务行落 30，实测 ${t.id}`)
+    }
+    assert.equal((await repo.findDoingTasks(iid)).length, 0, '正向：撤回作用于整单，无残留 doing')
+
+    // 已撤回(30) 本身也属"非进行中" ⇒ 二次撤回同样被拒，状态不被反复改写
+    const again = await facade.flow('processInstance/withdraw', { id: iid, operator: 'zhangsan' })
+    assert.equal(again.code, 99999999, `撤回态(30)实例二次撤回应被拒: ${JSON.stringify(again)}`)
+    assert.equal(again.msg, NOT_DOING, `二次撤回出口 msg 逐字等值: ${again.msg}`)
+    assert.equal((await repo.findInstanceById(iid))?.state, InstanceState.Withdraw, '被拒后实例仍 30')
+  })
+})
