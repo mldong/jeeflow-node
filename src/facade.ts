@@ -488,7 +488,10 @@ export class JeeflowFacade {
     try {
       flow = JSON.parse(content)
     } catch (e) {
-      throw new Error('流程定义 JSON 解析失败: ' + String(e))
+      // issues/139（回到 issues/121 口径）：出口 msg 只出 Java 参考实现的逐字固定文案
+      // （jeeflow-java ModelParser「读取流程定义 JSON 失败」，原始异常作为 cause 挂在错误对象上、
+      // 不进 msg）。此前拼 String(e) 会把 SyntaxError 文本连同内容片段透给前端与日志。
+      throw new Error('读取流程定义 JSON 失败', { cause: e })
     }
     if (!flow?.name) throw new Error('流程定义缺少 name')
     // 按 name 取最新定义：有则替换内容（version 不变），无则新建（对齐 boot3 redeploy）

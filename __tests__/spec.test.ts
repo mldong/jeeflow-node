@@ -4938,3 +4938,71 @@ describe('issues/127/132 事件腿：A 套码表 · 办理抄送 · 5/6 互斥 �
       '空监听器数组时 fire 安全返回')
   })
 })
+
+// ═══ issues/139 · designRedeploy 解析失败的出口形状 ══════════════════════════════
+// 判据源：jeeflow-hub `issues/139-….md`（owner 拍"修"）＋ `issues/121` 那轮定的口径——
+//   出口只出逐字固定文案（code=99999999 ＋ 一句中文），内部码与内部异常细节都不进 msg。
+// 逐字文案以 Java 参考实现为准：Java 的 processDesign/redeploy（JeeflowFacade.designRedeploy）
+//   把内容交给 `ModelParser.parse(bytes)`，解析腿失败时抛
+//   `RuntimeException("读取流程定义 JSON 失败", e)`（jeeflow-core ModelParser.java:47 ——
+//   原始异常只作 cause，不拼进 message），门面顶层 catch 出 msg＝该句逐字原文；
+//   C# 镜像同句（ModelParser.cs:45/54）。本栈改前拼的是 `String(e)` ⇒ msg 带 SyntaxError 文本。
+// 反闸写法照 issues/121（单断 Contains 对"带前缀/带尾巴"是恒绿的，必须逐字等值＋逐项禁泄漏）。
+describe('issues/139 designRedeploy JSON 解析失败：出口 msg 逐字等值且不含原始异常细节', () => {
+  const PARSE_FAIL = '读取流程定义 JSON 失败'   // 逐字＝Java 参考实现原文，八栈可比对
+
+  /** 夹具：设计稿有内容快照，但快照不是合法 JSON —— 正落在 designRedeploy 的解析腿上 */
+  async function harness139(content: string) {
+    const { engine, repo } = setup()
+    const extRepo = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, extRepo)
+    const r0 = await facade.flow('processDesign/save',
+      { name: 'bad139', displayName: '坏内容139', content, operator: 'zhangsan' })
+    assert.equal(r0.code, 0, `前置：save 不校验内容合法性，坏 JSON 也该入库并回 id: ${JSON.stringify(r0)}`)
+    assert.ok(r0.data.id, '前置：save 应回设计 id（否则下面 redeploy 打的是空 id）')
+    assert.equal((await extRepo.listDesignHis(r0.data.id)).length, 1,
+      '前置：内容快照已入库（redeploy 走的是"有快照但解析失败"那条腿，不是"没有内容"）')
+    return { repo, extRepo, facade, designId: r0.data.id as string }
+  }
+
+  it('门面负向（截断 JSON）：code=99999999 + msg 逐字等值，异常类名/解析器文本/堆栈一律不在出口', async () => {
+    const { facade, designId } = await harness139('{"name":"bad139","nodes":[')
+    const r = await facade.flow('processDesign/redeploy', { id: designId, operator: 'zhangsan' })
+
+    assert.equal(r.code, 99999999, `坏 JSON 重新部署必须被拒: ${JSON.stringify(r)}`)
+    assert.equal(r.msg, PARSE_FAIL,
+      `出口 msg 要逐字等值（改前拼 String(e) ⇒「流程定义 JSON 解析失败: SyntaxError: Unexpected end of JSON input」，本格即红）: ${r.msg}`)
+    // 反闸：msg 里不得出现异常类名 / 解析器细节 / 堆栈痕迹 / 文件路径 / SQL / 内容片段
+    for (const leak of ['Error', 'Syntax', 'Unexpected', 'position', 'JSON.parse', 'at ',
+      '"nodes"', '{', '[', '/', '\\', '.json', 'SELECT', 'INSERT', 'undefined']) {
+      assert.ok(!String(r.msg).includes(leak), `msg 不得含内部异常细节 ${JSON.stringify(leak)}: ${r.msg}`)
+    }
+  })
+
+  it('门面负向（非法内容带片段）：同样逐字等值，msg 不得把设计稿片段透出来', async () => {
+    // V8 对该串报 `Unexpected token 'S', ..."{"nodes":[SENTINEL_泄"... is not valid JSON`
+    // ⇒ 拼 String(e) 的改法会把设计稿内容片段一起送出出口（信息泄漏面），本格钉住它。
+    const { repo, extRepo, facade, designId } = await harness139('{"nodes":[SENTINEL_泄漏面_139]}')
+    const r = await facade.flow('processDesign/redeploy', { id: designId, operator: 'zhangsan' })
+
+    assert.equal(r.code, 99999999, `非法内容片段也必须被拒: ${JSON.stringify(r)}`)
+    assert.equal(r.msg, PARSE_FAIL, `出口 msg 逐字等值: ${r.msg}`)
+    assert.ok(!String(r.msg).includes('SENTINEL'), `msg 不得带内容片段哨兵串: ${r.msg}`)
+    assert.ok(!String(r.msg).includes('"nodes"'), `msg 不得带设计稿 JSON 片段: ${r.msg}`)
+    // 病灶不残留：解析失败排在任何写库之前 ⇒ 既没建新定义，也没把设计置成已部署
+    assert.ok(!(await repo.findDefineByName('bad139')), '解析失败不得留下流程定义行')
+    const design = await extRepo.findDesignById(designId)
+    assert.equal(design?.isDeployed, 0, `被拒后设计仍是未部署(0): ${JSON.stringify(design)}`)
+  })
+
+  it('正向对照（合法设计稿内容）：redeploy 仍 code=0 出 processDefineId 且置已部署，防"改成无条件抛"', async () => {
+    const good = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    const { repo, extRepo, facade, designId } = await harness139(good)
+    const r = await facade.flow('processDesign/redeploy', { id: designId, operator: 'zhangsan' })
+    assert.equal(r.code, 0, `正向：合法内容重新部署不得被新文案分支拦掉: ${JSON.stringify(r)}`)
+    assert.equal(r.msg, '成功')
+    assert.ok(r.data.processDefineId, '正向：出口仍出 processDefineId')
+    assert.equal((await extRepo.findDesignById(designId))?.isDeployed, 1, '正向：设计置已部署(1)')
+    assert.ok(await repo.findDefineById(String(r.data.processDefineId)), '正向：定义行确实落库')
+  })
+})
