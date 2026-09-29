@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { EngineImpl, KeyAutoGenTitle, KeyRealName, KeyUserID } from '../src/engine.js'
+import { EngineImpl, KeyAutoGenTitle, KeyCustomReturnVal, KeyRealName, KeyUserID } from '../src/engine.js'
 import { HandlerRegistry, registerBuiltinAssignments } from '../src/index.js'
 import { MemoryRepository } from '../src/memory.js'
 import { MemoryExtRepository } from '../src/memory-ext.js'
@@ -5887,6 +5887,420 @@ describe('issues/141 G10 空抄送人不建 cc 行：空串/纯空白/数组空�
     const mem = new MemoryRepository()
     await mem.createCcInstance('G10-X-9', 'zhangsan', '', '   ', null as any, undefined as any, ' 8501 ', '8501')
     assert.deepEqual(await mem.findCcActorIds('G10-X-9'), ['8501'], '混给档的期望真值')
+  })
+})
+
+// ═══ issues/142 A 批 · 记录类节点（snaker:custom）执行形状 ＋ 任务类零参与者建单 ══════════
+//
+// 验收标准逐字来自 `jeeflow-doc/docs/spec/02-flow-definition.md`：
+//   §6.1（owner 2026-09-29 拍「自定义类型这种记录类的，不会有参与人，是正常行为」）——
+//        记录类正确形状＝执行 clazz、落 taskState=20 历史行、令牌继续流转；
+//        禁止形状＝①当任务类建 DOING 行 ②兜底把行挂给当前操作人 ③直接跳过节点不建行（丢留痕）；
+//   §6.2（owner 2026-09-30 逐条拍三条硬要求）——①历史行必须**真落库**（只在聚合内存里 append 不算做到，
+//        java/c# 现读正是这个洞，本栈不照抄）；②clazz 解析不了 ⇒ 记日志＋照常落历史行＋续流，严禁抛错
+//        打断建单，且"未注册"与"clazz 空串"要分档可诊断（c# 把两者合成同一个异常，不照抄），处理器
+//        **自身**抛错不在豁免内；③记录类腿不解析参与者，反过来**任务类零参与者必须建 DOING 行**。
+//
+// 本栈改前三处病灶（逐处还原实测见本轮报告）：
+//   ① engine.executeNode 把 TypeCustom 与 TypeTask 同路走 createTask ⇒ 落 DOING 待办行（§6.1 禁止形状①）；
+//   ② engine.createTask 开头 `if (!actors.length) return` ⇒ 任务类零参与者一行不建（§6.1 死锁黑洞）；
+//   ③ src 内 clazz 零命中 ⇒ 记录类节点既不执行处理器、也不落历史行、更没有 INSERT 腿。
+describe('issues/142 记录类节点 custom 落 DONE 历史行并真落库 ＋ 任务类零参与者必须建 DOING 单（spec 02 §6.1/§6.2）', () => {
+
+  /** 与共享夹具 flows/08-custom-node.json 逐字同串的 clazz（本栈按名注册，不是反射类路径） */
+  const CLAZZ = 'com.mldong.jeeflow.test.TestCustomHandler'
+
+  /** start → apply(任务类，assignee=applicant) → custom1(记录类，properties 可给) → end */
+  function customFlowContent(customProps: Record<string, any>, taskProps: Record<string, any> = {}): string {
+    return JSON.stringify({
+      name: 'custom142', displayName: '记录类节点测试', type: 'approval',
+      nodes: [
+        { id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } },
+        { id: 'apply', type: 'snaker:task',
+          properties: { assignee: 'applicant', taskType: 0, performType: 0, ...taskProps }, text: { value: '发起申请' } },
+        { id: 'custom1', type: 'snaker:custom', properties: { ...customProps }, text: { value: '通知外部系统' } },
+        { id: 'end', type: 'snaker:end', properties: {}, text: { value: '结束' } },
+      ],
+      edges: [
+        { id: 'e0', sourceNodeId: 'start', targetNodeId: 'apply', properties: {} },
+        { id: 'e1', sourceNodeId: 'apply', targetNodeId: 'custom1', properties: {} },
+        { id: 'e2', sourceNodeId: 'custom1', targetNodeId: 'end', properties: {} },
+      ],
+    })
+  }
+
+  /** start → task1(任务类，properties 可给) → end；不给 assignee ⇒ 参与者天然解析为空 */
+  function singleTaskFlowContent(taskProps: Record<string, any> = {}): string {
+    return JSON.stringify({
+      name: 'zero142', displayName: '零参与者建单测试', type: 'approval',
+      nodes: [
+        { id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } },
+        { id: 'task1', type: 'snaker:task', properties: { taskType: 0, performType: 0, ...taskProps }, text: { value: '审批' } },
+        { id: 'end', type: 'snaker:end', properties: {}, text: { value: '结束' } },
+      ],
+      edges: [
+        { id: 'e0', sourceNodeId: 'start', targetNodeId: 'task1', properties: {} },
+        { id: 'e1', sourceNodeId: 'task1', targetNodeId: 'end', properties: {} },
+      ],
+    })
+  }
+
+  /** SQL 仓那半的 T0 假适配器：内存养 wf_process_task ＋ wf_process_task_actor 两张表、逐条记语句。
+   *  不连任何数据库、不开端口——"历史行真落库"钉的是 INSERT 流水，不是返回值（§6.2 第 1 条）。 */
+  function taskTableRepo() {
+    const taskRows: Array<Record<string, any>> = []
+    const actorRows: Array<Record<string, any>> = []
+    const stmts: Array<{ sql: string; args: any[] }> = []
+    const conn: any = {
+      async execute(sql: string, args: any[]) {
+        stmts.push({ sql, args })
+        if (/^INSERT INTO wf_process_task \(/.test(sql)) {
+          // 列序见 src/jdbc/shared.ts saveTask：0 id ·1 piid ·2 task_name ·3 display_name ·4 task_type
+          // ·5 perform_type ·6 task_state ·7 operator ·8 finish_time ·9 expire_time ·10 form_key ·11 task_parent_id ·12 variable
+          taskRows.push({ id: args[0], process_instance_id: args[1], task_name: args[2], task_type: args[4],
+            perform_type: args[5], task_state: args[6], operator: args[7], finish_time: args[8],
+            form_key: args[10], task_parent_id: args[11], variable: args[12] })
+          return
+        }
+        if (/^DELETE FROM wf_process_task_actor/.test(sql)) {
+          for (let i = actorRows.length - 1; i >= 0; i--) if (String(actorRows[i].process_task_id) === String(args[0])) actorRows.splice(i, 1)
+          return
+        }
+        if (/^INSERT INTO wf_process_task_actor/.test(sql)) {
+          actorRows.push({ id: args[0], process_task_id: args[1], actor_id: args[2] })
+          return
+        }
+        throw new Error(`假适配器收到未预期语句: ${sql}`)
+      },
+      async fetchAll() { return [] },
+      async fetchOne() { return null },
+      async begin() {}, async commit() {}, async rollback() {},
+    }
+    const adapter: any = { placeholder: '?', async acquire() { return conn }, async release() {} }
+    return { repo: new JdbcRepository(adapter), taskRows, actorRows, stmts }
+  }
+
+  /** 写侧同时打到两仓的仓储：读写走内存仓，saveTask 额外原样喂给 SQL 仓的假适配器。
+   *  这样"两仓同答案"钉的是**同一次执行**产出的同一行，而不是两个仓各喂一份手搓数据。 */
+  function bothRepos(mem: MemoryRepository, sql: JdbcRepository): any {
+    return new Proxy(mem, {
+      get(_t, prop: any) {
+        const v: any = (mem as any)[prop]
+        if (typeof v !== 'function') return v
+        return async (...args: any[]) => {
+          const out = await v.apply(mem, args)
+          if (prop === 'saveTask') await sql.saveTask(args[0])
+          return out
+        }
+      },
+    })
+  }
+
+  function seedDefine(repo: MemoryRepository, name: string, content: string): ProcessDefine {
+    const def = {
+      id: '', name, displayName: '142 测试', type: 'test', state: 1, content, version: 1,
+      createTime: new Date(), createUser: 't', updateTime: new Date(), updateUser: 't',
+    } as ProcessDefine
+    repo.addDefine(def)
+    return def
+  }
+
+  /** 引擎 harness：内存仓 ＋ 按名注册的 custom 处理器 ＋ 事件流水；sqlPair 给时写侧同打 SQL 仓。 */
+  function customHarness(content: string, customs: Record<string, any> = {}, sqlPair = false) {
+    const mem = new MemoryRepository()
+    const sql = taskTableRepo()
+    const engine = new EngineImpl(sqlPair ? bothRepos(mem, sql.repo) : mem, undefined, seqIdGen('c142'))
+    const registry = new HandlerRegistry()
+    for (const [name, h] of Object.entries(customs)) registry.registerCustom(name, h)
+    engine.setRegistry(registry)
+    const fired: ProcessEvent[] = []
+    engine.setExtensions({ listeners: [e => { fired.push({ ...e }) }] })
+    const def = seedDefine(mem, String(JSON.parse(content).name), content)
+    return { mem, sql, engine, registry, fired, def }
+  }
+
+  /** 走完整条记录类腿：发起（建 apply 待办）→ 把待办公办掉（触发 custom1 → end）。 */
+  async function runThroughCustom(h: ReturnType<typeof customHarness>, operator = 'alice') {
+    const started = await h.engine.startProcessInstanceById(h.def.id, operator)
+    const todosBefore = await h.mem.findDoingTasks(started.id)
+    for (const t of todosBefore) await h.engine.executeProcessTask(t.id, operator)
+    return { started, todosBefore }
+  }
+
+  /** console.warn 捕获——两档日志要能**分别**断言（§6.2 第 2 条"未注册"与"空串"分档） */
+  async function captureWarnings(fn: () => Promise<unknown>): Promise<string[]> {
+    const lines: string[] = []
+    const orig = console.warn
+    console.warn = (...args: any[]) => { lines.push(args.map(String).join(' ')) }
+    try { await fn() } finally { console.warn = orig }
+    return lines
+  }
+
+  /** 从内存仓读回该实例上某节点那条 DONE 行（读不到 ⇒ null，把"没这行"与"行不对"分开断） */
+  async function doneRow(mem: MemoryRepository, instId: string, taskName: string) {
+    const hit = (await mem.findDoneTasks(instId)).find(t => t.taskName === taskName)
+    return hit ? await mem.findTaskById(hit.id) : null
+  }
+
+  // ── A 组：记录类（custom）腿的形状 ────────────────────────────────────────────
+
+  it('①共享夹具 08-custom-node.json · custom 落一条 taskState=20 历史行，同一次执行两仓都读得到（§6.2 第 1 条的 INSERT 腿）', async () => {
+    const h = customHarness(readFileSync(flowDir + '08-custom-node.json', 'utf-8'),
+      { [CLAZZ]: { handle: () => 'NOTIFIED-42' } }, true)
+    const { started, todosBefore } = await runThroughCustom(h)
+    const iid = started.id
+
+    const done = await doneRow(h.mem, iid, 'custom1')
+    assert.ok(done, '内存仓必须查得到那条历史行（只 append 进聚合数组＝java/c# 现读的洞，§6.2 明写不算做到）')
+    assert.equal(done!.taskState, TaskState.Done, '历史行 taskState 必须是 20(DONE)，不是 10(DOING 待办)')
+    assert.equal(done!.displayName, '通知外部系统', '历史行带节点显示名（留痕要可读）')
+    assert.deepEqual(done!.actorIds, ['alice'], '历史行参与者＝当前操作人（java createHistoryTask 的 singletonList(operator) 同形，是留痕主体不是待办）')
+    assert.ok(done!.finishTime instanceof Date, 'DONE 行带 finishTime（java/python 同形）')
+    assert.equal(done!.formKey, '', '记录类行无 formKey')
+    assert.equal(done!.performType, 0, '记录类行无会签字段')
+    const applyRow = (await h.mem.findHistoryTasks(iid)).find(t => t.taskName === 'apply')!
+    assert.equal(String(done!.parentTaskId), String(applyRow.id), '建单不变量：taskParentId＝刚办结的那条行（issues/121 P1）')
+    assert.equal(done!.variables.isFirstTaskNode, false, '行级 isFirstTaskNode 照建单不变量写（custom1 不是 start 直接后继）')
+
+    // SQL 仓那半：同一次执行的 INSERT 流水里真有这一行 ＋ 对应的一行参与者
+    const sqlRow = h.sql.taskRows.find(r => r.task_name === 'custom1')
+    assert.ok(sqlRow, 'SQL 仓必须收到那条 wf_process_task 的 INSERT（"落库"看语句流水，不看返回值）')
+    assert.equal(Number(sqlRow!.task_state), 20, 'SQL 行 task_state=20')
+    assert.deepEqual(h.sql.actorRows.filter(a => String(a.process_task_id) === String(sqlRow!.id)).map(a => a.actor_id), ['alice'],
+      'SQL 行在 wf_process_task_actor 也有对应一行')
+    assert.ok(String(sqlRow!.variable).includes('isFirstTaskNode'), 'SQL 行的 variable 落了 isFirstTaskNode 标记')
+
+    // 待办数不增加（§6.1 硬结论 2：记录类不进"按待办数"的对账分母）
+    assert.ok(todosBefore.length === 1, `夹具自证：办理前应只有 apply 一条待办，实得 ${todosBefore.length}`)
+    assert.equal((await h.mem.findDoingTasks(iid)).length, 0, 'custom 不产生待办 ⇒ 公办后待办清零')
+  })
+
+  it('②不为 custom 那一条行 fire 码 3（TASK_START 表达"新待办产生"）；正向对照＝apply 那条 DOING 行照旧有码 3', async () => {
+    const h = customHarness(customFlowContent({ clazz: CLAZZ, val: 'customResult' }), { [CLAZZ]: { handle: () => 'ok' } })
+    const { started } = await runThroughCustom(h)
+
+    const taskStarts = h.fired.filter(e => e.type === EventType.ProcessTaskStart)
+    assert.ok(taskStarts.length >= 1, '正向对照：任务类建单照旧 fire 码 3（不能把整条腿的 fire 一起关掉）')
+    assert.equal(taskStarts.filter(e => e.nodeId === 'custom1').length, 0,
+      '记录类那一行不得出现在码 3 里（§11.3 码 3＝新待办产生，本腿建出来即已完成态）')
+    assert.deepEqual(taskStarts.filter(e => e.nodeId === 'apply').map(e => e.actors), [['alice']],
+      '任务类行的码 3 载荷仍带参与者')
+    assert.ok(h.fired.some(e => e.type === EventType.ProcessInstanceEnd), '令牌继续流转：实例走到终点并 fire 码 2')
+    assert.equal((await h.mem.findInstanceById(started.id))!.state, InstanceState.Done, '实例办结')
+  })
+
+  it('③记录类腿不解析参与者：定义里给 custom 配 assignee 也不建 DOING 行、不往行上挂人（§6.2 第 3 条前半）', async () => {
+    const h = customHarness(customFlowContent({ clazz: CLAZZ, assignee: 'bob', assignmentHandler: 'whatever' }),
+      { [CLAZZ]: { handle: () => 'ok' } })
+    const { started } = await runThroughCustom(h)
+
+    assert.equal((await h.mem.findDoingTasks(started.id)).length, 0, 'custom 不建 DOING 行（§6.1 禁止形状①）')
+    const done = await doneRow(h.mem, started.id, 'custom1')
+    assert.ok(done, '历史行照样要落（§6.1 禁止形状③：跳过节点丢留痕）')
+    assert.deepEqual(done!.actorIds, ['alice'], '参与者是当前操作人，不是节点上配的 assignee（本腿不走 resolveActors）')
+    assert.ok(!done!.actorIds.includes('bob'), '严禁把 assignee 解析成人挂到记录类行上')
+  })
+
+  // ── A 组：clazz 三档（未注册 / 空档 / 处理器自身抛错）──────────────────────────
+
+  it('④clazz 未注册 ⇒ 不抛错＋照常落历史行＋令牌续流；日志档 1「未注册」带 clazz 原串（§6.2 第 2 条）', async () => {
+    const h = customHarness(customFlowContent({ clazz: 'com.example.NotRegistered', methodName: 'execute' }))
+    let started!: ProcessInstance
+    const lines = await captureWarnings(async () => { started = (await runThroughCustom(h)).started })
+
+    assert.equal((await h.mem.findInstanceById(started.id))!.state, InstanceState.Done,
+      '未注册 clazz 不得打断建单——实例要走到终点（改前 java 那侧是抛 RuntimeException 的形状）')
+    const done = await doneRow(h.mem, started.id, 'custom1')
+    assert.ok(done, '未注册 clazz 也要落那条 DONE 历史行（记日志 ≠ 跳过节点）')
+    assert.deepEqual(done!.actorIds, ['alice'], '历史行参与者仍是当前操作人')
+    assert.equal(lines.filter(l => l.includes('未注册处理器')).length, 1, `档 1 日志应恰好一条，实得 ${JSON.stringify(lines)}`)
+    assert.ok(lines[0].includes('clazz=com.example.NotRegistered'), `档 1 日志要带 clazz 原串才诊断得动：${lines[0]}`)
+    assert.ok(lines[0].includes('methodName=execute'), `档 1 日志带 methodName（配了类名却查无实现，方法名是第二条线索）：${lines[0]}`)
+    assert.ok(!lines.some(l => l.includes('未配置 clazz')), '档 1 不得串到档 2 的文案上')
+
+    // 档 1 的第二小口：引擎压根没挂 HandlerRegistry ⇒ 同样不许炸，文案要指出 setRegistry
+    const bareMem = new MemoryRepository()
+    const bare = new EngineImpl(bareMem, undefined, seqIdGen('bare142'))
+    const bareDef = seedDefine(bareMem, 'custom142', customFlowContent({ clazz: 'com.example.NotRegistered' }))
+    let bareStarted!: ProcessInstance
+    const bareLines = await captureWarnings(async () => {
+      bareStarted = await bare.startProcessInstanceById(bareDef.id, 'alice')
+      for (const t of await bareMem.findDoingTasks(bareStarted.id)) await bare.executeProcessTask(t.id, 'alice')
+    })
+    assert.equal((await bareMem.findInstanceById(bareStarted.id))!.state, InstanceState.Done,
+      '没挂注册表也不得打断建单——记录类腿仍要落行并续流')
+    assert.equal(bareLines.filter(l => l.includes('未注册处理器')).length, 1, `档 1 日志仍出一条，实得 ${JSON.stringify(bareLines)}`)
+    assert.ok(bareLines[0].includes('setRegistry'), `未挂注册表时文案要指出 setRegistry 这一步：${bareLines[0]}`)
+  })
+
+  it('⑤clazz 空串／纯空白／整条缺失 ⇒ 不抛错＋照常落历史行＋续流；日志档 2 与档 1 分别可诊断', async () => {
+    const vectors: Array<[string, Record<string, any>]> = [
+      ['空串', { clazz: '', val: 'customResult' }],
+      ['纯空白', { clazz: '   ' }],
+      ['整条缺失', { methodName: 'execute' }],
+    ]
+    for (const [label, props] of vectors) {
+      const h = customHarness(customFlowContent(props))
+      let started!: ProcessInstance
+      const lines = await captureWarnings(async () => { started = (await runThroughCustom(h)).started })
+
+      assert.equal((await h.mem.findInstanceById(started.id))!.state, InstanceState.Done, `「${label}」档不得打断建单`)
+      const done = await doneRow(h.mem, started.id, 'custom1')
+      assert.ok(done, `「${label}」档仍要落历史行`)
+      assert.equal(lines.filter(l => l.includes('未配置 clazz')).length, 1, `「${label}」档应出档 2 日志一条，实得 ${JSON.stringify(lines)}`)
+      assert.ok(!lines.some(l => l.includes('未注册处理器')), `「${label}」档不得串到档 1 文案上（c# 把两者合成同一个异常，覆盖面比 java 宽，不照抄）`)
+    }
+  })
+
+  it('⑥处理器自身抛错 ⇒ 照旧外抛（不在"误配不该炸流程"的豁免内），不被静默吞掉也不假装办结', async () => {
+    const h = customHarness(customFlowContent({ clazz: CLAZZ }), {
+      [CLAZZ]: { handle: () => { throw new Error('业务处理器炸了') } },
+    })
+    const started = await h.engine.startProcessInstanceById(h.def.id, 'alice')
+    const todo = (await h.mem.findDoingTasks(started.id))[0]
+    await assert.rejects(() => h.engine.executeProcessTask(todo.id, 'alice'), /业务处理器炸了/,
+      '处理器自身执行失败是业务错误，必须外抛（§6.2 第 2 条末段）')
+    assert.equal(await doneRow(h.mem, started.id, 'custom1'), null, '外抛时不落历史行——"吞掉错误还建行"才是本条要禁的形状')
+    assert.equal((await h.mem.findInstanceById(started.id))!.state, InstanceState.Doing, '炸了不会假装办结')
+  })
+
+  it('⑦clazz 返回值：给了 properties.val 落自定义键，没给落缺省键 custom_return_val（对齐 java CustomParser/CustomModel）', async () => {
+    const withVal = customHarness(customFlowContent({ clazz: CLAZZ, val: 'customResult' }), { [CLAZZ]: { handle: () => 'NOTIFIED-1' } })
+    const a = await runThroughCustom(withVal)
+    const va = (await withVal.mem.findInstanceById(a.started.id))!.variables
+    assert.equal(va.customResult, 'NOTIFIED-1', 'properties.val 命中时写进该键')
+    assert.ok(!('custom_return_val' in va), 'val 命中时不再另写缺省键')
+
+    const noVal = customHarness(customFlowContent({ clazz: CLAZZ }), { [CLAZZ]: { handle: async () => ({ id: 7 }) } })
+    const b = await runThroughCustom(noVal)
+    const vb = (await noVal.mem.findInstanceById(b.started.id))!.variables
+    assert.deepEqual(vb.custom_return_val, { id: 7 }, 'val 缺失 ⇒ 缺省键 custom_return_val（java FlowConst.CUSTOM_RETURN_VAL 同串）')
+    assert.equal(KeyCustomReturnVal, 'custom_return_val', '本栈常量与 java 逐字同串')
+
+    const voidRet = customHarness(customFlowContent({ clazz: CLAZZ }), { [CLAZZ]: { handle: () => undefined } })
+    const c = await runThroughCustom(voidRet)
+    const vc = (await voidRet.mem.findInstanceById(c.started.id))!.variables
+    assert.ok(!('custom_return_val' in vc),
+      '处理器无返回值 ⇒ 不写键（java 那侧 put 的是 JVM null；本栈 undefined 过 JSON 序列化会整键消失，见 extensions.ts issues/122 注释，故显式不写而不是写出空值）')
+  })
+
+  // ── B 组：任务类零参与者必须建单 ──────────────────────────────────────────────
+
+  it('⑧任务类零参与者必须建一行 DOING：行存在、state=10、参与者空数组、发起人不在参与者里（§6.1 表第一行／§6.2 第 3 条）', async () => {
+    const h = customHarness(singleTaskFlowContent())
+    const inst = await h.engine.startProcessInstanceById(h.def.id, 'carol')
+    const doing = await h.mem.findDoingTasks(inst.id)
+
+    assert.equal(doing.length, 1, `零参与者也要建单，实得 ${doing.length} 行（改前 0 行＝§6.1 点名的死锁黑洞）`)
+    assert.equal(doing[0].taskState, TaskState.Doing, '建的是 DOING(10) 行')
+    assert.deepEqual(doing[0].actorIds, [], '参与者为空数组——"建行且不挂人"与"不建单"是两件事')
+    assert.ok(!doing[0].actorIds.includes('carol'), '严禁兜底把行挂给当前操作人/发起人（§6.1 硬结论 1，python 任务类腿那一支也不照抄）')
+    assert.equal((await h.mem.findInstanceById(inst.id))!.state, InstanceState.Doing, '实例进行中且确有可推进行')
+    const starts = h.fired.filter(e => e.type === EventType.ProcessTaskStart)
+    assert.equal(starts.length, 1, '这一行是待办行 ⇒ 照旧 fire 码 3 一次')
+    assert.deepEqual(starts[0].actors, [], '码 3 载荷的参与者是空数组（不省键、不假装有值）')
+  })
+
+  it('⑨零参与者 ＋ 会签配置 ⇒ 仍只建一行（不 0 行、不 N 行），且不写 nrOfInstances=0 的会签簿记（重入口就此封死）', async () => {
+    for (const ct of ['PARALLEL', 'SEQUENTIAL']) {
+      const h = customHarness(singleTaskFlowContent({ performType: 'ALL', countersignType: ct }))
+      const inst = await h.engine.startProcessInstanceById(h.def.id, 'dave')
+      const doing = await h.mem.findDoingTasks(inst.id)
+
+      assert.equal(doing.length, 1, `${ct} 零参与者应恰好建一行，实得 ${doing.length}`)
+      assert.deepEqual(doing[0].actorIds, [], `${ct} 那行的参与者是空数组`)
+      const keys = Object.keys(doing[0].variables)
+      assert.ok(!keys.some(k => k.startsWith('nrOfInstances_')), `${ct} 零参与者行不得带 nrOfInstances=0 的会签簿记（0 计数正是反复重入的入口）`)
+      assert.ok(!keys.some(k => k.startsWith('operatorList_')), `${ct} 零参与者行不得写空的 operatorList 簿记`)
+      assert.equal(doing[0].variables.isFirstTaskNode, true, `${ct}：start 直接后继 ⇒ 行级首节点标记照建单不变量`)
+    }
+  })
+
+  it('⑩零参与者行由 flow.auto 办得动并推进到终点；整条链不产生第二行（自动推进不重入）', async () => {
+    const h = customHarness(singleTaskFlowContent())
+    const inst = await h.engine.startProcessInstanceById(h.def.id, 'erin')
+    const row = (await h.mem.findDoingTasks(inst.id))[0]
+    await h.engine.executeProcessTask(row.id, 'flow.auto')
+
+    assert.equal((await h.mem.findInstanceById(inst.id))!.state, InstanceState.Done, 'flow.auto 放行（isAllowed 判据不动）⇒ 实例走到终点')
+    assert.equal((await h.mem.findDoingTasks(inst.id)).length, 0, '办结后不留待办')
+    const all = await h.mem.findHistoryTasks(inst.id)
+    assert.equal(all.length, 1, `整条链只有一行任务，实得 ${all.length} 行（反复重入会多建）`)
+  })
+
+  it('⑪正向对照 · 任务类有参与者时形状不变：单人一行一人、多人一行承载全部（尾部"按有效列表写回"没改坏既有形状）', async () => {
+    const one = customHarness(singleTaskFlowContent({ assignee: 'frank' }))
+    const i1 = await one.engine.startProcessInstanceById(one.def.id, 'frank')
+    const d1 = await one.mem.findDoingTasks(i1.id)
+    assert.equal(d1.length, 1, '单参与者仍是一行')
+    assert.deepEqual(d1[0].actorIds, ['frank'], '单参与者行的参与者就是那一个人')
+
+    const many = customHarness(singleTaskFlowContent({ assignee: 'frank,grace' }))
+    const i2 = await many.engine.startProcessInstanceById(many.def.id, 'frank')
+    const d2 = await many.mem.findDoingTasks(i2.id)
+    assert.equal(d2.length, 1, '普通任务一行承载全部参与者（对齐 boot3 createTask＋addTaskActor，任一可办）')
+    assert.deepEqual(d2[0].actorIds, ['frank', 'grace'], '多参与者按有效列表落库')
+  })
+
+  // ── C 组：clazz 注册表挂在既有 HandlerRegistry 上（不另立并行注册中心）───────────
+
+  it('⑫clazz 注册表挂在既有 HandlerRegistry 上：registerCustom/resolveCustom/listHandlers/listHandlerNames 四件套', async () => {
+    const r = new HandlerRegistry()
+    assert.equal(r.resolveCustom(''), undefined, '空名 ⇒ undefined（引擎侧走"未配置 clazz"那一档，不抛错）')
+    assert.equal(r.resolveCustom(CLAZZ), undefined, '未注册 ⇒ undefined（不是异常，这是 §6.2 第 2 条的前提）')
+
+    const handler = { handle: () => 1 }
+    r.registerCustom(CLAZZ, handler, { displayName: '外部系统通知', order: 3 })
+    assert.equal(r.resolveCustom(CLAZZ), handler, '按 clazz 原样串解析到同一个实例')
+    assert.equal(r.resolveCustom('com.example.Missing'), undefined, '别的名字仍未命中')
+    assert.deepEqual(r.listHandlers('CustomHandler').map(m => m.name), [CLAZZ], 'CustomHandler 类型清单出得来（SPI 字典同一把尺子）')
+    assert.equal(r.listHandlers('CustomHandler')[0].displayName, '外部系统通知', '元数据同族复用（displayName/order 走既有 HandlerMeta）')
+    assert.deepEqual(r.listHandlerNames(), [CLAZZ], '名称清单含 custom —— 与 assignment/decision 同一家，没有第二个注册中心')
+    assert.equal(r.listHandlers('AssignmentHandler').length, 7, '内置 7 个 assignment 元数据不受影响（既有清单没被动）')
+    assert.deepEqual(r.listHandlers('DecisionHandler'), [], 'decision 清单未被 custom 串台')
+  })
+
+  it('⑬clazz 按 trim 后的原样串命中注册表（与 java `Class.forName(clazz.trim())` 同形）；未命中则不写返回值键', async () => {
+    // 定义里 clazz 两端多写空白 ⇒ 仍命中同一个注册名，处理器照跑、返回值照写
+    const padded = customHarness(customFlowContent({ clazz: `  ${CLAZZ}  ` }), { [CLAZZ]: { handle: () => 'HIT' } })
+    const r = await runThroughCustom(padded)
+    assert.equal(await (await doneRow(padded.mem, r.started.id, 'custom1'))?.taskState, TaskState.Done,
+      '带空白的 clazz 也要落 DONE 历史行')
+    const vars = (await padded.mem.findInstanceById(r.started.id))!.variables
+    assert.equal(vars.custom_return_val, 'HIT', 'trim 后命中注册名 ⇒ 处理器返回值写进缺省键（不因为多了两个空格就退化成"未注册"档）')
+
+    // 另一个未注册名 ⇒ 档 1：不炸、落行、处理器没跑所以也没有返回值键
+    const missed = customHarness(customFlowContent({ clazz: 'com.example.NOT_FOUND' }), { [CLAZZ]: { handle: () => 'HIT' } })
+    const r2 = await runThroughCustom(missed)
+    const v2 = (await missed.mem.findInstanceById(r2.started.id))!.variables
+    assert.ok(!('custom_return_val' in v2), '未注册 ⇒ 处理器没跑、不写返回值键（照常落行续流，见④）')
+    assert.ok(await doneRow(missed.mem, r2.started.id, 'custom1'), '未注册档仍要落历史行')
+  })
+
+  it('⑭custom 作为 start 直接后继（发起腿当场执行）：行级 isFirstTaskNode=true、发起后即办结', async () => {
+    const content = JSON.stringify({
+      name: 'customfirst142', displayName: '记录类首节点测试', type: 'approval',
+      nodes: [
+        { id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } },
+        { id: 'custom1', type: 'snaker:custom', properties: { clazz: CLAZZ }, text: { value: '写台账' } },
+        { id: 'end', type: 'snaker:end', properties: {}, text: { value: '结束' } },
+      ],
+      edges: [
+        { id: 'e0', sourceNodeId: 'start', targetNodeId: 'custom1', properties: {} },
+        { id: 'e1', sourceNodeId: 'custom1', targetNodeId: 'end', properties: {} },
+      ],
+    })
+    const h = customHarness(content, { [CLAZZ]: { handle: () => 'LEDGER-1' } })
+    const inst = await h.engine.startProcessInstanceById(h.def.id, 'gina')
+
+    assert.equal((await h.mem.findInstanceById(inst.id))!.state, InstanceState.Done,
+      '发起腿就要把记录类节点跑完并走到终点（§6.2 第 2 条"记日志但停在原地"算违反本条的那一档不许出现）')
+    assert.equal((await h.mem.findDoingTasks(inst.id)).length, 0, '全程不产生待办')
+    const done = await doneRow(h.mem, inst.id, 'custom1')
+    assert.ok(done, '发起腿同样要落那条历史行')
+    assert.equal(done!.variables.isFirstTaskNode, true, 'start 直接后继 ⇒ 行级首节点标记为 true（建单不变量与 java 同规格）')
+    assert.equal(String(done!.parentTaskId), '0', '发起 execution 无当前任务 ⇒ parentTaskId 落字符 0（issues/121 P1）')
+    assert.equal((await h.mem.findInstanceById(inst.id))!.variables.custom_return_val, 'LEDGER-1', '返回值随续流写进实例变量')
   })
 })
 

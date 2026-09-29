@@ -11,8 +11,25 @@ export interface IDecisionHandler {
   decide(node: FlowNode, inst: ProcessInstance, vars: Record<string, any>): string | Promise<string>
 }
 
+/**
+ * 记录类节点（`snaker:custom`）处理器接口 —— issues/142 A 批 · spec 02-flow-definition.md §6.2 第 2 条。
+ *
+ * 注册键＝流程定义里 `properties.clazz` 的**原样字符串**（如夹具
+ * `flows/08-custom-node.json` 的 `com.mldong.jeeflow.test.TestCustomHandler`）。
+ * java 那边是 `Class.forName(clazz).newInstance()` 的反射按名实例化；TS 没有可依托的反射语义，
+ * 共享夹具里的 JVM 类名在 node 永远实例化不到，故与 **c#(`Context.CustomHandlers`) /
+ * python(`HandlerRegistry.register_custom`) 同策**：集成方按名注册实例，引擎按名解析后调用。
+ *
+ * 返回值非 `undefined` 时由引擎写进执行变量，键＝节点 `properties.val`（缺省 `custom_return_val`），
+ * 对齐 java `CustomParser.java:20-22` ＋ `CustomModel.java:46-48`。
+ * 可同步可异步（与 `IAssignmentHandler.assign` 一样两侧都吃）。
+ */
+export interface ICustomHandler {
+  handle(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>): any | Promise<any>
+}
+
 /** 处理器类型名（对齐 Java/go/python HandlerMeta.type，四语言通用） */
-export type HandlerType = 'AssignmentHandler' | 'CandidateHandler' | 'FlowInterceptor' | 'DecisionHandler'
+export type HandlerType = 'AssignmentHandler' | 'CandidateHandler' | 'FlowInterceptor' | 'DecisionHandler' | 'CustomHandler'
 
 /** 处理器元数据（v1.4.0，SPI 实现清单字典源） */
 export interface HandlerMeta {
@@ -43,6 +60,7 @@ export const BUILTIN_ASSIGNMENT_METAS: HandlerMeta[] = [
 export class HandlerRegistry {
   private assignments = new Map<string, IAssignmentHandler>()
   private decisions   = new Map<string, IDecisionHandler>()
+  private customs     = new Map<string, ICustomHandler>()
   private metas       = new Map<string, HandlerMeta>()
 
   /** 构造即内置 7 个通用 AssignmentHandler 元数据（v1.6.0 issues/16，注册名与 Java 类全限定名一致） */
@@ -62,6 +80,15 @@ export class HandlerRegistry {
     if (meta) this.metas.set(name, { type: 'DecisionHandler', name, ...meta })
   }
 
+  /**
+   * 注册记录类节点处理器（issues/142 A 批 · spec 02 §6.2 第 2 条）。
+   * `name` 必须是流程定义 `properties.clazz` 的**原样字符串**（引擎按名解析，不做反射、不做包名裁剪）。
+   */
+  registerCustom(name: string, handler: ICustomHandler, meta?: Omit<HandlerMeta, 'name' | 'type'>) {
+    this.customs.set(name, handler)
+    if (meta) this.metas.set(name, { type: 'CustomHandler', name, ...meta })
+  }
+
   /** 注册处理器元数据（不绑定运行时实现，对齐 Java HandlerRegistry.register；
    *  拦截器/候选类清单等无运行时注册表的类型用） */
   registerMeta(type: HandlerType, meta: Omit<HandlerMeta, 'type'>) {
@@ -76,6 +103,13 @@ export class HandlerRegistry {
     return this.decisions.get(name)
   }
 
+  /**
+   * 按 `clazz` 原样串解析记录类节点处理器；空名/未注册 ⇒ `undefined`
+   * （引擎侧分档记日志后照常落历史行并续流，**不抛错** —— spec 02 §6.2 第 2 条）。 */
+  resolveCustom(name: string): ICustomHandler | undefined {
+    return name ? this.customs.get(name) : undefined
+  }
+
   // ── SPI 实现清单（v1.4.0）──
 
   /** 按处理器类型列出可用实现的元数据（按 order 升序；
@@ -86,6 +120,8 @@ export class HandlerRegistry {
       for (const n of this.assignments.keys()) names.add(n)
     } else if (typeName === 'DecisionHandler') {
       for (const n of this.decisions.keys()) names.add(n)
+    } else if (typeName === 'CustomHandler') {
+      for (const n of this.customs.keys()) names.add(n)
     }
     for (const [n, m] of this.metas) {
       // 老数据无 type 时按 AssignmentHandler 归类（与历史 listHandlers 行为一致）
@@ -103,6 +139,6 @@ export class HandlerRegistry {
 
   /** 已注册的处理器名称清单（含未带元数据的） */
   listHandlerNames(): string[] {
-    return [...this.assignments.keys(), ...this.decisions.keys()]
+    return [...this.assignments.keys(), ...this.decisions.keys(), ...this.customs.keys()]
   }
 }

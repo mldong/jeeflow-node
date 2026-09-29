@@ -32,6 +32,10 @@ export const KeyAutoGenTitle = 'autoGenTitle'
 //   f_ccActors  发起时抄送   tf_ccActors 办理时抄送
 export const KeyCcActorsStart = 'f_ccActors'
 export const KeyCcActors      = 'tf_ccActors'
+// issues/142 A 批：记录类节点（snaker:custom）处理器返回值的**缺省变量键**
+// ——逐字对齐 Java `FlowConst.CUSTOM_RETURN_VAL`（enums/FlowConst.java:107）；
+// 节点 properties.val 给了就用 val（java CustomParser.java:20-22 的同一判据）。
+export const KeyCustomReturnVal = 'custom_return_val'
 
 /**
  * issues/127：抄送人入参归一（判据对齐 Java `JeeflowEngineImpl.handleCcActors`）——
@@ -495,8 +499,15 @@ export class EngineImpl implements Engine {
     if (startNode) {
       for (const node of followEdges(flow, startNode.id)) {
         if (node.type === TypeTask || node.type === TypeCustom) {
-          node.properties = node.properties ?? {}
-          node.properties.assignee = inst.operator
+          // issues/142（spec 02 §6.1）：往节点上写 assignee 只对**任务类**有意义——java 那侧判据是
+          // `tm.getTarget() instanceof TaskModel`（CustomModel 不是 TaskModel 的子类，见
+          // JeeflowEngineImpl.executeAndJumpToFirstTaskNode），记录类腿根本不解析参与者，给它写 assignee
+          // 等于给一个"本来就不该有参与者"的节点挂人。custom 命中时照样 executeNode（与 java 一样让它
+          // 落历史行＋继续走出边），只是不再改写它的 properties。
+          if (node.type === TypeTask) {
+            node.properties = node.properties ?? {}
+            node.properties.assignee = inst.operator
+          }
           await this.executeNode(flow, inst, node, operator, vars, taskId)
           break
         }
@@ -691,9 +702,17 @@ export class EngineImpl implements Engine {
                         parentId: string = '0'): Promise<void> {
     // 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
     // 任务完成的拦截器由 executeProcessTask 显式触发，1.8.0 SYNC 同步演进）
-    if (node.type === TypeTask || node.type === TypeCustom) {
+    if (node.type === TypeTask) {
       await this.createTask(node, inst, operator, vars, await this.surrogateProcessName(flow, inst),
         parentId, this.isFirstTaskNode(flow, node))
+      return
+    }
+    // issues/142 A 批（spec 02-flow-definition.md §6.1 表第二行 · owner 2026-09-29/09-30 两次拍）：
+    // snaker:custom 是**记录类**节点，不是任务类。上一版它与 TypeTask 同路走 createTask ⇒ 落一条
+    // DOING 待办行，正是 §6.1「禁止的形状①：当任务类建 DOING 行」。分流后独立一支：执行 clazz、
+    // 落 taskState=20 的历史行**并真落库**、令牌沿出边继续流转、不 fire 码 3（详见 execCustomNode）。
+    if (node.type === TypeCustom) {
+      await this.execCustomNode(flow, inst, node, operator, vars, parentId)
       return
     }
     if (!(await this.firePre(node, inst))) return
@@ -784,7 +803,15 @@ export class EngineImpl implements Engine {
   private async createTask(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>, processName = '',
                        parentId: string = '0', isFirst: boolean = false): Promise<void> {
     const actors = await this.resolveActors(node, inst, operator, vars)
-    if (!actors.length) return
+    // issues/142 §6.2 第 3 条（spec 02 §6.1 表第一行 · owner 2026-09-30 拍）：**任务类零参与者也必须建一行
+    // DOING**，参与者为空数组。上一版的 `if (!actors.length) return` 就是 §6.1 点名 python 曾犯的死锁黑洞
+    // ——实例停在 state=10 却零可办行，谁也办不动。形状与 java `CreateTaskHandler`（handler/impl/
+    // CreateTaskHandler.java:38-63 无条件建单）同形。
+    // ⚠️ "建行且不挂人"与"不建单"是两件事：这里**严禁**兜底把行挂给当前操作人（§6.1 硬结论 1，八栈一律不许有），
+    //    那等于伪造一条他不该收到的待办。记录类（custom）腿已在 executeNode 分流，不再进本函数。
+    // 零参与者 ⇒ 会签那三支（逐人建单 / 取 actors[0] / 写 nrOfInstances 簿记）没有成员可循环，
+    // 落到下面"普通建单"那一条腿建**一条**空参与者行；簿记键一个都不写，也就没有"计数为 0 会被反复重入"的入口
+    // （SEQUENTIAL 的推进只由 nrOfInstances>0 的行驱动，见 executeProcessTask 的 getCsState 那一支）。
     // issues/116：参与者解析完成后、落库前应用生效委托——代理人并入参与者集合，
     // 随任务一起 saveTask 落 wf_process_task_actor（严禁"事后 addTaskActor 补写"）
     const agents = await this.surrogateAgents(actors, processName)
@@ -796,7 +823,9 @@ export class EngineImpl implements Engine {
     const expireExpr = node.properties?.expireTime
     const expireArgs = inst.variables
 
-    if (isCountersign(node.properties?.performType) && ct) {
+    // 零参与者 ⇒ 落到下面"普通建单"那一条腿（会签三支都是"按成员逐个建单"，没有成员就没有可建的那一支，
+    // 若让它们空跑会重新退化成"零可办行"的黑洞形状）
+    if (actors.length && isCountersign(node.properties?.performType) && ct) {
       switch (ct) {
         case 'PARALLEL':
           for (const actor of actors) {
@@ -839,11 +868,79 @@ export class EngineImpl implements Engine {
     }
     // 普通任务：一个任务承载全部参与者（对齐 boot3 createTask + addTaskActor，多参与者任一可办）
     const effActors = mergeAgents(actors, agents)
-    const nt = inst.createTask(this.nextId(), node.id, node.text.value, effActors[0], operator, form, now, parentId, isFirst)
-    if (effActors.length > 1) nt.actorIds = effActors
+    // issues/142 §6.2 第 3 条：零参与者时这里照样建**一行**（effActors[0] 不存在 ⇒ 行首人占位写空串，
+    // 参与者集合随后被显式赋成空数组），旧形状 `if (!actors.length) return` 已撤。
+    const nt = inst.createTask(this.nextId(), node.id, node.text.value, effActors[0] ?? '', operator, form, now, parentId, isFirst)
+    // 参与者一律按**有效列表**落库：单人时与工厂默认的 [actor] 等值、多人时并入代理人、零人时是空数组
+    // （"建行不挂人"）。写回必须在 saveTask 之前——两仓都是随这一行一起落 wf_process_task_actor。
+    nt.actorIds = effActors
     applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 普通建单
     await this.repo.saveTask(nt)
     await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
+  }
+
+  /**
+   * 记录类节点（`snaker:custom`）执行腿 —— issues/142 A 批 · spec 02-flow-definition.md §6.1/§6.2
+   * （§6.1 owner 2026-09-29 拍「记录类节点没有参与者是正常形态」；§6.2 三条硬要求 owner 2026-09-30 逐条拍）。
+   *
+   * 三条要求分别落在哪：
+   * 1. **历史行必须真落库**（§6.2 第 1 条）——`inst.createHistoryTask(...)` 之后紧跟
+   *    `await this.repo.saveTask(ht)`：内存仓进 `tasks` map、SQL 仓走 `INSERT INTO wf_process_task`
+   *    （＋ `wf_process_task_actor` 一行），两仓都查得到那条 `task_state=20` 行。
+   *    ⚠️ 不照抄 java/c# 的形状：它们把 `createHistoryTask` 的返回值只 append 进聚合 `instance.tasks`，
+   *    `persistTasks` 只保存 `exec.getProcessTaskList()`、`updateInstance` 级联又只对
+   *    `taskId != null` 的行发 UPDATE ⇒ 那条 DONE 行永远进不了库（§6.2 第 1 条 ⚠️ 段点名基准自身的洞）。
+   *    行形状：`taskState=20`、参与者＝`[operator]`（java `Collections.singletonList(operator)` 同形的
+   *    **留痕主体**，DONE 行不在待办里出现）、`taskParentId` 与行级 `isFirstTaskNode` 照建单不变量走。
+   * 2. **`clazz` 解析不了 ⇒ 记日志 ＋ 照常落历史行 ＋ 令牌继续流转，严禁抛错打断建单**（§6.2 第 2 条）。
+   *    "未注册"与"clazz 缺失/空串"**分档两条文案**（c# 把两者合成同一个异常、覆盖面比 java 宽，不照抄）。
+   *    反过来处理器**自身执行失败**不在豁免内：不外吞、照旧往上抛，那是业务错误不是配错形状。
+   * 3. **本腿不解析参与者**（§6.2 第 3 条前半），所以 §6.1 那条"参与者为空"的判据对它不适用；
+   *    任务类零参与者必须建单那一半在 `createTask` 里落地。
+   *
+   * **不 fire `EventType.ProcessTaskStart`(码 3)**：码 3 表达"新待办产生"（§11.3 那一行明写
+   * "每个任务行落库之后逐任务 fire，载荷带 actors"），本腿建出来即已完成态，没有任何待办产生 ——
+   * 与 java 一致（java 那侧 `notifyTaskStart` 只跟着 `persistTasks` 的 DOING 行）。
+   *
+   * `clazz` 的执行形状：TS 没有 java `Class.forName(clazz).newInstance()` 那种反射语义可依托
+   * （共享夹具 `flows/08-custom-node.json` 里写的就是 `com.mldong.jeeflow.test.TestCustomHandler`
+   * 这种 JVM 类名，在 node 永远反射不到，报"实例化失败"只会把每条沿用夹具的流程都炸掉），
+   * 故与 **c#(`Context.CustomHandlers.TryGetValue`) / python(`HandlerRegistry.resolve_custom`) 同策按名查注册表**，
+   * 并且**挂在既有 `HandlerRegistry` 上**（本仓的参与者/决策处理器注册表已经是"按名注册＋元数据清单"
+   * 两件套，`registerAssignment`/`registerDecision` 同族；另立一个 custom 专用注册中心会造成
+   * 第二个并行清单，`listHandlers`/`listHandlerNames` 那两把尺子还得各修一遍）。
+   * 返回值非 `undefined` 时写进执行变量，键＝`properties.val`，缺省 `custom_return_val`
+   * （对齐 java `CustomParser.java:20-22` 给 `var` 兜的默认值 ＋ `CustomModel.java:46-48` 那句 put）。
+   */
+  private async execCustomNode(flow: FlowModel, inst: ProcessInstance, node: FlowNode, operator: string,
+                               vars: Record<string, any>, parentId: string = '0'): Promise<void> {
+    const clazz = String(node.properties?.clazz ?? '').trim()
+    const methodName = String(node.properties?.methodName ?? '').trim()
+    const handler = clazz ? this.registry?.resolveCustom(clazz) : undefined
+    if (handler) {
+      // 处理器自身抛错 ⇒ 外抛（§6.2 第 2 条末段：不在"误配不该炸流程"的豁免里）
+      const ret = await handler.handle(node, inst, operator, vars)
+      const varKey = String(node.properties?.val ?? '').trim() || KeyCustomReturnVal
+      if (ret !== undefined) vars[varKey] = ret
+    } else if (clazz) {
+      // 档 1：clazz 配了、注册表里没有对应实现（本栈按名注册，见方法头注释）。
+      // 文案再分两小口：引擎压根没挂 HandlerRegistry 时，集成方照"registerCustom"的提示去查是查不动的。
+      console.warn(`[jeeflow] custom 节点 clazz 未注册处理器，跳过执行、只落历史行并继续流转: ` +
+        `nodeId=${node.id} clazz=${clazz}${methodName ? ` methodName=${methodName}` : ''}` +
+        `（${this.registry
+          ? `注册姿势：registry.registerCustom("<clazz 原样串>", handler)`
+          : '本引擎实例未挂 HandlerRegistry——先 engine.setRegistry(new HandlerRegistry()) 再 registerCustom("<clazz 原样串>", handler)'}）`)
+    } else {
+      // 档 2：clazz 根本没配 / 空串 / 纯空白 —— 与档 1 分开诊断（spec 02 §6.2 第 2 条明写要分档）
+      console.warn(`[jeeflow] custom 节点未配置 clazz（缺失或空串），跳过执行、只落历史行并继续流转: ` +
+        `nodeId=${node.id}（这是流程定义属性问题，不是注册表未命中；判据见 spec 02 §6.2 第 2 条）`)
+    }
+    const now = new Date()
+    const ht = inst.createHistoryTask(this.nextId(), node.id, node.text?.value ?? '', operator, now,
+      parentId, this.isFirstTaskNode(flow, node))
+    await this.repo.saveTask(ht)
+    // 令牌继续沿出边流转（java CustomModel 收尾那句 runOutTransition）
+    for (const n of followEdges(flow, node.id)) await this.executeNode(flow, inst, n, operator, vars, parentId)
   }
 
   private async resolveActors(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>): Promise<string[]> {

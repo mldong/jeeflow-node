@@ -279,6 +279,34 @@ export class ProcessInstance {
     this.tasks.push(task)
     return task
   }
+
+  /**
+   * 记录类历史行工厂（issues/142 A 批 · spec 02-flow-definition.md §6.1/§6.2，owner 2026-09-29/09-30 两次拍）
+   *
+   * 形状基准＝jeeflow-java `ProcessInstance.createHistoryTask`（domain/ProcessInstance.java:425）
+   * ＋ python `create_history_task`（jeeflow/model.py:223）：`taskState=20(DONE)`、
+   * 参与者＝`[operator]`（**留痕主体，不是待办**——java 那侧是 `Collections.singletonList(operator)`）、
+   * 无 formKey、无会签字段、`finishTime` 已落；建单不变量（`parentTaskId` ＋ 行级 `isFirstTaskNode`）
+   * 与 `createTask` 同规格适用（issues/121 P1，java 那边也是同一句注释）。
+   *
+   * ⚠️ 这一支存在的理由：记录类节点（`snaker:custom`）**没有参与者是正常形态**，既不许按任务类
+   * 建 DOING 行（§6.1 禁止形状①），也不许"兜底把行挂给当前操作人"伪造一条他不该收到的待办
+   * （禁止形状②——行是 DONE ⇒ 谁也办不动，天然不在待办里），更不许直接跳过节点丢留痕（禁止形状③）。
+   * 调用方必须把返回的行**真落库**（`repo.saveTask`）——§6.2 第 1 条：只在聚合 `tasks` 里 append
+   * 不算做到，java/c# 现读正是栽在这条上的（基准自身的洞，本栈不照抄）。 */
+  createHistoryTask(id: string, taskName: string, displayName: string, operator: string, now: Date, parentId: string, isFirst: boolean): ProcessTask {
+    const task = new ProcessTask({
+      id, processInstanceId: this.id,
+      taskName, displayName, taskState: TaskState.Done,
+      actorId: operator ?? '', actorIds: operator ? [operator] : [],
+      taskType: 0, performType: 0, formKey: '', parentTaskId: parentId,
+      variables: { isFirstTaskNode: isFirst },
+      finishTime: now,
+      createTime: now, updateTime: now, createUser: operator, updateUser: operator,
+    })
+    this.tasks.push(task)
+    return task
+  }
 }
 
 // ─── 子实体：ProcessTask ────────────────────────────────────────────────────────

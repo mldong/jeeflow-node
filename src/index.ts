@@ -1,7 +1,7 @@
 export { EngineImpl, type Engine, type EngineOptions, type SurrogateLookup } from './engine.js'
 export { MemoryRepository } from './memory.js'
 export { MemoryExtRepository } from './memory-ext.js'
-export { HandlerRegistry, type IAssignmentHandler, type IDecisionHandler, type HandlerMeta, type HandlerType } from './registry.js'
+export { HandlerRegistry, type IAssignmentHandler, type IDecisionHandler, type ICustomHandler, type HandlerMeta, type HandlerType } from './registry.js'
 export { enumDict, enumDictKeys, type DictItem } from './metadata.js'
 export * from './model.js'
 export type { ProcessRepository, ProcessExtRepository, UserProvider, OrgUserProvider, IDGenerator, ExpressionEvaluator, QueryCondition } from './spi.js'
