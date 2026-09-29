@@ -2,7 +2,7 @@ import { TaskState } from './model.js'
 import type { CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDefine } from './model.js'
 import { cloneInstance, cloneTask, type ProcessInstance, type ProcessTask } from './model.js'
 import type { ProcessRepository, QueryCondition } from './spi.js'
-import { isBlankOwnership } from './spi.js'
+import { hasEffectiveCcOwnership, isBlankOwnership, defaultCreateCcInstanceIfAbsent } from './spi.js'
 
 // ═══ 条件匹配基建（issues/05-5，对齐 JDBC 白名单语义） ═══
 
@@ -85,10 +85,30 @@ export function eqValue(v: any, expect: any): boolean {
  * （`!op.is_empty()` 判据）同形；非空值**原样比较、不 trim**，与 java `t.operator = ?`
  * 及本栈 SQL 侧 `= ?` 的取值口径一致（不借机放宽成模糊匹配）。
  * 返回 null 表示"归属值为空"，调用方据此让每一行都不匹配。
+ *
+ * ⚠️ `pageCcInstances` 自 issues/141 G1 起不再走本函数，改走 `hasEffectiveCcOwnership`
+ * （同一条尺子再延长一档：空集合也算没填，且 conditions 里 `cc.actor_id` 的空值一并收进空页）。
  */
 function ownershipKey(wanted: string | null | undefined): string | null {
   const op = wanted ?? ''
   return op.trim() === '' ? null : op
+}
+
+/**
+ * 内存仓的 cc 行（issues/141 G2）——形状对齐表 `wf_process_cc_instance`：
+ * actor id ＋ 未读状态（0 未读 / 1 已读）＋ 建行时间与更新时间。
+ *
+ * 旧形状是「按实例存一串 actor id」，那种存法把 G2 的②「不重置未读」和③「不更新原行时间」
+ * 照不出来（没有 state、也没有时间可比较 ⇒ 只能测①），重复抄送把已读抹回未读、
+ * 把原行时间刷成 now 这两种**假修**在测试面上是隐形的。java 侧同一个升级
+ * （`MemoryProcessRepository.CcRow`）；既有断言语义一字不改。
+ */
+export interface CcRow {
+  actorId: string
+  /** 0 未读 / 1 已读（对齐 `wf_process_cc_instance.state`） */
+  state: number
+  createTime: Date
+  updateTime: Date
 }
 
 export class MemoryRepository implements ProcessRepository {
@@ -96,7 +116,7 @@ export class MemoryRepository implements ProcessRepository {
   private instances = new Map<string, ProcessInstance>()
   private tasks    = new Map<string, ProcessTask>()
   private actors   = new Map<string, string[]>()
-  private ccInstances = new Map<string, string[]>()
+  private ccInstances = new Map<string, CcRow[]>()
   private seq = 1
 
   addDefine(def: ProcessDefine) {
@@ -233,12 +253,46 @@ export class MemoryRepository implements ProcessRepository {
     this.actors.set(taskId, (this.actors.get(taskId) ?? []).filter(a => !remove.has(a)))
   }
   async createCcInstance(instanceId: string, _creator: string, ...actorIds: string[]) {
-    const existing = this.ccInstances.get(instanceId) ?? []
-    const seen = new Set(existing)
-    for (const a of actorIds) { if (!seen.has(a)) { existing.push(a); seen.add(a) } }
-    this.ccInstances.set(instanceId, existing)
+    // issues/141 G2 写侧判重＝幂等空操作（spec 06 §4），与 JdbcRepository.createCcInstance 同一条判据：
+    // 同一 (实例, 被抄送人) 已有 cc 行 ⇒ 跳过——①不新增行、②不重置未读（state 保持原值）、
+    // ③不更新原行时间（createTime/updateTime 逐字不变）。判重在写侧，查询侧不引入去重。
+    const rows = this.ccInstances.get(instanceId) ?? []
+    for (const actorId of actorIds) {
+      if (actorId == null || rows.some(r => r.actorId === actorId)) continue
+      const now = new Date()
+      rows.push({ actorId, state: 0, createTime: now, updateTime: now })
+    }
+    this.ccInstances.set(instanceId, rows)
   }
-  async updateCcStatus(_instanceId: string, _actorId: string) {}
+
+  async findCcActorIds(instanceId: string): Promise<string[]> {
+    return (this.ccInstances.get(instanceId) ?? []).map(r => r.actorId)
+  }
+
+  async createCcInstanceIfAbsent(instanceId: string, creator: string, ...actorIds: string[]): Promise<string[]> {
+    // 走 spi 里那份 java default 的对应物（与 JdbcRepository 同一条判重逻辑，不各写一遍）
+    return defaultCreateCcInstanceIfAbsent(this, instanceId, creator, actorIds)
+  }
+
+  async updateCcStatus(instanceId: string, actorId: string) {
+    // 已读：state 0→1 ＋ 刷 updateTime（对齐 `wf_process_cc_instance.state` 与 java 内存仓同款）。
+    // G2 之前这里是纯 no-op ⇒ 「重复抄送不得把已读抹回未读」这一档在内存仓根本测不出来。
+    for (const row of this.ccInstances.get(instanceId) ?? []) {
+      if (row.actorId === actorId) {
+        row.state = 1
+        row.updateTime = new Date()
+      }
+    }
+  }
+
+  /**
+   * 测试访问器：读回某实例的 cc **行**（issues/141 G2）。②「不重置未读」与③「不更新原行时间」
+   * 必须看 state 与两个时间字段，只看 actor id 集合照不出那两种假修（java 同名 `ccRowsForTest`）。
+   * 返回浅拷贝数组，调用方改数组不影响仓储；行对象本身是引用（时间与状态才可比）。
+   */
+  ccRowsForTest(instanceId: string): CcRow[] {
+    return [...(this.ccInstances.get(instanceId) ?? [])]
+  }
 
   // ── 核心表分页（v1.5.0）──
 
@@ -326,10 +380,14 @@ export class MemoryRepository implements ProcessRepository {
 
   // pageCcInstances 我的抄送分页（v1.3.0）：按抄送人 actorId 过滤，join 实例 + 定义
   async pageCcInstances(pageNum = 1, pageSize = 10, actorId: string, conditions?: QueryCondition[]) {
+    // issues/141 G1 归属条件必填（spec 06 §2.5）：cc.actor_id 上没有有效归属证据 ⇒ 空页，
+    // 绝不能退化成"这条不加"放出所有有 cc 行的实例。判据与 JdbcRepository.pageCcInstances
+    // 共用 hasEffectiveCcOwnership 那**一份**实现（issues/117 场景 27 那把尺子：同一份数据
+    // 两仓必须同答案；旧形状是 SQL 仓不带条件放全部实例、本仓只放有 cc 行的实例，两仓相反）。
+    if (!hasEffectiveCcOwnership(actorId, conditions)) return { rows: [] as CcInstanceRow[], total: 0 }
     const rows: CcInstanceRow[] = []
-    const op = ownershipKey(actorId) // issues/129 案 A 第二层：空 ⇒ 空页（cc.actor_id 为归属列）
-    for (const [instId, actors] of this.ccInstances) {
-      if (op == null || !actors.includes(op)) continue
+    for (const [instId, ccRows] of this.ccInstances) {
+      if (!ccRows.some(r => r.actorId === actorId)) continue
       const inst = this.instances.get(instId)
       if (!inst) continue
       const def = this.defines.get(inst.defineId)
@@ -343,7 +401,7 @@ export class MemoryRepository implements ProcessRepository {
         defineVersion: def?.version ?? 0,
       }
       const fields = pickFields(r, INSTANCE_FIELDS)
-      fields['cc.actor_id'] = actors
+      fields['cc.actor_id'] = ccRows.map(row => row.actorId)
       if (matchConditions(conditions, fields)) rows.push(r)
     }
     const total = rows.length

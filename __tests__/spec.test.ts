@@ -5028,3 +5028,485 @@ describe('issues/139 designRedeploy JSON 解析失败：出口 msg 逐字等值�
     assert.ok(!r2.msg.includes('SENTINEL'), `redeploy 腿不得把内容片段透出去: ${r2.msg}`)
   })
 })
+
+// ─────────────────────────────────────────────────────────────────────────────
+// issues/141 G1「抄送分页归属条件必填」
+// 判据源＝jeeflow-doc/docs/spec/06-facade.md §2.5「抄送分页同一条尺子（owner 2026-09-29 拍）」
+// 行为基准＝jeeflow-java 3d1fc98 的 CcPageOwnershipTest（内存仓一路）
+//          ＋ JdbcCcOwnershipIdempotentTest 的 G1 四格（SQL 仓一路）——两仓每一格读数必须相等
+//          （issues/117 场景 27 那把尺子从 todo/done 扩到 ccList）。
+// 本栈形状差异：java 的归属证据只有 `cc.actor_id` 条件一条腿；本栈门面把归属作为**位置参**下发
+// （与 pageInstances/pageTodoTasks/pageDoneTasks 同形），conditions 是第二条腿 ⇒ 判据合成
+// `hasEffectiveCcOwnership`，两仓共用同一份实现，不给分叉留余地。
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('issues/141 G1 抄送分页归属条件必填：cc.actor_id 无有效条件 ⇒ 空页（内存仓＋SQL 仓同判据）', () => {
+  const ME = 'user1'
+  const OTHER = 'user2'
+
+  /** 两条 cc 行各占一个实例（ME / OTHER 各一条）：不引引擎，直连仓储把格钉在分页判据上。 */
+  async function fixtureG1() {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const r0 = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const mine = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: r0.data.processDefineId, operator: 'zhangsan', businessNo: 'CC141-MINE' })
+    assert.equal(mine.code, 0, JSON.stringify(mine))
+    const theirs = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: r0.data.processDefineId, operator: 'zhaoliu', businessNo: 'CC141-THEIRS' })
+    assert.equal(theirs.code, 0, JSON.stringify(theirs))
+    await repo.createCcInstance(String(mine.data.processInstanceId), 'zhangsan', ME)
+    await repo.createCcInstance(String(theirs.data.processInstanceId), 'zhangsan', OTHER)
+    return { repo, facade, mine: String(mine.data.processInstanceId), theirs: String(theirs.data.processInstanceId) }
+  }
+
+  /**
+   * 判据表（java 的三档逐字照抄：缺条件⇒空页、空值三形＋空集合⇒空页、非归属列空值仍忽略）。
+   * `rows` 字段＝内存仓该档的期望读数；`sqlShortCircuits`＝SQL 仓该档必须在**取连接之前**短路。
+   */
+  const TABLE: Array<{ tag: string; actor: any; conds?: any[]; rows: number; sqlShortCircuits: boolean }> = [
+    // ① 条件整条没给（java `pageCcInstances(new PageQuery())` 那一档）
+    { tag: '位置参缺省（undefined）', actor: undefined, rows: 0, sqlShortCircuits: true },
+    { tag: '位置参 null', actor: null, rows: 0, sqlShortCircuits: true },
+    // ② 空值三形（issues/129 已钉，此处与新增档同表复跑，防止改动面把旧档漏回去）
+    { tag: '位置参空串', actor: '', rows: 0, sqlShortCircuits: true },
+    { tag: '位置参全空白', actor: '   ', rows: 0, sqlShortCircuits: true },
+    { tag: '位置参制表/换行空白', actor: '\t\n', rows: 0, sqlShortCircuits: true },
+    // ②+ G1 新收的一档：空集合＝「谁都没有」，与空串同档（改前内存仓 [].trim() 直接抛、SQL 仓带数组下库）
+    { tag: '位置参空集合 []（＝谁都没有）', actor: [], rows: 0, sqlShortCircuits: true },
+    // ③ 条件腿（conditions）打在归属列上的空值：一律空页，不得折叠成"这条不加"
+    { tag: '条件 cc.actor_id EQ 空串', actor: ME, conds: [{ column: 'cc.actor_id', operator: 'EQ', value: '' }], rows: 0, sqlShortCircuits: true },
+    { tag: '条件 cc.actor_id EQ 全空白', actor: ME, conds: [{ column: 'cc.actor_id', operator: 'EQ', value: '   ' }], rows: 0, sqlShortCircuits: true },
+    { tag: '条件 cc.actor_id EQ null', actor: ME, conds: [{ column: 'cc.actor_id', operator: 'EQ', value: null }], rows: 0, sqlShortCircuits: true },
+    { tag: '条件 cc.actor_id EQ 空集合', actor: ME, conds: [{ column: 'cc.actor_id', operator: 'EQ', value: [] }], rows: 0, sqlShortCircuits: true },
+    { tag: '条件 cc.actor_id IN 空集合（java「空 IN ⇒ 空页」）', actor: ME, conds: [{ column: 'cc.actor_id', operator: 'IN', value: [] }], rows: 0, sqlShortCircuits: true },
+    { tag: '条件 cc.actor_id LIKE 空串', actor: ME, conds: [{ column: 'cc.actor_id', operator: 'LIKE', value: '' }], rows: 0, sqlShortCircuits: true },
+    { tag: '条件 cc.actor_id NE 空集合', actor: ME, conds: [{ column: 'cc.actor_id', operator: 'NE', value: [] }], rows: 0, sqlShortCircuits: true },
+    // ④ 正向对照（证明"空页"不是无条件返空）
+    { tag: '正向 · 有效位置参归属', actor: ME, rows: 1, sqlShortCircuits: false },
+    // ⑤ 哨兵：只收归属列——非归属列（可选过滤）空值仍按"没填"忽略
+    { tag: '哨兵 · 非归属列 t.business_no LIKE 空串仍被忽略', actor: ME, conds: [{ column: 't.business_no', operator: 'LIKE', value: '' }], rows: 1, sqlShortCircuits: false },
+    { tag: '哨兵 · 非归属列 pd.name EQ null 仍被忽略', actor: ME, conds: [{ column: 'pd.name', operator: 'EQ', value: null }], rows: 1, sqlShortCircuits: false },
+  ]
+
+  /** SQL 仓的 T0 探针：空页档必须在**取连接之前**短路；非空页档必须真去取连接（这才证明短路是真的）。 */
+  function probeRepo() {
+    const noConn: any = {
+      placeholder: '?',
+      acquire() { throw new Error('PROBE_ACQUIRE') },
+      release() { throw new Error('PROBE_RELEASE') },
+    }
+    return new JdbcRepository(noConn)
+  }
+
+  it('内存仓 · 判据表逐档：空值三形＋空集合＋条件腿空值 ⇒ 空页；正向与可选过滤哨兵不被改坏', async () => {
+    const f = await fixtureG1()
+    for (const t of TABLE) {
+      const page = await f.repo.pageCcInstances(1, 50, t.actor as any, t.conds)
+      assert.equal(page.rows.length, t.rows,
+        `${t.tag}：内存仓读数应为 ${t.rows} 行，实读 ${page.rows.length} ⇒ 空归属又退化成"这条不加"了`)
+      assert.equal(page.total, t.rows, `${t.tag}：total 与 rows 同口径（空页时 total 也要归 0）`)
+    }
+    // 别人的归属档同样只出别人的（判据没把过滤做成"永远空"）
+    assert.equal((await f.repo.pageCcInstances(1, 50, OTHER)).total, 1, 'OTHER 档照旧出他自己的 1 行')
+    assert.equal((await f.repo.pageCcInstances(1, 50, 'nosuchuser')).total, 0, '谁都不是 ⇒ 空页（对照组）')
+  })
+
+  it('SQL 仓 · 同一张判据表逐档同答案（空归属短路在取连接之前，非空归属照常下查询）', async () => {
+    const p = probeRepo()
+    for (const t of TABLE) {
+      if (t.sqlShortCircuits) {
+        const page = await p.pageCcInstances(1, 50, t.actor as any, t.conds)
+        assert.deepEqual(page, { rows: [], total: 0 },
+          `${t.tag}：SQL 仓必须与内存仓同答案（空页），实读 ${JSON.stringify(page)}`)
+      } else {
+        // 反闸：非空归属档要真去取连接 ⇒ 上面那批"空页"断言不是探针本身失灵
+        await assert.rejects(() => p.pageCcInstances(1, 50, t.actor as any, t.conds), /PROBE_ACQUIRE/,
+          `${t.tag}：SQL 仓该档不该被空页短路吃掉（正向/哨兵档必须下查询）`)
+      }
+    }
+  })
+
+  it('两仓同答案 · 空页与"没短路"的档位划分逐档一致（判据只有一份实现）', async () => {
+    const f = await fixtureG1()
+    const p = probeRepo()
+    for (const t of TABLE) {
+      const mem = await f.repo.pageCcInstances(1, 50, t.actor as any, t.conds)
+      let sqlEmpty: boolean
+      try {
+        const page = await p.pageCcInstances(1, 50, t.actor as any, t.conds)
+        sqlEmpty = page.rows.length === 0 && page.total === 0
+      } catch (e) {
+        sqlEmpty = false // 取了连接＝没短路
+      }
+      const memEmpty = mem.rows.length === 0 && mem.total === 0
+      assert.equal(sqlEmpty, memEmpty,
+        `${t.tag}：同一份数据两仓必须同结论（内存 ${memEmpty ? '空页' : '出行'} / SQL ${sqlEmpty ? '空页' : '下查询'}）`)
+    }
+  })
+
+  it('门面一路不受影响：ccList 空 operator 仍按 issues/129 回落缺省 user1，m_LIKE_* 空串仍当"没填"', async () => {
+    const f = await fixtureG1()
+    const blank = await f.facade.flow('processInstance/ccList', { operator: '', pageSize: 50 })
+    assert.equal(blank.code, 0, JSON.stringify(blank))
+    assert.equal(blank.data.rows.length, 1, `空 operator 回落 user1 ⇒ 1 行（不是空页、也不是全库）: ${JSON.stringify(blank.data)}`)
+    const viaM = await f.facade.flow('processInstance/ccList', { operator: ME, pageSize: 50, m_LIKE_businessNo: '' })
+    assert.equal(viaM.code, 0, JSON.stringify(viaM))
+    assert.equal(viaM.data.rows.length, 1, 'm_LIKE_businessNo 传空串仍按"没填"忽略（可选放行未被 G1 改坏）')
+    // 绕过门面的归属列条件（m_<别名>_<操作符>_<字段> ⇒ `m_cc_EQ_actorId`；空串被 parseMQuery 丢掉，
+    // 全空白则真会下发）⇒ 仓储这层必须自己顶住
+    const dirty = await f.facade.flow('processInstance/ccList', { operator: ME, pageSize: 50, m_cc_EQ_actorId: '   ' })
+    assert.equal(dirty.code, 0, JSON.stringify(dirty))
+    assert.equal(dirty.data.rows.length, 0, '归属列上空白条件 ⇒ 空页，不得退化成"这条不加"出全部实例')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// issues/141 G2「抄送写侧判重＝幂等空操作」
+// 判据源＝jeeflow-doc/docs/spec/06-facade.md §4 ＋ spec 11 §11.2 原则 1「码值表达发生了什么事实」
+//        ＋ §11.7「三条入口共用一支」。行为基准＝jeeflow-java 3d1fc98 的 CcWriteIdempotentTest
+//        （内存仓一路 ＋ 引擎/门面两条腿）＋ JdbcCcOwnershipIdempotentTest 的 G2 六格（SQL 仓一路）。
+// 四档逐字：同一 (instanceId, actorId) 已有 cc 行时 ①不新增行 ②不重置未读状态 ③不更新原行时间
+// ④不 fire CC_CREATE（码 4）；逐人 fire 的入参换成"实际新建的子集"，子集为空整支不 fire。
+// 查询侧不加 DISTINCT、历史重复行不清理（owner 拍为接受既成事实）⇒ 这里只钉写侧。
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('issues/141 G2 抄送写侧判重＝幂等空操作：①不新增行 ②不重置未读 ③不刷原行时间 ④不发码 4（子集才 fire）', () => {
+  /** 让"原行时间被刷新"与"没被刷新"在断言上分得开（Date 毫秒精度，java 侧同款 tick）。 */
+  const tick = async () => { await new Promise<void>(r => setTimeout(r, 12)) }
+
+  /** 内存仓一路的夹具：引擎＋门面＋只收 CC_CREATE 的事件 sink。 */
+  function harnessG2() {
+    const { engine, repo } = setup()
+    const fired: ProcessEvent[] = []
+    engine.setExtensions({ listeners: [(e) => { if (e.type === EventType.CcCreate) fired.push({ ...e }) }] })
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    return { engine, repo, facade, fired }
+  }
+  async function defineOf(facade: JeeflowFacade): Promise<string> {
+    const r = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    return String(r.data.processDefineId)
+  }
+  async function startG2(facade: JeeflowFacade, defineId: string, operator = 'zhangsan', extra: Record<string, any> = {}) {
+    const r = await facade.flow('processInstance/startAndExecute', { processDefineId: defineId, operator, ...extra })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    return String(r.data.processInstanceId)
+  }
+  async function manualCc(facade: JeeflowFacade, instanceId: string, ...actorIds: string[]) {
+    const r = await facade.flow('processInstance/createCCInstance',
+      { processInstanceId: instanceId, operator: 'zhangsan', actorIds })
+    assert.equal(r.code, 0, `手动抄送应成功: ${JSON.stringify(r)}`)
+  }
+  const actorIdsOf = (events: ProcessEvent[]) => events.map(e => e.ccActorId)
+  /** 行快照＝纯值拷贝（拿引用比时间会被"就地改字段"这种假修糊过去）。 */
+  const rowsOf = (repo: MemoryRepository, instanceId: string) =>
+    repo.ccRowsForTest(instanceId).map(r => ({ actorId: r.actorId, state: r.state, ct: r.createTime.getTime(), ut: r.updateTime.getTime() }))
+
+  // ═══ 正向对照：全新的一次抄送照旧建行＋逐人 fire ═══
+
+  it('正向对照 · 首轮全新抄送照旧逐人建行、逐人 fire 码 4，新行是未读（state=0）', async () => {
+    const { repo, facade, fired } = harnessG2()
+    const instanceId = await startG2(facade, await defineOf(facade))
+    fired.length = 0
+    await manualCc(facade, instanceId, '6101', '6102')
+
+    assert.deepEqual(await repo.findCcActorIds(instanceId), ['6101', '6102'], '全新抄送应逐人落行')
+    assert.equal(fired.length, 2, `全新抄送应逐人 fire（码 4），实收 ${fired.length}`)
+    assert.deepEqual(actorIdsOf(fired), ['6101', '6102'], 'ccActorId 顺序与入参一致')
+    assert.deepEqual([...new Set(fired.map(e => e.type))], [4], 'fire 的是码 4（CC_CREATE）而不是别的码')
+    for (const e of fired) assert.equal(e.instanceId, instanceId, '码 4 的 sourceId 应为 instanceId')
+    assert.deepEqual(rowsOf(repo, instanceId).map(r => r.state), [0, 0], '新行应是未读（state=0）')
+  })
+
+  // ═══ 四档：重复抄送是幂等空操作 ═══
+
+  it('①不新增行 ＋ ④不发码 4 · 手动腿连发两次同一个人（没发生创建就不得发事件）', async () => {
+    const { repo, facade, fired } = harnessG2()
+    const instanceId = await startG2(facade, await defineOf(facade))
+    await manualCc(facade, instanceId, '6201')
+    assert.deepEqual(await repo.findCcActorIds(instanceId), ['6201'], '首次抄送落 1 行')
+    assert.equal(fired.length, 1, '首次抄送 fire 1 次')
+
+    fired.length = 0
+    await tick()
+    await manualCc(facade, instanceId, '6201')
+
+    assert.deepEqual(await repo.findCcActorIds(instanceId), ['6201'], '①重复抄送不得新增行')
+    assert.equal(rowsOf(repo, instanceId).length, 1, '①重复抄送后行数仍是 1')
+    assert.equal(fired.length, 0, '④没发生"创建"就不得发码 4（spec 11.2 原则 1「码=事实」）')
+  })
+
+  it('②不重置未读 · 先置已读（state=1），重复抄送不得把已读抹回未读', async () => {
+    const { repo, facade } = harnessG2()
+    const instanceId = await startG2(facade, await defineOf(facade))
+    await manualCc(facade, instanceId, '6301')
+    const read = await facade.flow('processInstance/updateCCStatus', { processInstanceId: instanceId, operator: '6301' })
+    assert.equal(read.code, 0, `已读应成功: ${JSON.stringify(read)}`)
+    assert.equal(rowsOf(repo, instanceId)[0].state, 1, '置读后 state 应为 1（这条腿本身要能测出来）')
+
+    await tick()
+    await manualCc(facade, instanceId, '6301')
+
+    assert.equal(rowsOf(repo, instanceId)[0].state, 1, '②重复抄送不得把已读抹回未读（不产生"再提醒一次"语义）')
+    assert.equal(rowsOf(repo, instanceId).length, 1, '①顺带：仍是那一行')
+  })
+
+  it('③不更新原行时间 · 重复抄送后 createTime/updateTime 逐字不变', async () => {
+    const { repo, facade } = harnessG2()
+    const instanceId = await startG2(facade, await defineOf(facade))
+    await manualCc(facade, instanceId, '6401')
+    const before = rowsOf(repo, instanceId)[0]
+    assert.ok(before.ct > 0 && before.ut > 0, `前置：原行两个时间都该有值: ${JSON.stringify(before)}`)
+
+    await tick()
+    await manualCc(facade, instanceId, '6401')
+
+    const after = rowsOf(repo, instanceId)[0]
+    assert.equal(after.ct, before.ct, '③重复抄送不得刷新原行 createTime')
+    assert.equal(after.ut, before.ut, '③重复抄送不得刷新原行 updateTime')
+  })
+
+  it('④子集档 · 第二次给「已知人＋新人」⇒ 只为新人建行、事件里只出现新人', async () => {
+    const { repo, facade, fired } = harnessG2()
+    const instanceId = await startG2(facade, await defineOf(facade))
+    await manualCc(facade, instanceId, '6501', '6502')
+    assert.equal(fired.length, 2, '首轮 fire 2 次')
+
+    fired.length = 0
+    await tick()
+    await manualCc(facade, instanceId, '6501', '6503')
+
+    assert.deepEqual(actorIdsOf(fired), ['6503'], '逐人 fire 的入参应是**实际新建的子集**，不是原始请求')
+    assert.equal(fired.length, 1, '子集只有 1 人 ⇒ 只 fire 1 次')
+    assert.deepEqual(await repo.findCcActorIds(instanceId), ['6501', '6502', '6503'], '实际新建的 cc 行也只有那一行')
+  })
+
+  it('同一次调用内的重复折叠 · 仓储直连返回去重子集，门面两形态各只落一行一次', async () => {
+    const { repo, facade, fired } = harnessG2()
+    const instanceId = await startG2(facade, await defineOf(facade))
+
+    // 直连仓储：入参里就带重复
+    const created = await repo.createCcInstanceIfAbsent!(instanceId, 'zhangsan', '6601', '6601', '6602')
+    assert.deepEqual(created, ['6601', '6602'], '返回的子集必须折掉同一次调用内的重复')
+    assert.deepEqual(await repo.findCcActorIds(instanceId), ['6601', '6602'], '同人同实例只落一行')
+
+    fired.length = 0
+    // 逗号串形态（toStringList2 按逗号切 ＋ parseCcActors 再折一层）
+    const r1 = await facade.flow('processInstance/createCCInstance',
+      { processInstanceId: instanceId, operator: 'zhangsan', actorIds: '6603,6603' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    assert.equal(fired.length, 1, `同一次调用内的重复只 fire 一次，实收 ${JSON.stringify(actorIdsOf(fired))}`)
+    assert.deepEqual(actorIdsOf(fired), ['6603'])
+    // 数组形态（逐元素）里带重复，判重同一条
+    fired.length = 0
+    const r2 = await facade.flow('processInstance/createCCInstance',
+      { processInstanceId: instanceId, operator: 'zhangsan', actorIds: ['6603', '6604', '6604'] })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    assert.deepEqual(actorIdsOf(fired), ['6604'], '数组形态里的重复同样折叠')
+    assert.deepEqual(await repo.findCcActorIds(instanceId), ['6601', '6602', '6603', '6604'])
+  })
+
+  it('f_ 与 tf_ 两腿共用同一条判重 · 发起腿已抄的人在办理腿不建行不 fire，新人照旧', async () => {
+    const { repo, facade, fired } = harnessG2()
+    const defineId = await defineOf(facade)
+    const instanceId = await startG2(facade, defineId, 'zhangsan', { f_ccActors: '7001' })
+    assert.deepEqual(actorIdsOf(fired), ['7001'], '发起腿 fire 1 次')
+    assert.deepEqual(await repo.findCcActorIds(instanceId), ['7001'], '发起腿落 1 行')
+
+    fired.length = 0
+    await tick()
+    const task = (await repo.findDoingTasks(instanceId))[0]
+    const r = await facade.flow('processTask/execute', {
+      processTaskId: task.id, operator: 'leader', submitType: SubmitType.Agree, tf_ccActors: '7001,7002',
+    })
+    assert.equal(r.code, 0, JSON.stringify(r))
+
+    assert.deepEqual(await repo.findCcActorIds(instanceId), ['7001', '7002'], '办理腿只为新人 7002 建行（7001 已有行）')
+    assert.deepEqual(actorIdsOf(fired), ['7002'], '办理腿只 fire 实际新建的子集（两腿共用判据，spec §11.7）')
+  })
+
+  it('逗号串与数组两形态等价 · 混用也走同一条判重腿', async () => {
+    const { repo, facade, fired } = harnessG2()
+    const defineId = await defineOf(facade)
+    const instanceId = await startG2(facade, defineId, 'zhangsan', { f_ccActors: ['7101', '7102'] })
+    assert.deepEqual(await repo.findCcActorIds(instanceId), ['7101', '7102'], '集合形态照旧逐人建行')
+    assert.equal(fired.length, 2, '集合形态照旧逐人 fire')
+
+    fired.length = 0
+    await tick()
+    const task = (await repo.findDoingTasks(instanceId))[0]
+    await facade.flow('processTask/execute', {
+      processTaskId: task.id, operator: 'leader', submitType: SubmitType.Agree, tf_ccActors: '7101, 7103 ,',
+    })
+
+    assert.deepEqual(await repo.findCcActorIds(instanceId), ['7101', '7102', '7103'], '逗号串形态与集合形态判重同一条')
+    assert.deepEqual(actorIdsOf(fired), ['7103'], '两形态混用也只为新人 fire（空项照旧丢弃）')
+  })
+
+  it('反向哨兵 · 判重作用域按实例不按全局：不同实例上的同一个人各自建行各 fire', async () => {
+    const { repo, facade, fired } = harnessG2()
+    // 两个实例 id 直接给定（不走 startAndExecute）：setup() 的 idGen 是"毫秒 × 1000 ＋ 随机三位"，
+    // 同一毫秒连起两单有 ~1‰ 撞号，会把这格的 notEqual 前置打成偶发红。判重作用域只看 cc 行的
+    // (实例, 人) 二元组，实例是否真存在与本案无关（门面腿只校 id 形状）。
+    const first = '1410000000000001'
+    const second = '1410000000000002'
+    fired.length = 0
+
+    await manualCc(facade, first, '6701')
+    await tick()
+    await manualCc(facade, second, '6701')
+
+    assert.deepEqual(await repo.findCcActorIds(first), ['6701'], '实例一应有自己的 cc 行')
+    assert.deepEqual(await repo.findCcActorIds(second), ['6701'], '实例二不受实例一影响，同一个人照样建行')
+    assert.equal(fired.length, 2, '两个实例各 fire 一次（判重不得做成全局判重）')
+    assert.deepEqual(fired.map(e => e.instanceId), [first, second], '事件按各自的实例 id 发出')
+  })
+
+  // ═══ 第三方仓储的兼容形状（java 的 interface default 在 TS 里的对应物） ═══
+
+  it('未实现判重 SPI 的第三方仓储 ⇒ 旧行为逐字不变（全量建行 ＋ 全量 fire）', async () => {
+    const calls: string[][] = []
+    const legacyRepo: any = {
+      async createCcInstance(_id: string, _creator: string, ...actors: string[]) { calls.push(actors) },
+    }
+    const fired: ProcessEvent[] = []
+    const engine = new EngineImpl(legacyRepo)
+    engine.setExtensions({ listeners: [(e) => { fired.push({ ...e }) }] })
+
+    const created = await engine.handleCcActors('88001', 'zhangsan', 'a,b')
+    assert.deepEqual(calls, [['a', 'b']], '未实现 findCcActorIds ⇒ 既有行视作空集 ⇒ 全量插入（与旧 createCcInstance 逐字一致）')
+    assert.deepEqual(created, ['a', 'b'], '返回全量（没有判重依据时不静默改变既有集成方行为）')
+    assert.deepEqual(actorIdsOf(fired), ['a', 'b'], 'fire 照旧逐人一次')
+  })
+
+  it('第三方只实现 findCcActorIds ⇒ 判重照样生效（读侧驱动，与内置两仓同一条 default 腿）', async () => {
+    const calls: string[][] = []
+    const existing = ['a']
+    const partialRepo: any = {
+      async createCcInstance(_id: string, _creator: string, ...actors: string[]) { calls.push(actors); existing.push(...actors) },
+      async findCcActorIds() { return [...existing] },
+    }
+    const engine = new EngineImpl(partialRepo)
+
+    const created = await engine.handleCcActors('88002', 'zhangsan', 'a,b')
+    assert.deepEqual(calls, [['b']], '已有行里的 a 不再插第二行')
+    assert.deepEqual(created, ['b'], '返回实际新建的子集')
+  })
+
+  // ═══ SQL 仓一路（T0 假适配器：只装 cc 写侧三条语句，不连任何数据库） ═══
+
+  /**
+   * 假适配器：内存里养一张 `wf_process_cc_instance`，逐条记录执行过的语句。
+   * 断言直接查这张表的真实行（只看返回值不作数），并借语句流水钉住
+   * "跳过式判重既不 UPDATE 原行、也不重插"（②③档在 SQL 仓的证据形态）。
+   */
+  function ccTableRepo() {
+    const rows: Array<Record<string, any>> = []
+    const stmts: Array<{ sql: string; args: any[] }> = []
+    const byInstance = (instanceId: any) =>
+      rows.filter(r => String(r.process_instance_id) === String(instanceId))
+        .slice().sort((a, b) => Number(a.id) - Number(b.id))
+    const conn: any = {
+      async execute(sql: string, args: any[]) {
+        stmts.push({ sql, args })
+        if (/^INSERT INTO wf_process_cc_instance/.test(sql)) {
+          rows.push({
+            id: args[0], process_instance_id: args[1], actor_id: args[2], state: 0,
+            create_time: args[3], create_user: args[4], update_time: args[5], update_user: args[6],
+          })
+          return
+        }
+        if (/^UPDATE wf_process_cc_instance SET state=1/.test(sql)) {
+          for (const r of byInstance(args[1])) if (String(r.actor_id) === String(args[2])) { r.state = 1; r.update_time = args[0] }
+          return
+        }
+        throw new Error(`假适配器收到未预期语句: ${sql}`)
+      },
+      async fetchAll(sql: string, args: any[]) {
+        stmts.push({ sql, args })
+        if (/^SELECT actor_id FROM wf_process_cc_instance/.test(sql)) {
+          return byInstance(args[0]).map(r => ({ actor_id: r.actor_id }))
+        }
+        if (/FROM wf_process_instance t/.test(sql)) return [] // 分页取数：形状断言用，行内容不在本案范围
+        throw new Error(`假适配器收到未预期语句: ${sql}`)
+      },
+      async fetchOne(sql: string, args: any[]) {
+        stmts.push({ sql, args })
+        if (/SELECT COUNT\(\*\)/.test(sql)) return { cnt: rows.filter(r => String(r.actor_id) === String(args[0])).length }
+        throw new Error(`假适配器收到未预期语句: ${sql}`)
+      },
+      async begin() {}, async commit() {}, async rollback() {},
+    }
+    const adapter: any = { placeholder: '?', async acquire() { return conn }, async release() {} }
+    return { repo: new JdbcRepository(adapter), rows, stmts, byInstance }
+  }
+  const insertStmts = (stmts: Array<{ sql: string }>) => stmts.filter(s => /^INSERT INTO wf_process_cc_instance/.test(s.sql))
+  const updateStmts = (stmts: Array<{ sql: string }>) => stmts.filter(s => /^UPDATE wf_process_cc_instance/.test(s.sql))
+
+  it('SQL 仓 · findCcActorIds 读的是真实行集（判重的依据不能是内存猜测）', async () => {
+    const { repo } = ccTableRepo()
+    assert.deepEqual(await repo.findCcActorIds!('900001'), [], '空实例没有 cc 行')
+    await repo.createCcInstance('900001', 'zhangsan', '8601', '8602')
+    assert.deepEqual(await repo.findCcActorIds!('900001'), ['8601', '8602'], '两行两个人')
+    await repo.createCcInstance('900001', 'zhangsan', '8601', '8603')
+    assert.deepEqual(await repo.findCcActorIds!('900001'), ['8601', '8602', '8603'], '重复的 8601 不新增')
+  })
+
+  it('SQL 仓 · ①不新增行 ＋ ④子集：createCcInstanceIfAbsent 只插新人并只回新人', async () => {
+    const { repo, rows, stmts } = ccTableRepo()
+    const first = await repo.createCcInstanceIfAbsent!('900002', 'zhangsan', '8201', '8202')
+    assert.deepEqual(first, ['8201', '8202'], '首轮全新 ⇒ 子集＝全量')
+    assert.equal(insertStmts(stmts).length, 2, '首轮两条 INSERT')
+
+    const before = stmts.length
+    const again = await repo.createCcInstanceIfAbsent!('900002', 'zhangsan', '8201', '8503')
+    assert.deepEqual(again, ['8503'], '返回的必须是实际新建的子集（引擎拿它去 fire）')
+    assert.equal(insertStmts(stmts.slice(before)).length, 1, '重复的 8201 不得再插一行')
+    assert.equal(rows.length, 3, `库里总共 3 行，实读 ${rows.length}`)
+    assert.deepEqual(await repo.findCcActorIds!('900002'), ['8201', '8202', '8503'])
+  })
+
+  it('SQL 仓 · ②不重置未读 ＋ ③不刷原行时间：跳过式判重既不 UPDATE 也不重插', async () => {
+    const { repo, rows, stmts, byInstance } = ccTableRepo()
+    await repo.createCcInstance('900003', 'zhangsan', '8401')
+    await repo.updateCcStatus('900003', '8401')
+    assert.equal(byInstance('900003')[0].state, 1, '置读后 state=1')
+    const ct = byInstance('900003')[0].create_time as Date
+    const ut = byInstance('900003')[0].update_time as Date
+    assert.ok(ct instanceof Date && ut instanceof Date, `前置：原行两个时间都该有值: ${JSON.stringify(byInstance('900003'))}`)
+
+    const before = { inserts: insertStmts(stmts).length, updates: updateStmts(stmts).length }
+    await repo.createCcInstance('900003', 'zhangsan', '8401')
+    await repo.createCcInstanceIfAbsent!('900003', 'zhangsan', '8401')
+
+    assert.equal(insertStmts(stmts).length, before.inserts, '①重复抄送一条 INSERT 都不该多发')
+    assert.equal(updateStmts(stmts).length, before.updates, '②③跳过式判重不走 UPDATE ⇒ 未读状态与原行时间无从被动')
+    assert.equal(rows.length, 1, '①库里仍是那一行')
+    assert.equal(byInstance('900003')[0].state, 1, '②重复抄送不得把已读抹回未读')
+    assert.equal(byInstance('900003')[0].create_time, ct, '③create_time 逐字不变')
+    assert.equal(byInstance('900003')[0].update_time, ut, '③update_time 逐字不变')
+  })
+
+  it('SQL 仓 · 改动面不外溢：查询侧仍 LEFT JOIN 不带 DISTINCT，写侧不发 DELETE（历史重复行不清理）', async () => {
+    const { repo, stmts, rows } = ccTableRepo()
+    await repo.createCcInstance('900004', 'zhangsan', '8701')
+    await repo.pageCcInstances(1, 10, '8701')
+
+    const page = stmts.filter(s => /FROM wf_process_instance t/.test(s.sql))
+    assert.ok(page.length >= 1, '分页应下查询（COUNT ＋ 取数两条）')
+    for (const s of page) {
+      assert.ok(/LEFT JOIN wf_process_cc_instance cc/.test(s.sql), `查询侧 join 形状不动: ${s.sql}`)
+      assert.ok(!/DISTINCT/i.test(s.sql), `判重在写侧，查询侧不得引入 DISTINCT（owner 2026-09-29 拍）: ${s.sql}`)
+    }
+    assert.equal(stmts.filter(s => /DELETE FROM wf_process_cc_instance/.test(s.sql)).length, 0,
+      '历史重复行不清理 ⇒ 写侧不得出现 DELETE')
+    assert.equal(rows.length, 1)
+    // 手动构造历史重复行（绕过写侧判重直接落两行）⇒ 查询侧原样出行、不去重
+    rows.push({ id: 2, process_instance_id: '900004', actor_id: '8701', state: 0, create_time: new Date(), create_user: 'x', update_time: new Date(), update_user: 'x' })
+    assert.deepEqual(await repo.findCcActorIds!('900004'), ['8701', '8701'], 'findCcActorIds 也不加 DISTINCT：重复行原样返回')
+  })
+})
+
+

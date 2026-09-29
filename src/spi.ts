@@ -36,6 +36,44 @@ export function isBlankOwnership(column: string, operator: string, val: unknown)
   return OWNERSHIP_COLUMNS.has(column) && operator.toUpperCase() === 'EQ' && isBlankValue(val)
 }
 
+/**
+ * 归属证据的**有效性**判据（issues/141 G1 · 逐字对齐 java
+ * `JdbcProcessRepository#hasEffectiveCondition` 的反面）：在 `isBlankValue` 的三形
+ * （null / undefined / 全空白串）之上再收一档**空集合**——`[]` 表达的是「谁都没有」，
+ * 与空串同档。这一档不补上，同一份数据在两仓会各说各话：内存仓 `[].trim()` 直接 TypeError，
+ * SQL 仓把数组当标量绑进 `cc.actor_id = ?` 下库（既不是空页也不是报错口径统一）。
+ */
+export function isBlankOwnershipValue(val: unknown): boolean {
+  if (isBlankValue(val)) return true
+  return Array.isArray(val) && val.length === 0
+}
+
+/** 抄送归属列（`pageCcInstances` 的归属证据落在这一列上，与 OWNERSHIP_COLUMNS 里那枚同名）。 */
+const CC_OWNERSHIP_COLUMN = 'cc.actor_id'
+
+/**
+ * 抄送分页的**归属条件必填**判据（issues/141 G1 · spec 06 §2.5「抄送分页同一条尺子」）。
+ *
+ * 本栈的归属证据有两路：门面下发的**位置参** `actorId`（java 下发的是 `cc.actor_id EQ` 条件，
+ * 形状不同、义务相同）与 `conditions` 里打在 `cc.actor_id` 上的条件。判据：
+ *   ① 位置参无效（缺 / 空串 / 全空白 / null / 空集合）⇒ **空页**；
+ *   ② `conditions` 里凡是打在 `cc.actor_id` 上的条件，只要有一条值无效 ⇒ **空页**
+ *      （含 java 那格「空 IN ⇒ 空页」；这一路不看 operator，与 java `hasEffectiveCondition` 一致）；
+ *   ③ 非归属列（`m_LIKE_businessNo` 等**可选过滤**）的空值放行**不变**，仍按「没填」忽略——
+ *      本判据只看 `cc.actor_id`，绝不把可选过滤一起改成空页。
+ *
+ * ⚠️ 两仓（`JdbcRepository` / `MemoryRepository`）**共用这一份实现**，不是各写一遍：
+ * 「同一栈两个仓储两个答案」正是 issues/117 场景 27 立过法的形状，判据只留一处才不可能分叉。
+ */
+export function hasEffectiveCcOwnership(actorId: unknown, conditions?: QueryCondition[]): boolean {
+  if (isBlankOwnershipValue(actorId)) return false
+  for (const c of conditions ?? []) {
+    if (c.column !== CC_OWNERSHIP_COLUMN) continue
+    if (isBlankOwnershipValue(c.value)) return false
+  }
+  return true
+}
+
 // ── 统计行类型（v1.8.25，issues/103）──
 
 export interface InstanceStatsRow {
@@ -81,8 +119,39 @@ export interface ProcessRepository {
   createCcInstance(instanceId: string, creator: string, ...actorIds: string[]): Promise<void>
   updateCcStatus(instanceId: string, actorId: string): Promise<void>
 
+  /**
+   * issues/141 G2 写侧判重的**读侧**（spec 06 §4「抄送写侧判重＝幂等空操作」）：读某实例
+   * **已存在**的 cc 行 actor id，供建 cc 的三条入口（发起 `f_ccActors`／办理 `tf_ccActors`／
+   * 门面手动 `createCCInstance`）判重用——三条腿共用引擎那一支漏斗（§11.7）。
+   *
+   * <p>声明成**可选**是刻意的（java 侧对应 `IProcessRepository` 的 `default` 方法）：未实现的
+   * 第三方仓储走 {@link defaultCreateCcInstanceIfAbsent} ⇒ 视作「没有既有行」⇒ 全量建行、全量 fire，
+   * 与旧行为逐字一致，SPI 源码兼容不破。本包自带的两仓（`JdbcRepository` / `MemoryRepository`）
+   * **必须**实现：否则 G1 那条「同一栈 SQL 仓与内存仓两个答案」的分叉在写侧重演一遍。
+   */
+  findCcActorIds?(instanceId: string): Promise<string[]>
+
+  /**
+   * issues/141 G2：写侧**幂等**建 cc 行。同一 `(instanceId, actorId)` 已有 cc 行时**跳过**——
+   * ①不新增行 ②不重置未读状态（`state`）③不更新原行时间（`create_time`/`update_time` 逐字不变），
+   * 重复抄送同一个人是数据面上的 no-op（owner 2026-09-29 明确「不需要重置」，不产生"再提醒一次"语义）；
+   * 返回**实际新建**的 actor 子集（顺序与入参一致，同一次调用内的重复也折叠）。
+   *
+   * <p>为什么返回子集而不是 `void`：spec §11.2 原则 1「码值表达发生了什么事实」⇒ 没发生"创建"
+   * 就不得 fire `CC_CREATE`（码 4）。逐人 fire 的入参一律换成这个子集，子集为空整支不 fire。
+   * 查询侧不引入 DISTINCT、历史重复行也不清理（owner 拍为接受既成事实）。
+   *
+   * <p>未实现的仓储由 {@link defaultCreateCcInstanceIfAbsent} 兜出 java 的 `default` 语义。
+   */
+  createCcInstanceIfAbsent?(instanceId: string, creator: string, ...actorIds: string[]): Promise<string[]>
+
   // PageCcInstances 我的抄送分页（v1.3.0，对齐 Java pageCcInstances）：
-  // 按抄送人 actorId 过滤实例列表，返回行数据（含关联定义名/版本）+ 总数
+  // 按抄送人 actorId 过滤实例列表，返回行数据（含关联定义名/版本）+ 总数。
+  //
+  // ⚠️ **归属条件必填**（issues/141 G1 · spec 06 §2.5）：`cc.actor_id` 上没有有效归属证据（缺 / 空值三形 /
+  // 空集合）时必须返回**空页**（`rows=[]`、`total=0`），严禁退化成"这条不加"而返回全部实例；
+  // 判据是 {@link hasEffectiveCcOwnership}，SQL 仓与内存仓共用一份实现，两仓必须同答案。
+  // 非归属列的空值放行不受影响（`m_LIKE_*` 传空串仍按"没填"忽略）。
   pageCcInstances(pageNum: number, pageSize: number, actorId: string, conditions?: QueryCondition[]): Promise<{ rows: CcInstanceRow[]; total: number }>
 
   // ── 核心表分页（v1.5.0，对齐 Java pageDefines/pageInstances/pageTodoTasks/pageDoneTasks）──
@@ -101,6 +170,34 @@ export interface ProcessRepository {
   statsStuckNodeGroup(limit?: number): Promise<Record<string, any>[]>
   statsStuckApproverGroup(limit?: number): Promise<Record<string, any>[]>
   statsCompletedInstanceDurations(start?: Date | null, end?: Date | null): Promise<number[]>
+}
+
+/**
+ * issues/141 G2 —— java `IProcessRepository#createCcInstanceIfAbsent` 那条 `default` 在 TS 里的对应物
+ * （接口给不出默认实现，所以做成自由函数，两仓与引擎共用同一份判重逻辑）。
+ *
+ * 只依赖 `createCcInstance` ＋ 可选的 `findCcActorIds`，**不调用** `createCcInstanceIfAbsent`，
+ * 所以自带实现的仓储可以直接 `return defaultCreateCcInstanceIfAbsent(this, …)` 而不会自我递归。
+ *
+ * 行为：读该实例既有 cc 行 ⇒ 折掉已存在的人与本次入参内的重复 ⇒ 只插新人 ⇒ 返回**实际新建**的子集。
+ * 仓储未实现 `findCcActorIds` 时既有集合视作空 ⇒ 与旧 `createCcInstance` 全量插入逐字一致
+ * （java 的 default 同理，第三方仓储不被静默改变行为）。
+ */
+export async function defaultCreateCcInstanceIfAbsent(
+  repo: Pick<ProcessRepository, 'createCcInstance' | 'findCcActorIds'>,
+  instanceId: string,
+  creator: string,
+  actorIds: string[],
+): Promise<string[]> {
+  const existing = repo.findCcActorIds ? await repo.findCcActorIds(instanceId) : []
+  const fresh: string[] = []
+  for (const actorId of actorIds) {
+    if (actorId == null) continue
+    if (existing.includes(actorId) || fresh.includes(actorId)) continue
+    fresh.push(actorId)
+  }
+  if (fresh.length > 0) await repo.createCcInstance(instanceId, creator, ...fresh)
+  return fresh
 }
 
 export interface UserProvider {

@@ -13,7 +13,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { ProcessInstance, ProcessTask, type ProcessDefine, type CcInstanceRow, type DefineRow, type InstanceRow, type TaskRow } from '../model.js'
 import { InstanceState, TaskState } from '../model.js'
 import type { IDGenerator, ProcessRepository, QueryCondition, InstanceStatsRow, TaskStatsRow } from '../spi.js'
-import { isBlankOwnership, isBlankValue } from '../spi.js'
+import { isBlankOwnership, isBlankValue, hasEffectiveCcOwnership, defaultCreateCcInstanceIfAbsent } from '../spi.js'
 
 // ═══ 列白名单（issues/05-5，与 mldong-boot2 别名一致） ═══
 
@@ -481,18 +481,48 @@ export class JdbcRepository implements ProcessRepository {
   // ── CcInstance（抄送）─────────────────────────────────────────────────────
 
   async createCcInstance(instanceId: string, creator: string, ...actorIds: string[]): Promise<void> {
+    // issues/141 G2 写侧判重＝幂等空操作（spec 06 §4），与内存仓同一条判据：同一 (实例, 被抄送人)
+    // 已有 cc 行 ⇒ 直接跳过——①不新增行、②不重置未读（state 保持原值）、③不更新原行时间
+    // （不碰 UPDATE，create_time/update_time 逐字不变）。判重放在**写侧**而不是查询侧：
+    // 查询不引入 DISTINCT（owner 2026-09-29 拍），历史重复行也不清理。
+    const existing = await this.findCcActorIds(instanceId)
     const conn = await this.c()
     try {
       const now = new Date()
       for (const actorId of actorIds) {
+        if (actorId == null || existing.includes(actorId)) continue
         await conn.execute(this.sql(
           'INSERT INTO wf_process_cc_instance (id, process_instance_id, actor_id, state, ' +
           'create_time, create_user, update_time, update_user) VALUES (?,?,?,0,?,?,?,?)'),
           [this.idGen.nextId(), instanceId, actorId, now, creator, now, creator])
+        // 同一次调用内的重复也算"已存在"，只落一行
+        existing.push(actorId)
       }
     } finally {
       await this.done(conn)
     }
+  }
+
+  /**
+   * issues/141 G2：某实例已有的 cc 行 actor id（写侧判重的读侧，对齐 java `findCcActorIds`）。
+   * 排序按 id ASC 与本仓 `findTaskActors` 同形，让"既有集合"在两仓/跨驱动都稳定可断言。
+   * ⚠️ 查询侧不带 DISTINCT：判重在写侧，历史重复行原样返回（owner 拍为接受既成事实）。
+   */
+  async findCcActorIds(instanceId: string): Promise<string[]> {
+    const conn = await this.c()
+    try {
+      const rows = await conn.fetchAll(this.sql(
+        'SELECT actor_id FROM wf_process_cc_instance WHERE process_instance_id = ? ORDER BY id ASC'), [instanceId])
+      return rows.map(r => String(r.actor_id))
+    } finally {
+      await this.done(conn)
+    }
+  }
+
+  async createCcInstanceIfAbsent(instanceId: string, creator: string, ...actorIds: string[]): Promise<string[]> {
+    // spi 里那份 java default 的对应物（本仓的 findCcActorIds/createCcInstance 已自带判重，
+    // 本方法只负责把"实际新建的子集"回传给调用方去 fire）
+    return defaultCreateCcInstanceIfAbsent(this, instanceId, creator, actorIds)
   }
 
   async updateCcStatus(instanceId: string, actorId: string): Promise<void> {
@@ -677,8 +707,14 @@ export class JdbcRepository implements ProcessRepository {
 
   // pageCcInstances 我的抄送分页（v1.3.0）：cc 表 join 实例 + 定义，按抄送人过滤（对齐 Java pageCcInstances）
   async pageCcInstances(pageNum: number, pageSize: number, actorId: string, conditions?: QueryCondition[]): Promise<{ rows: CcInstanceRow[]; total: number }> {
-    // issues/129 案 A 第二层：位置参归属过滤（cc.actor_id）为空 ⇒ 空页（与内存仓/java 同判据）
-    if (isBlankValue(actorId)) return { rows: [], total: 0 }
+    // issues/141 G1 归属条件必填（spec 06 §2.5）：cc.actor_id 上没有有效归属证据 ⇒ 空页。
+    // 这一格补的是 issues/129 那把尺子的**延长档**：129 收了"归属列给了空值"（下面 buildWhere 的
+    // OWNERSHIP_COLUMNS ⇒ `AND 1=0`，位置参空值那一路也一并由 hasEffectiveCcOwnership 覆盖），
+    // G1 收的是"空集合也算没填"（`[]`/空 IN ⇒ 空页，而不是让数组下库或整条条件静默消失）。
+    // 旧形状在这一侧是 `FROM wf_process_instance t LEFT JOIN wf_process_cc_instance cc` 不带条件
+    // 返回**全部实例**（php PDO 那面反面教材），而它自家内存仓只放"有 cc 行的实例"——同一栈两仓
+    // 两个答案正是 issues/117 场景 27 立过法的形状，所以判据两仓共用 hasEffectiveCcOwnership 一份实现。
+    if (!hasEffectiveCcOwnership(actorId, conditions)) return { rows: [], total: 0 }
     const cond = this.buildWhere(conditions ?? [], CC_WHITELIST)
     const where = ' FROM wf_process_instance t' +
       ' LEFT JOIN wf_process_define pd ON t.process_define_id = pd.id' +

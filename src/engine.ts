@@ -5,6 +5,8 @@ import {
   InstanceState, TaskState, SubmitType,
 } from './model.js'
 import type { ProcessRepository, ProcessExtRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
+// issues/141 G2：cc 写侧判重的 java `default` 方法在 TS 里的对应物（第三方仓储未实现判重 SPI 时兜旧行为）
+import { defaultCreateCcInstanceIfAbsent } from './spi.js'
 import { type EngineExtensions, type FlowInterceptor, type AssignmentHandler, type DecisionHandler, type ProcessEventListener, EventType, type ProcessEvent } from './extensions.js'
 import { HandlerRegistry } from './registry.js'
 
@@ -286,19 +288,28 @@ export class EngineImpl implements Engine {
   /**
    * issues/127 / 规范 11 §11.7：抄送落库 ＋ 逐抄送人 fire CC_CREATE(4) 的**唯一漏斗**。
    * 行为基准＝Java `JeeflowEngineImpl.handleCcActors` + `notifyCcCreate`：
-   *   ① 先 `createCcInstance`（cc 行 INSERT 落库）② 再按 cc 行粒度逐人 fire，
+   *   ① 先建 cc 行（落库）② 再按 cc 行粒度逐人 fire，
    *   ccActorId 直传事件体（监听器免反查 cc 表）。
    * 三条路径（发起 f_ccActors／办理 tf_ccActors／手动 processInstance/createCCInstance）
    * 都走本函数 ⇒ §11.2 原则 1「同一事实只发一次、路径不进事件名」；入参为空零副作用。
+   *
+   * issues/141 G2 写侧判重＝幂等空操作（spec 06 §4）：建行走 `createCcInstanceIfAbsent`，
+   * 同一 (实例, 人) 已有 cc 行时跳过——不新增行、不重置未读、不更新原行时间；
+   * **逐人 fire 的入参是"实际新建的子集"而不是原始请求**（§11.2 原则 1「码=事实」：
+   * 没发生"创建"就不得发码 4），子集为空整支不 fire（不空转、也不照旧全量 fire）。
+   * 返回值同步改成那个子集（旧版返回"请求的抄送人"，与"实际新建"不是一回事）。
+   * 未实现判重 SPI 的第三方仓储由 `defaultCreateCcInstanceIfAbsent` 兜出旧行为（全量建行＋全量 fire）。
    */
   async handleCcActors(instanceId: string, operator: string, ccActors: any): Promise<string[]> {
     const actors = parseCcActors(ccActors)
     if (!actors.length || !instanceId) return actors
-    await this.repo.createCcInstance(instanceId, operator, ...actors)
-    for (const ccActorId of actors) {
+    const created = this.repo.createCcInstanceIfAbsent
+      ? await this.repo.createCcInstanceIfAbsent(instanceId, operator, ...actors)
+      : await defaultCreateCcInstanceIfAbsent(this.repo, instanceId, operator, actors)
+    for (const ccActorId of created) {
       await this.fireEvent({ type: EventType.CcCreate, instanceId, operator, ccActorId })
     }
-    return actors
+    return created
   }
 
   /**
