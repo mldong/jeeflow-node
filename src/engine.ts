@@ -6,7 +6,8 @@ import {
 } from './model.js'
 import type { ProcessRepository, ProcessExtRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
 // issues/141 G2：cc 写侧判重的 java `default` 方法在 TS 里的对应物（第三方仓储未实现判重 SPI 时兜旧行为）
-import { defaultCreateCcInstanceIfAbsent } from './spi.js'
+// issues/141 G10：抄送人单值/集合归一的**那一份**判据（漏斗层与写侧层共用，见 spi.normalizeCcActors）
+import { defaultCreateCcInstanceIfAbsent, normalizeCcActors } from './spi.js'
 import { type EngineExtensions, type FlowInterceptor, type AssignmentHandler, type DecisionHandler, type ProcessEventListener, EventType, type ProcessEvent } from './extensions.js'
 import { HandlerRegistry } from './registry.js'
 
@@ -37,18 +38,16 @@ export const KeyCcActors      = 'tf_ccActors'
  * 数组或逗号串都吃，逐项 trim、丢空项、按出现顺序去重。
  * 去重不是锦上添花：`createCcInstance` 逐行 INSERT，内存仓那侧还按实例去重，
  * 同一人写两次会"一行两事件"，破掉 §11.3「逐抄送人 fire 一次 ＝ cc 行粒度一一对应」。
+ *
+ * <p>issues/141 G10「空不创建行」（spec 06 §2.10）：本函数只留**形态**这一层（逗号串 vs 数组），
+ * 单值判据交给 `spi.normalizeCcActors` 那**一份**实现——漏斗层与写侧层（两仓 `createCcInstance`
+ * ＋ `defaultCreateCcInstanceIfAbsent`）共用同一条尺子，才不会出现"逗号串修好了、数组腿漏修"
+ * 或"门面挡住了、直连仓储照样灌空值"。丢完为空 ⇒ 调用方不建 cc 行、也不 fire 码 4。
+ * 反向哨兵同样由那一条判据保证：`"0"` 这类"看起来像空"的正常 id 不会被吃掉。
  */
 export function parseCcActors(v: any): string[] {
   const list = Array.isArray(v) ? v : (typeof v === 'string' ? v.split(',') : [])
-  const out: string[] = []
-  const seen = new Set<string>()
-  for (const raw of list) {
-    const s = String(raw ?? '').trim()
-    if (!s || seen.has(s)) continue
-    seen.add(s)
-    out.push(s)
-  }
-  return out
+  return normalizeCcActors(list)
 }
 
 /**
@@ -299,6 +298,12 @@ export class EngineImpl implements Engine {
    * 没发生"创建"就不得发码 4），子集为空整支不 fire（不空转、也不照旧全量 fire）。
    * 返回值同步改成那个子集（旧版返回"请求的抄送人"，与"实际新建"不是一回事）。
    * 未实现判重 SPI 的第三方仓储由 `defaultCreateCcInstanceIfAbsent` 兜出旧行为（全量建行＋全量 fire）。
+   *
+   * issues/141 G10「空不创建行」（spec 06 §2.10）：`parseCcActors` 已把空串/纯空白/数组里的空元素
+   * 丢干净，**丢完为空 ⇒ 直接返回、既不建 cc 行也不 fire 码 4**（本栈没有 java 那个
+   * `"".split(",")` 得到一个空元素的旧形状）。⚠️ 这一层只是**漏斗**，写侧两仓与
+   * `defaultCreateCcInstanceIfAbsent` 各自还要再挡一次——绕过门面/引擎直连仓储的调用方
+   * 同样不得把空归属值灌进 `actor_id`（两层缺一层就不算落地）。
    */
   async handleCcActors(instanceId: string, operator: string, ccActors: any): Promise<string[]> {
     const actors = parseCcActors(ccActors)

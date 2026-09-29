@@ -11,6 +11,8 @@ import { JdbcProcessExtRepository } from '../src/jdbc/ext.js'
 import { JeeflowFacade } from '../src/facade.js'
 import { InstanceState, TaskState, SubmitType, type ProcessDefine, ProcessInstance, ProcessTask } from '../src/model.js'
 import type { ExpressionEvaluator, UserProvider } from '../src/spi.js'
+// issues/141 G10：写侧兜底路径（java `default` 方法的 TS 对应物）＋ 单点判据要能直连测到
+import { defaultCreateCcInstanceIfAbsent } from '../src/spi.js'
 import { type FlowInterceptor, EventType, type EngineExtensions, type ProcessEvent,
   // issues/132 §11.6 改名兼容义务：旧成员名保留一代为别名（enum 外部的同值常量）
   ProcessStart, ProcessFinish, ProcessReject, TaskCreate, TaskComplete, CcCreate } from '../src/extensions.js'
@@ -5506,6 +5508,385 @@ describe('issues/141 G2 抄送写侧判重＝幂等空操作：①不新增行 �
     // 手动构造历史重复行（绕过写侧判重直接落两行）⇒ 查询侧原样出行、不去重
     rows.push({ id: 2, process_instance_id: '900004', actor_id: '8701', state: 0, create_time: new Date(), create_user: 'x', update_time: new Date(), update_user: 'x' })
     assert.deepEqual(await repo.findCcActorIds!('900004'), ['8701', '8701'], 'findCcActorIds 也不加 DISTINCT：重复行原样返回')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// issues/141 G10「空抄送人不建 cc 行」（owner 2026-09-29 拍：「空不创建行」）
+// 判据源＝jeeflow-doc/docs/spec/06-facade.md §2.10。行为基准＝jeeflow-java 5fbd5ac
+// （CcBlankActorDroppedTest 13 格 ＋ JdbcCcOwnershipIdempotentTest 的 G10 六格）。
+// 四条实现要求逐条钉住：
+//   ① 三条入口（发起 f_ccActors／办理 tf_ccActors／门面手动 createCCInstance）解析抄送人集合时
+//      空串、纯空白、数组里的空元素一律丢弃；丢完为空 ⇒ 不建任何 cc 行、也不 fire CC_CREATE(4)；
+//      逗号串与数组两种形态同判据（只修一条腿正是本条要抓的形状）。
+//   ② 两层都挡——漏斗层（engine.handleCcActors／parseCcActors）＋ 写侧层（两仓 createCcInstance
+//      ＋ spi.defaultCreateCcInstanceIfAbsent）。只修漏斗，绕过门面/引擎直连仓储的调用方照样灌空值。
+//   ③ 落库与比较一律取 trim 后的值：" 123 " 与 "123" 是同一个人（不 trim 就把 G2 的写侧判重打穿）。
+//   ④ 反向哨兵："0" 这类"看起来像空"的正常 id 不得被当空值丢掉；手动腿丢完为空与本仓既有的
+//      "空 actorIds"档同判（沿用 'actorIds 缺失' 文案，不新造错误码/文案）。
+// node 侧的旧形状与 java 不同：漏斗 parseCcActors 本就丢空（没有 `"".split(",")` 得一空元素的洞），
+// 洞在**手动腿的 toStringList2**（`v.map(String)` 把 null 变成字面量 "null" 的假归属人）与
+// **两仓写侧＋spi default**（只挡 null，空串/纯空白/未 trim 一律放行）——G10 收的就是这两处。
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('issues/141 G10 空抄送人不建 cc 行：空串/纯空白/数组空元素一律丢弃 ⇒ 不建行、不 fire 码 4（三入口＋两仓同判据）', () => {
+  /** 内存仓一路夹具：引擎＋门面＋只收 CC_CREATE 的事件 sink（与 G2 块同款，互不串味）。 */
+  function harnessG10() {
+    const { engine, repo } = setup()
+    const fired: ProcessEvent[] = []
+    engine.setExtensions({ listeners: [(e) => { if (e.type === EventType.CcCreate) fired.push({ ...e }) }] })
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    return { engine, repo, facade, fired }
+  }
+  const firedIds = (events: ProcessEvent[]) => events.map(e => e.ccActorId)
+
+  async function defineOf10(facade: JeeflowFacade): Promise<string> {
+    const r = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    return String(r.data.processDefineId)
+  }
+  async function start10(facade: JeeflowFacade, defineId: string, extra: Record<string, any> = {}): Promise<string> {
+    const r = await facade.flow('processInstance/startAndExecute', { processDefineId: defineId, operator: 'zhangsan', ...extra })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    return String(r.data.processInstanceId)
+  }
+  /** 手动腿原始返回（全空白档要看它是不是与"空集合"同档，不能假定成功）。 */
+  const manualRaw = (facade: JeeflowFacade, instanceId: string, actorIds: any) =>
+    facade.flow('processInstance/createCCInstance', { processInstanceId: instanceId, operator: 'zhangsan', actorIds })
+  async function manualOk(facade: JeeflowFacade, instanceId: string, actorIds: any) {
+    const r = await manualRaw(facade, instanceId, actorIds)
+    assert.equal(r.code, 0, `手动抄送应成功: ${JSON.stringify(r)}`)
+  }
+  /** 办理腿：给实例上唯一待办办理并带 tf_ccActors。 */
+  async function executeCc10(facade: JeeflowFacade, repo: MemoryRepository, instanceId: string, ccActors: any) {
+    const task = (await repo.findDoingTasks(instanceId))[0]
+    const r = await facade.flow('processTask/execute', {
+      processTaskId: task.id, operator: 'leader', submitType: SubmitType.Agree, tf_ccActors: ccActors,
+    })
+    assert.equal(r.code, 0, `办理应成功: ${JSON.stringify(r)}`)
+  }
+
+  /**
+   * SQL 仓一路的 T0 假适配器（与 G2 块那个同款、只装 cc 写侧用得上的两条语句）：
+   * 内存里养一张 `wf_process_cc_instance`，逐条记录语句 ⇒ 不连任何数据库、不开端口，
+   * "空值不得下库"看的是 INSERT 流水而不是返回值。
+   */
+  function ccTableG10() {
+    const rows: Array<Record<string, any>> = []
+    const stmts: Array<{ sql: string; args: any[] }> = []
+    const conn: any = {
+      async execute(sql: string, args: any[]) {
+        stmts.push({ sql, args })
+        if (/^INSERT INTO wf_process_cc_instance/.test(sql)) {
+          rows.push({ id: args[0], process_instance_id: args[1], actor_id: args[2], state: 0, create_time: args[3], create_user: args[4], update_time: args[5], update_user: args[6] })
+          return
+        }
+        throw new Error(`假适配器收到未预期语句: ${sql}`)
+      },
+      async fetchAll(sql: string, args: any[]) {
+        stmts.push({ sql, args })
+        if (/^SELECT actor_id FROM wf_process_cc_instance/.test(sql)) {
+          return rows.filter(r => String(r.process_instance_id) === String(args[0])).map(r => ({ actor_id: r.actor_id }))
+        }
+        throw new Error(`假适配器收到未预期语句: ${sql}`)
+      },
+      async fetchOne() { return null },
+      async begin() {}, async commit() {}, async rollback() {},
+    }
+    const adapter: any = { placeholder: '?', async acquire() { return conn }, async release() {} }
+    const repo = new JdbcRepository(adapter)
+    const inserts = () => stmts.filter(s => /^INSERT INTO wf_process_cc_instance/.test(s.sql))
+    return { repo, rows, stmts, inserts }
+  }
+
+  // ═══ 正向对照（G10 不得把好行为改坏）═══
+
+  it('正向对照 · 非空抄送人照旧逐人建行、逐人 fire 码 4', async () => {
+    const { repo, facade, fired } = harnessG10()
+    const instanceId = await start10(facade, await defineOf10(facade))
+    fired.length = 0
+
+    await manualOk(facade, instanceId, ['9101', '9102'])
+
+    assert.deepEqual(await repo.findCcActorIds(instanceId), ['9101', '9102'], '正向对照：非空抄送人照旧逐人落行')
+    assert.deepEqual(firedIds(fired), ['9101', '9102'], '正向对照：照旧逐人 fire 码 4')
+  })
+
+  // ═══ 手动腿 ═══
+
+  it('G10 手动腿 · 丢完为空 ⇒ 不建行、不 fire，且与既有"空 actorIds"档同判（actorIds 缺失，不新造文案）', async () => {
+    const { repo, facade, fired } = harnessG10()
+    const defineId = await defineOf10(facade)
+    // 参照档：本仓既有的"空集合"判据（空数组）——所有空白档必须与它同一个答案
+    const refIid = await start10(facade, defineId)
+    const ref = await manualRaw(facade, refIid, [])
+    assert.equal(ref.code, 99999999, `参照档应报错: ${JSON.stringify(ref)}`)
+    assert.ok(ref.msg.includes('actorIds 缺失'), ref.msg)
+
+    for (const [label, actorIds] of [
+      ["'' 空串", ''], ["'   ' 纯空白", '   '], ["['']", ['']], ["['  ']", ['  ']],
+      ["['', '   ']", ['', '   ']], ["[null]", [null]], ["[undefined]", [undefined]],
+      ["[null, undefined]", [null, undefined]],
+    ] as Array<[string, any]>) {
+      fired.length = 0
+      const instanceId = await start10(facade, defineId)
+      const r = await manualRaw(facade, instanceId, actorIds)
+      assert.equal(r.code, ref.code, `${label} 应与空集合同档（code）: ${JSON.stringify(r)}`)
+      assert.equal(r.msg, ref.msg, `${label} 应与空集合同档（msg 逐字，不新造文案）`)
+      assert.deepEqual(await repo.findCcActorIds(instanceId), [], `G10：${label} 不得建任何 cc 行`)
+      assert.equal(fired.length, 0, `G10：${label} 不得 fire 码 4，实收 ${JSON.stringify(firedIds(fired))}`)
+    }
+  })
+
+  it('G10 手动腿 · 混给只丢空的：有效的人照旧建行＋fire，不得落出空 actor_id 行', async () => {
+    const { repo, facade, fired } = harnessG10()
+    const instanceId = await start10(facade, await defineOf10(facade))
+    fired.length = 0
+
+    await manualOk(facade, instanceId, ['9301', '', '  ', '9302'])
+
+    assert.deepEqual(await repo.findCcActorIds(instanceId), ['9301', '9302'], '数组里的空元素丢弃、有效元素保留')
+    assert.equal(repo.ccRowsForTest(instanceId).length, 2, `不得落出 actor_id='' 的行，实有 ${repo.ccRowsForTest(instanceId).length} 行`)
+    assert.deepEqual(firedIds(fired), ['9301', '9302'], 'fire 的入参只含有效的人')
+  })
+
+  it('G10 手动腿 · 数组里的 null/undefined 是空值，不是字面量 "null"/"undefined" 假归属人（node 侧 toStringList2 旧形状）', async () => {
+    const { repo, facade, fired } = harnessG10()
+    const instanceId = await start10(facade, await defineOf10(facade))
+    fired.length = 0
+
+    await manualOk(facade, instanceId, ['9401', null, undefined])
+
+    assert.deepEqual(await repo.findCcActorIds(instanceId), ['9401'],
+      `null/undefined 必须丢弃，不得被 String() 串化成 "null"/"undefined" 落进 actor_id`)
+    assert.deepEqual(firedIds(fired), ['9401'], '事件里也不得出现串化后的假归属人')
+  })
+
+  // ═══ 发起腿 f_ccActors（逗号串与数组两形态同判据）═══
+
+  it('G10 发起腿 · f_ccActors 给空串 ⇒ 不建行、不 fire（java 旧形状 "".split(",") 得一空元素的对手戏）', async () => {
+    const { repo, facade, fired } = harnessG10()
+    const defineId = await defineOf10(facade)
+    fired.length = 0
+
+    const instanceId = await start10(facade, defineId, { f_ccActors: '' })
+    assert.deepEqual(await repo.findCcActorIds(instanceId), [], 'G10：空串不得建 cc 行')
+    assert.equal(fired.length, 0, 'G10：空串不得 fire 码 4')
+
+    const instanceId2 = await start10(facade, defineId, { f_ccActors: '   ' })
+    assert.deepEqual(await repo.findCcActorIds(instanceId2), [], 'G10：纯空白同样不建行')
+    assert.equal(fired.length, 0, 'G10：纯空白同样不 fire')
+  })
+
+  it('G10 发起腿 · 逗号串里的空元素与尾随逗号丢弃，有效的人照旧建行＋fire', async () => {
+    const { repo, facade, fired } = harnessG10()
+    const defineId = await defineOf10(facade)
+    fired.length = 0
+
+    const iid = await start10(facade, defineId, { f_ccActors: '9501,,9502' })
+    assert.deepEqual(await repo.findCcActorIds(iid), ['9501', '9502'], '逗号串空元素丢弃')
+    assert.deepEqual(firedIds(fired), ['9501', '9502'], '逐有效人 fire')
+
+    fired.length = 0
+    const iid2 = await start10(facade, defineId, { f_ccActors: '9503,' })
+    assert.deepEqual(await repo.findCcActorIds(iid2), ['9503'], '尾随逗号不得建空行')
+    assert.deepEqual(firedIds(fired), ['9503'], '尾随逗号只 fire 有效的人')
+  })
+
+  it('G10 发起腿 · 数组形态含空元素与逗号串同判据（只修一条腿＝本条要抓的形状）', async () => {
+    const { repo, facade, fired } = harnessG10()
+    fired.length = 0
+
+    const iid = await start10(facade, await defineOf10(facade), { f_ccActors: ['9601', '', '  '] })
+    assert.deepEqual(await repo.findCcActorIds(iid), ['9601'], '数组形态与逗号串同判据')
+    assert.deepEqual(firedIds(fired), ['9601'], '数组形态只 fire 有效的人')
+  })
+
+  // ═══ 办理腿 tf_ccActors ═══
+
+  it('G10 办理腿 · tf_ccActors 纯空白/空串 ⇒ 不建行、不 fire', async () => {
+    const { repo, facade, fired } = harnessG10()
+    const defineId = await defineOf10(facade)
+
+    for (const [label, ccActors] of [["'   ' 纯空白", '   '], ["'' 空串", ''], ["['']", ['']], ["['  ','']", ['  ', '']]] as Array<[string, any]>) {
+      const instanceId = await start10(facade, defineId)
+      fired.length = 0
+      await executeCc10(facade, repo, instanceId, ccActors)
+      assert.deepEqual(await repo.findCcActorIds(instanceId), [], `G10：办理腿 ${label} 不得建 cc 行`)
+      assert.equal(fired.length, 0, `G10：办理腿 ${label} 不得 fire 码 4`)
+    }
+  })
+
+  it('G10 办理腿 · 尾随逗号与混给只丢空的（逗号串/数组两形态同判）', async () => {
+    const { repo, facade, fired } = harnessG10()
+    const defineId = await defineOf10(facade)
+
+    const iid = await start10(facade, defineId)
+    fired.length = 0
+    await executeCc10(facade, repo, iid, '9701,')
+    assert.deepEqual(await repo.findCcActorIds(iid), ['9701'], '办理腿尾随逗号不得建空行')
+    assert.deepEqual(firedIds(fired), ['9701'], '办理腿只 fire 有效的人')
+
+    const iid2 = await start10(facade, defineId)
+    fired.length = 0
+    await executeCc10(facade, repo, iid2, ['9702', '', '  ', '9703'])
+    assert.deepEqual(await repo.findCcActorIds(iid2), ['9702', '9703'], '办理腿数组形态同样只丢空的')
+    assert.deepEqual(firedIds(fired), ['9702', '9703'])
+  })
+
+  // ═══ trim：落库与比较一律取 trim 后的值（与 G2 判重咬合）═══
+
+  it('G10 落库值取 trim 后的串 · " 9801 " 与 "9801" 是同一个人', async () => {
+    const { repo, facade, fired } = harnessG10()
+    const instanceId = await start10(facade, await defineOf10(facade))
+    fired.length = 0
+
+    await manualOk(facade, instanceId, [' 9801 ', '9802'])
+
+    assert.deepEqual(await repo.findCcActorIds(instanceId), ['9801', '9802'], '入库值应是 trim 后的串')
+    assert.deepEqual(firedIds(fired), ['9801', '9802'], 'fire 的 ccActorId 也取 trim 后的值')
+  })
+
+  it('G10 trim 后同值命中 G2 判重 · 先抄 9901 再抄 " 9901 " ⇒ 仍 1 行、0 新 fire', async () => {
+    const { repo, facade, fired } = harnessG10()
+    const instanceId = await start10(facade, await defineOf10(facade))
+    await manualOk(facade, instanceId, ['9901'])
+    fired.length = 0
+
+    await manualOk(facade, instanceId, [' 9901 '])
+
+    assert.deepEqual(await repo.findCcActorIds(instanceId), ['9901'], '带空格的同一人不得再建第二行（不 trim 就把 G2 判重打穿）')
+    assert.equal(repo.ccRowsForTest(instanceId).length, 1, '库里仍是那一行')
+    assert.equal(fired.length, 0, `判重命中 ⇒ 不 fire 码 4，实收 ${JSON.stringify(firedIds(fired))}`)
+  })
+
+  // ═══ 写侧兜底：绕过引擎/门面直连仓储也建不出空行 ═══
+
+  it('G10 内存仓写侧兜底 · 直连 createCcInstance：空串/纯空白/null 丢弃 ＋ 落库值 trim', async () => {
+    const { repo } = harnessG10()
+    await repo.createCcInstance('G10-M1', 'zhangsan', '', '   ', null as any, undefined as any, ' 8501 ', '8501')
+
+    assert.deepEqual(await repo.findCcActorIds('G10-M1'), ['8501'], '仓储写侧空串/纯空白/null 都不建行，值取 trim 后的串')
+    assert.equal(repo.ccRowsForTest('G10-M1').length, 1, `只落那一行（" 8501 " 与 "8501" 是同一个人），实有 ${repo.ccRowsForTest('G10-M1').length} 行`)
+
+    const { repo: fresh } = harnessG10()
+    await fresh.createCcInstance('G10-M2', 'zhangsan', '')
+    assert.deepEqual(fresh.ccRowsForTest('G10-M2'), [], 'createCcInstance(id, creator, \'\') ⇒ 零行（本条普查的正主）')
+  })
+
+  it('G10 内存仓 IfAbsent · 返回的子集不含空值；全空入参 ⇒ 一行不建', async () => {
+    const { repo } = harnessG10()
+
+    const created = await repo.createCcInstanceIfAbsent!('G10-M3', 'zhangsan', '', '8601', '  ')
+    assert.deepEqual(created, ['8601'], '实际新建子集只含有效的人（子集是拿去 fire 的那一份）')
+    assert.deepEqual(await repo.findCcActorIds('G10-M3'), ['8601'], '子集与落库行一致')
+
+    const created2 = await repo.createCcInstanceIfAbsent!('G10-M4', 'zhangsan', '', '   ', null as any)
+    assert.deepEqual(created2, [], '全空入参 ⇒ 子集为空')
+    assert.deepEqual(repo.ccRowsForTest('G10-M4'), [], '全空入参 ⇒ 不建任何 cc 行')
+  })
+
+  it('G10 判据单点 · spi.defaultCreateCcInstanceIfAbsent（第三方仓储兜底路径）同样丢空，全空时连 createCcInstance 都不调用', async () => {
+    const calls: string[][] = []
+    const thirdParty: any = {
+      async createCcInstance(_id: string, _creator: string, ...actors: string[]) { calls.push(actors) },
+    }
+
+    const created = await defaultCreateCcInstanceIfAbsent(thirdParty, 'G10-S1', 'zhangsan', ['', '  ', '8701', ' 8702 '])
+    assert.deepEqual(created, ['8701', '8702'], '子集不含空值且取 trim 后的串')
+    assert.deepEqual(calls, [['8701', '8702']], '递给 createCcInstance 的入参也必须是归一后的集合')
+
+    calls.length = 0
+    const empty = await defaultCreateCcInstanceIfAbsent(thirdParty, 'G10-S2', 'zhangsan', ['', '   ', null as any])
+    assert.deepEqual(empty, [], '全空 ⇒ 子集为空')
+    assert.equal(calls.length, 0, '全空 ⇒ 最底层写入口一次都不被调用（不建行为主）')
+  })
+
+  // ═══ 反向哨兵 ═══
+
+  it('G10 反向哨兵 · "0" 这类"看起来像空"的正常 id 不得被当空值丢掉（三入口同判）', async () => {
+    const { repo, facade, fired } = harnessG10()
+    const defineId = await defineOf10(facade)
+
+    fired.length = 0
+    const manual = await start10(facade, defineId)
+    await manualOk(facade, manual, ['0', 'user-1'])
+    assert.deepEqual(await repo.findCcActorIds(manual), ['0', 'user-1'], "G10 只丢空串/纯空白：'0' 这类正常 id 不得被吃掉")
+    assert.equal(fired.length, 2, '反向哨兵：照旧逐人 fire')
+
+    fired.length = 0
+    const startLeg = await start10(facade, defineId, { f_ccActors: '0' })
+    assert.deepEqual(await repo.findCcActorIds(startLeg), ['0'], "发起腿 '0' 照旧建行")
+    assert.deepEqual(firedIds(fired), ['0'], "发起腿 '0' 照旧 fire")
+
+    fired.length = 0
+    const execLeg = await start10(facade, defineId)
+    await executeCc10(facade, repo, execLeg, ['0'])
+    assert.deepEqual(await repo.findCcActorIds(execLeg), ['0'], "办理腿 ['0'] 照旧建行")
+    assert.deepEqual(firedIds(fired), ['0'], "办理腿 ['0'] 照旧 fire")
+  })
+
+  // ═══ SQL 仓一路 ═══
+
+  it('G10 SQL 仓写侧兜底 · 直连 createCcInstance：空值一条 INSERT 都不发，落库值取 trim 后的串', async () => {
+    const { repo, rows, inserts } = ccTableG10()
+
+    await repo.createCcInstance('900101', 'zhangsan', '', '   ', null as any, undefined as any, ' 8501 ', '8501')
+
+    assert.equal(inserts().length, 1, `空串/纯空白/null 不得下库，实发 ${inserts().length} 条 INSERT`)
+    assert.deepEqual(rows.map(r => r.actor_id), ['8501'], '绑进 actor_id 的值是 trim 后的串，且 " 8501 " 与 "8501" 只落一行')
+    assert.deepEqual(await repo.findCcActorIds('900101'), ['8501'])
+  })
+
+  it('G10 SQL 仓 IfAbsent · 子集不含空值；全空入参 ⇒ 零 INSERT', async () => {
+    const { repo, rows, inserts } = ccTableG10()
+
+    const created = await repo.createCcInstanceIfAbsent!('900102', 'zhangsan', '', '8601', '  ')
+    assert.deepEqual(created, ['8601'], '返回的子集只含实际新建的有效人')
+    assert.equal(inserts().length, 1, `只插一条，实发 ${inserts().length} 条`)
+
+    const before = inserts().length
+    const empty = await repo.createCcInstanceIfAbsent!('900102', 'zhangsan', '', '   ', null as any)
+    assert.deepEqual(empty, [], '全空 ⇒ 子集为空')
+    assert.equal(inserts().length, before, '全空 ⇒ 一条 INSERT 都不许多发')
+    assert.deepEqual(rows.map(r => r.actor_id), ['8601'], '库里没有空行')
+  })
+
+  it('G10 SQL 仓 trim 后同值命中判重 · 已抄 8701 再抄 " 8701 " ⇒ 不多发一条 INSERT', async () => {
+    const { repo, rows, inserts } = ccTableG10()
+
+    await repo.createCcInstance('900103', 'zhangsan', '8701')
+    const before = inserts().length
+    await repo.createCcInstance('900103', 'zhangsan', ' 8701 ')
+
+    assert.equal(inserts().length, before, `带空格的同一人必须命中判重（不 trim 就落两行），实多发 ${inserts().length - before} 条`)
+    assert.deepEqual(rows.map(r => r.actor_id), ['8701'], '库里只有那一行')
+  })
+
+  it('G10 两仓同答案 · 同一组入参在内存仓与 SQL 仓得到同一个 actor 集合（issues/117 场景 27 那把尺子）', async () => {
+    const vectors: Array<{ label: string; actors: any[] }> = [
+      { label: '空串/纯空白/null/未 trim 同人混给', actors: ['', '   ', null, undefined, ' 8501 ', '8501'] },
+      { label: '有效人夹空元素', actors: ['8502', '', '8503'] },
+      { label: '只有带空格的一个人', actors: [' 8504 '] },
+      { label: '反向哨兵 "0" 与带横线 id', actors: ['0', 'user-1'] },
+      { label: '全空', actors: ['', '  '] },
+      { label: '同一次调用内的重复', actors: ['8505', ' 8505 ', '8505'] },
+    ]
+    for (const [idx, { label, actors }] of vectors.entries()) {
+      const mem = new MemoryRepository()
+      const sql = ccTableG10().repo
+      const memIds = `G10-X-${idx}`
+      const sqlIds = `9002${idx}0`
+      await mem.createCcInstance(memIds, 'zhangsan', ...(actors as string[]))
+      await sql.createCcInstance(sqlIds, 'zhangsan', ...(actors as string[]))
+      const a = await mem.findCcActorIds(memIds)
+      const b = await sql.findCcActorIds(sqlIds)
+      assert.deepEqual(a, b, `「${label}」两仓必须同答案：内存仓出 ${JSON.stringify(a)}，SQL 仓出 ${JSON.stringify(b)}`)
+    }
+    // 逐档的真值（同答案还不够，还得答案是"只丢空的"那一个）
+    const mem = new MemoryRepository()
+    await mem.createCcInstance('G10-X-9', 'zhangsan', '', '   ', null as any, undefined as any, ' 8501 ', '8501')
+    assert.deepEqual(await mem.findCcActorIds('G10-X-9'), ['8501'], '混给档的期望真值')
   })
 })
 

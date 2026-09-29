@@ -74,6 +74,50 @@ export function hasEffectiveCcOwnership(actorId: unknown, conditions?: QueryCond
   return true
 }
 
+/**
+ * 抄送人**单个**入参的归一值（issues/141 G10「空不创建行」· spec 06-facade.md §2.10）：
+ * `null`/`undefined` ⇒ 空串（即"没有归属人"）；其余取 `String(val).trim()`。
+ *
+ * ⚠️ 落库与比较一律用这个返回值，`" 123 "` 与 `"123"` 是同一个人——不 trim 就会与 §4 的
+ * 写侧判重错开、同一人落两行。反向哨兵：判据只吃空值，`"0"` 这类"看起来像空"的正常 id
+ * 归一后是 `"0"`，**不得**被丢掉。
+ */
+export function normalizeCcActorValue(val: unknown): string {
+  if (val == null) return ''
+  return String(val).trim()
+}
+
+/**
+ * 抄送人**集合**归一（issues/141 G10「空不创建行」· spec 06-facade.md §2.10，
+ * 对齐 java `StringUtils.normalizeCcActors`）：逐元素 {@link normalizeCcActorValue}，
+ * **空串 / 纯空白 / null / undefined 一律丢弃**，同一次调用内的重复折叠，顺序保持。
+ * 丢完为空 ⇒ 调用方**不得建 cc 行、也不得 fire 码 4**（CC_CREATE）。
+ *
+ * ⚠️ **单点判据**（本仓 G1 的先例：判据函数放 spi.ts，两仓共用，见 `isBlankOwnershipValue`／
+ * `hasEffectiveCcOwnership`）：漏斗层（`engine.parseCcActors` ＋ 门面手动腿）与写侧层
+ * （`MemoryRepository.createCcInstance` ＋ `JdbcRepository.createCcInstance` ＋
+ * {@link defaultCreateCcInstanceIfAbsent}）都走这一份实现，严禁各抄一遍——
+ * 只修漏斗，绕过门面/引擎直连仓储的调用方照样能把空归属值灌进 `actor_id`，
+ * 那正是 issues/129 那族"空 operator 读全库"的病根。
+ *
+ * 逗号串与数组两种形态在本函数之上由 `engine.parseCcActors` 收敛成同一个数组再进来，
+ * 两形同判据（spec §2.10「别只修一条腿」）。
+ *
+ * @param raw 抄送人数组（rest 参数产物 / 已按逗号切开的元素集）；非数组按"没有抄送人"处理
+ */
+export function normalizeCcActors(raw: readonly unknown[] | null | undefined): string[] {
+  const out: string[] = []
+  if (!Array.isArray(raw)) return out
+  const seen = new Set<string>()
+  for (const item of raw) {
+    const actor = normalizeCcActorValue(item)
+    if (!actor || seen.has(actor)) continue
+    seen.add(actor)
+    out.push(actor)
+  }
+  return out
+}
+
 // ── 统计行类型（v1.8.25，issues/103）──
 
 export interface InstanceStatsRow {
@@ -116,6 +160,15 @@ export interface ProcessRepository {
   addTaskActor(taskId: string, actors: string[]): Promise<void>
   removeTaskActor(taskId: string, actors: string[]): Promise<void>
 
+  /**
+   * 建 cc 行的**最底层写入口**（`wf_process_cc_instance`）。
+   *
+   * <p>issues/141 G10「空不创建行」（spec 06 §2.10）：入参里的<b>空串、纯空白、`null`/`undefined`
+   * 一律丢弃</b>，落库值取 trim 后的串。判据要落在这一层而不只落在引擎漏斗里——绕过
+   * `handleCcActors` 直连仓储的调用方（集成层、第三方仓储消费者）同样不得把空归属值灌进
+   * `actor_id`，那正是 issues/129 那族"空 operator 读全库"的病根。实现方请复用
+   * {@link normalizeCcActorValue}／{@link normalizeCcActors}，别各写一套。</p>
+   */
   createCcInstance(instanceId: string, creator: string, ...actorIds: string[]): Promise<void>
   updateCcStatus(instanceId: string, actorId: string): Promise<void>
 
@@ -142,6 +195,9 @@ export interface ProcessRepository {
    * 查询侧不引入 DISTINCT、历史重复行也不清理（owner 拍为接受既成事实）。
    *
    * <p>未实现的仓储由 {@link defaultCreateCcInstanceIfAbsent} 兜出 java 的 `default` 语义。
+   *
+   * <p>issues/141 G10：入参里的空串/纯空白/null 同样先被 {@link normalizeCcActors} 丢掉，
+   * 返回的子集**不可能**含空值（子集是拿去 fire 码 4 的那一份）。
    */
   createCcInstanceIfAbsent?(instanceId: string, creator: string, ...actorIds: string[]): Promise<string[]>
 
@@ -182,6 +238,11 @@ export interface ProcessRepository {
  * 行为：读该实例既有 cc 行 ⇒ 折掉已存在的人与本次入参内的重复 ⇒ 只插新人 ⇒ 返回**实际新建**的子集。
  * 仓储未实现 `findCcActorIds` 时既有集合视作空 ⇒ 与旧 `createCcInstance` 全量插入逐字一致
  * （java 的 default 同理，第三方仓储不被静默改变行为）。
+ *
+ * <p>issues/141 G10「空不创建行」（spec 06 §2.10）：入参先过 {@link normalizeCcActors}——
+ * 空串/纯空白/null 丢弃、值取 trim 后的串，所以**返回的子集里没有空值**（子集是拿去 fire 码 4 的
+ * 那一份），全空入参 ⇒ `fresh` 为空 ⇒ 连 `createCcInstance` 都不调用。本函数是 java 那条 `default`
+ * 的对应物，也是"写侧兜底"这一层：漏斗修好了、绕过引擎直连仓储的调用方仍在这里被同一判据挡住。
  */
 export async function defaultCreateCcInstanceIfAbsent(
   repo: Pick<ProcessRepository, 'createCcInstance' | 'findCcActorIds'>,
@@ -190,9 +251,9 @@ export async function defaultCreateCcInstanceIfAbsent(
   actorIds: string[],
 ): Promise<string[]> {
   const existing = repo.findCcActorIds ? await repo.findCcActorIds(instanceId) : []
+  // issues/141 G10：先归一（空值丢弃＋trim＋同次折叠），再与既有行判重——与 G2 同一条尺子
   const fresh: string[] = []
-  for (const actorId of actorIds) {
-    if (actorId == null) continue
+  for (const actorId of normalizeCcActors(actorIds)) {
     if (existing.includes(actorId) || fresh.includes(actorId)) continue
     fresh.push(actorId)
   }

@@ -2,7 +2,7 @@ import { TaskState } from './model.js'
 import type { CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDefine } from './model.js'
 import { cloneInstance, cloneTask, type ProcessInstance, type ProcessTask } from './model.js'
 import type { ProcessRepository, QueryCondition } from './spi.js'
-import { hasEffectiveCcOwnership, isBlankOwnership, defaultCreateCcInstanceIfAbsent } from './spi.js'
+import { hasEffectiveCcOwnership, isBlankOwnership, defaultCreateCcInstanceIfAbsent, normalizeCcActorValue } from './spi.js'
 
 // ═══ 条件匹配基建（issues/05-5，对齐 JDBC 白名单语义） ═══
 
@@ -256,9 +256,14 @@ export class MemoryRepository implements ProcessRepository {
     // issues/141 G2 写侧判重＝幂等空操作（spec 06 §4），与 JdbcRepository.createCcInstance 同一条判据：
     // 同一 (实例, 被抄送人) 已有 cc 行 ⇒ 跳过——①不新增行、②不重置未读（state 保持原值）、
     // ③不更新原行时间（createTime/updateTime 逐字不变）。判重在写侧，查询侧不引入去重。
+    //
+    // issues/141 G10「空不创建行」（spec 06 §2.10）：与 JdbcRepository 同一判据、同一份实现
+    // （`spi.normalizeCcActorValue`）——空串/纯空白/null 丢弃，落库值取 trim 后的串。
+    // 两仓必须同答案（issues/117 场景 27 那把尺子），且这一层是"绕过引擎/门面直连仓储"的兜底。
     const rows = this.ccInstances.get(instanceId) ?? []
-    for (const actorId of actorIds) {
-      if (actorId == null || rows.some(r => r.actorId === actorId)) continue
+    for (const rawActorId of actorIds) {
+      const actorId = normalizeCcActorValue(rawActorId)
+      if (!actorId || rows.some(r => r.actorId === actorId)) continue
       const now = new Date()
       rows.push({ actorId, state: 0, createTime: now, updateTime: now })
     }

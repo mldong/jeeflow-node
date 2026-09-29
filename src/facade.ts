@@ -10,7 +10,7 @@ import {
 } from './model.js'
 import type { OrgUserProvider, ProcessExtRepository, ProcessRepository, QueryCondition } from './spi.js'
 import type { EngineImpl } from './engine.js'
-import { KeyAutoExecute, KeyAdminID, KeyCcActorsStart, KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign } from './engine.js'
+import { KeyAutoExecute, KeyAdminID, KeyCcActorsStart, KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign, parseCcActors } from './engine.js'
 import { EventType } from './extensions.js'
 
 // submitType 枚举（对齐 boot3）
@@ -835,7 +835,11 @@ export class JeeflowFacade {
   private async createCCInstance(args: Record<string, any>): Promise<void> {
     const instanceId = toId(args.processInstanceId)
     const operator = operatorArg(args)
-    const actors = toStringList2(args.actorIds)
+    // issues/141 G10「空不创建行」（spec 06 §2.10）：手动腿与引擎两条腿走**同一个**归一函数
+    // （`engine.parseCcActors` → `spi.normalizeCcActors`，逗号串与数组两形同判据）——
+    // 空串/纯空白/数组里的空元素（含 null，`String(null)` 会变成字面量 "null" 那条假归属人）一律丢弃；
+    // 丢完为空 ⇒ 与上面那条"空集合＝actorIds 缺失"同档（沿用既有文案，不新造错误码/文案）。
+    const actors = parseCcActors(args.actorIds)
     if (actors.length === 0) throw new Error('actorIds 缺失')
     // issues/102 ＋ issues/127/132：手动 CC 与发起/办理两条腿同码同漏斗——§11.2 原则 1
     // "码值表达发生了什么事实，不表达谁触发的"，故手动路径照样 fire CC_CREATE(4)。

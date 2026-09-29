@@ -13,7 +13,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { ProcessInstance, ProcessTask, type ProcessDefine, type CcInstanceRow, type DefineRow, type InstanceRow, type TaskRow } from '../model.js'
 import { InstanceState, TaskState } from '../model.js'
 import type { IDGenerator, ProcessRepository, QueryCondition, InstanceStatsRow, TaskStatsRow } from '../spi.js'
-import { isBlankOwnership, isBlankValue, hasEffectiveCcOwnership, defaultCreateCcInstanceIfAbsent } from '../spi.js'
+import { isBlankOwnership, isBlankValue, hasEffectiveCcOwnership, defaultCreateCcInstanceIfAbsent, normalizeCcActorValue } from '../spi.js'
 
 // ═══ 列白名单（issues/05-5，与 mldong-boot2 别名一致） ═══
 
@@ -485,12 +485,18 @@ export class JdbcRepository implements ProcessRepository {
     // 已有 cc 行 ⇒ 直接跳过——①不新增行、②不重置未读（state 保持原值）、③不更新原行时间
     // （不碰 UPDATE，create_time/update_time 逐字不变）。判重放在**写侧**而不是查询侧：
     // 查询不引入 DISTINCT（owner 2026-09-29 拍），历史重复行也不清理。
+    //
+    // issues/141 G10「空不创建行」（spec 06 §2.10）：入参先过 `spi.normalizeCcActorValue`——
+    // 空串/纯空白/null 一律丢弃，绑进 actor_id 的值取 trim 后的串（`" 123 "` 与 `"123"` 是同一个人，
+    // 与上面的写侧判重同一条尺子）。绕过引擎/门面直连仓储的第三方调用方也建不出 actor_id='' 的行，
+    // 那正是 issues/129 那族"空 operator 读全库"的病根。⚠️ 与内存仓共用一份判据，两仓必须同答案。
     const existing = await this.findCcActorIds(instanceId)
     const conn = await this.c()
     try {
       const now = new Date()
-      for (const actorId of actorIds) {
-        if (actorId == null || existing.includes(actorId)) continue
+      for (const rawActorId of actorIds) {
+        const actorId = normalizeCcActorValue(rawActorId)
+        if (!actorId || existing.includes(actorId)) continue
         await conn.execute(this.sql(
           'INSERT INTO wf_process_cc_instance (id, process_instance_id, actor_id, state, ' +
           'create_time, create_user, update_time, update_user) VALUES (?,?,?,0,?,?,?,?)'),
