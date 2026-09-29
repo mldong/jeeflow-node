@@ -222,8 +222,10 @@ export class JeeflowFacade {
     let flow: any
     try {
       flow = JSON.parse(content)
-    } catch {
-      throw new Error('流程定义 JSON 解析失败')
+    } catch (e) {
+      // issues/139：八栈同一条腿用 java 逐字原文（ModelParser.java:47「读取流程定义 JSON 失败」），
+      // 原始异常只作 cause——门面顶层会把 message 原样送进出口 msg。
+      throw new Error('读取流程定义 JSON 失败', { cause: e })
     }
     const name = flow?.name
     if (!name) throw new Error('流程定义缺少 name')
@@ -246,8 +248,10 @@ export class JeeflowFacade {
     let flow: any
     try {
       flow = JSON.parse(content)
-    } catch {
-      throw new Error('流程定义 JSON 解析失败')
+    } catch (e) {
+      // issues/139：八栈同一条腿用 java 逐字原文（ModelParser.java:47「读取流程定义 JSON 失败」），
+      // 原始异常只作 cause——门面顶层会把 message 原样送进出口 msg。
+      throw new Error('读取流程定义 JSON 失败', { cause: e })
     }
     await this.repo.updateDefine({
       id: defineId, name: flow?.name ?? '', displayName: flow?.displayName ?? '',

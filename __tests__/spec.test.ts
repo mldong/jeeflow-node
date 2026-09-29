@@ -5005,4 +5005,26 @@ describe('issues/139 designRedeploy JSON 解析失败：出口 msg 逐字等值�
     assert.equal((await extRepo.findDesignById(designId))?.isDeployed, 1, '正向：设计置已部署(1)')
     assert.ok(await repo.findDefineById(String(r.data.processDefineId)), '正向：定义行确实落库')
   })
+
+  it('同一条腿的另两处（processDefine/deploy 与 processDefine/redeploy）也用同一逐字文案，本栈不再三腿两样', async () => {
+    const { engine, repo } = setup()
+    const extRepo = new MemoryExtRepository()
+    const facade = new JeeflowFacade(engine, repo, extRepo)
+
+    // 腿 1：processDefine/deploy 直接吃 args.content（→ saveDeployedDefine 的解析分支）
+    const r1 = await facade.flow('processDefine/deploy',
+      { content: '{"name":"bad139legs","nodes":[', operator: 'zhangsan' })
+    assert.equal(r1.code, 99999999, `deploy 腿坏 JSON 必须被拒: ${JSON.stringify(r1)}`)
+    assert.equal(r1.msg, PARSE_FAIL, `deploy 腿 msg 逐字等值: ${r1.msg}`)
+
+    // 先放一份合法定义，再走 processDefine/redeploy 的解析腿
+    const good = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    const ok0 = await facade.flow('processDefine/deploy', { content: good, operator: 'zhangsan' })
+    assert.equal(ok0.code, 0, `前置：合法内容部署成功才谈重新部署: ${JSON.stringify(ok0)}`)
+    const r2 = await facade.flow('processDefine/redeploy',
+      { processDefineId: ok0.data.processDefineId, content: '{"nodes":[SENTINEL_泄漏面_139]}', operator: 'zhangsan' })
+    assert.equal(r2.code, 99999999, `redeploy 腿坏 JSON 必须被拒: ${JSON.stringify(r2)}`)
+    assert.equal(r2.msg, PARSE_FAIL, `redeploy 腿 msg 逐字等值: ${r2.msg}`)
+    assert.ok(!r2.msg.includes('SENTINEL'), `redeploy 腿不得把内容片段透出去: ${r2.msg}`)
+  })
 })
