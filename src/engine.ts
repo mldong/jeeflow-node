@@ -25,6 +25,53 @@ export const KeyAutoExecute = 'flow.auto'
 export const KeyAdminID     = 'flow.admin'
 // issue 29：自动生成标题（对齐 boot3 FlowConst.AUTO_GEN_TITLE）
 export const KeyAutoGenTitle = 'autoGenTitle'
+// issues/127：抄送人入参两枚（逐字对齐 Java FlowConst.CC_ACTORS_START / CC_ACTORS）
+//   f_ccActors  发起时抄送   tf_ccActors 办理时抄送
+export const KeyCcActorsStart = 'f_ccActors'
+export const KeyCcActors      = 'tf_ccActors'
+
+/**
+ * issues/127：抄送人入参归一（判据对齐 Java `JeeflowEngineImpl.handleCcActors`）——
+ * 数组或逗号串都吃，逐项 trim、丢空项、按出现顺序去重。
+ * 去重不是锦上添花：`createCcInstance` 逐行 INSERT，内存仓那侧还按实例去重，
+ * 同一人写两次会"一行两事件"，破掉 §11.3「逐抄送人 fire 一次 ＝ cc 行粒度一一对应」。
+ */
+export function parseCcActors(v: any): string[] {
+  const list = Array.isArray(v) ? v : (typeof v === 'string' ? v.split(',') : [])
+  const out: string[] = []
+  const seen = new Set<string>()
+  for (const raw of list) {
+    const s = String(raw ?? '').trim()
+    if (!s || seen.has(s)) continue
+    seen.add(s)
+    out.push(s)
+  }
+  return out
+}
+
+/**
+ * 规范 11 §11.3 载荷键 submitType 归一：出**整数**，不用 undefined（⇒ 省略整键）表达
+ * （issues/122 同族坑）。缺省/非法时取引擎既有默认——不认 submitType 的动作一律按同意办
+ * （executeNode TypeEnd 分支同样是"非 Reject 即办结"），所以归一成 1(AGREE) 与实际行为一致。
+ */
+function normalizeSubmitType(v: any): number {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : SubmitType.Agree
+}
+
+/**
+ * 规范 11 §11.3 code 5/6 互斥判据（场景 30/31「走退回的这一次不得再发 5」）。
+ * 退回族＝2 拒绝 / 3 退回上一步 / 6 退回发起人 / 20 会签软拒绝；
+ * 其余（0 APPLY / 1 AGREE / 4 JUMP / 5 重新提交 / 常规会签办理）算"任务被办掉"。
+ * ⚠️ 4(JUMP) 按 §11.3 code 5 那一行的"跳转"归 complete：本栈分不出前跳/回跳
+ * （要判拓扑），而 §11.3 code 6 的"跳转回退"在 boot2 血缘语义下就是 submitType=3。
+ */
+function isRejectSubmitType(submitType: number): boolean {
+  return submitType === SubmitType.Reject
+    || submitType === SubmitType.Rollback
+    || submitType === SubmitType.RollbackToOperator
+    || submitType === SubmitType.CountersignDisagree
+}
 
 export interface Engine {
   startProcessInstanceById(defineId: string, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
@@ -216,20 +263,62 @@ export class EngineImpl implements Engine {
     for (const ic of await this.resolveInterceptors(inst)) await ic.postHandle(node, inst)
   }
   async fireEvent(evt: ProcessEvent) {
-    // 公开事件发布入口（issues/102 CC_CREATE）：facade 层 CC 实例创建后逐抄送人 fire；
+    // 公开事件发布入口（issues/102 CC_CREATE，issues/127/132 全码表）：引擎内部与各条 fire 腿共用；
     // 无监听器（ext/listeners 为空）时零副作用，与上一版逐字节一致
     await this.#fireEvent(evt)
   }
   async #fireEvent(evt: ProcessEvent) {
-    if (!this.ext?.listeners) return
-    // 兜底语义（issues/104 P2 统一口径）：单监听器异常只记录不传播——
-    // 不得影响引擎主流程，也不得中断后续监听器（对齐 PHP per-listener catch）
-    for (const l of this.ext.listeners) {
+    const listeners = this.ext?.listeners
+    // 零注册安全返回（§11.5「无监听器」义务：不得空指针/抛错）——ext 未设、listeners 未给、
+    // 给了空数组三种形态都走这里，非数组的脏注入同样不炸主流程
+    if (!Array.isArray(listeners) || listeners.length === 0) return
+    // 兜底语义（issues/104 P2 / §11.5 异常隔离）：**逐监听器** catch——单个监听器抛异常只记日志，
+    // ① 不回滚主流程 ② 不中断后续监听器（对齐 PHP per-listener catch；同步抛错也被 await 捕获）
+    for (const l of listeners) {
       try {
         await l(evt)
       } catch (e) {
         console.error(`[jeeflow] process event listener error: type=${evt.type} instanceId=${evt.instanceId}`, e)
       }
+    }
+  }
+
+  /**
+   * issues/127 / 规范 11 §11.7：抄送落库 ＋ 逐抄送人 fire CC_CREATE(4) 的**唯一漏斗**。
+   * 行为基准＝Java `JeeflowEngineImpl.handleCcActors` + `notifyCcCreate`：
+   *   ① 先 `createCcInstance`（cc 行 INSERT 落库）② 再按 cc 行粒度逐人 fire，
+   *   ccActorId 直传事件体（监听器免反查 cc 表）。
+   * 三条路径（发起 f_ccActors／办理 tf_ccActors／手动 processInstance/createCCInstance）
+   * 都走本函数 ⇒ §11.2 原则 1「同一事实只发一次、路径不进事件名」；入参为空零副作用。
+   */
+  async handleCcActors(instanceId: string, operator: string, ccActors: any): Promise<string[]> {
+    const actors = parseCcActors(ccActors)
+    if (!actors.length || !instanceId) return actors
+    await this.repo.createCcInstance(instanceId, operator, ...actors)
+    for (const ccActorId of actors) {
+      await this.fireEvent({ type: EventType.CcCreate, instanceId, operator, ccActorId })
+    }
+    return actors
+  }
+
+  /**
+   * 规范 11 §11.3 code 2/9 的 fire 漏斗——**必须在实例 state 落库之后调用**（§11.2 原则 3）。
+   * 只服务「流程自己走到终点」这一事实：办结(20)/拒绝到终态(45) 共用 PROCESS_INSTANCE_END(2)，
+   * 靠载荷 state 分（§11.6：实例终态＝2，旧版 Finish/Reject 拆分作废）；
+   * state=40 那一档额外 fire INSTANCE_TERMINATED(9)（规范 08 场景 34）。
+   *
+   * ⚠️ 撤回(30) **不走本漏斗**——规范 11 §11.3 码 2/8 与场景 32/34 明写「撤回(30)/终止(40)
+   * 不发 2，各发 8/9」，同轮既发 8 又发 2 ⇒ 下游收到「流程已办结」的错通知（node 首版即此形状，已纠）。
+   *
+   * ⚠️ 本栈当前**没有任何写 40 的门面动作**（spec 06 无 processInstance/terminate 档；
+   * InstanceState.Interrupt 仅定义、零赋值点），故 code 9 只有经本漏斗才会发得出——
+   * 接线是为将来终止腿落地时不再漏发，不是给现有路径凭空多发事件。
+   */
+  async notifyInstanceEnd(inst: ProcessInstance, operator: string, reason: string = ''): Promise<void> {
+    const state = Number(inst.state)
+    await this.fireEvent({ type: EventType.ProcessInstanceEnd, instanceId: inst.id, operator, state })
+    if (state === InstanceState.Interrupt) {
+      await this.fireEvent({ type: EventType.InstanceTerminated, instanceId: inst.id, operator, reason })
     }
   }
 
@@ -249,7 +338,8 @@ export class EngineImpl implements Engine {
     // 聚合根工厂创建实例
     const inst = ProcessInstance.create(this.nextId(), defineId, operator, vars, now)
     await this.repo.saveInstance(inst)
-    await this.fireEvent({ type: EventType.ProcessStart, instanceId: inst.id, operator })
+    // §11.3 code 1：实例行 insert **之后** fire（场景 28：发起前先 fire ⇒ 红）
+    await this.fireEvent({ type: EventType.ProcessInstanceStart, instanceId: inst.id, operator })
 
     const startNode = findNodeByType(flow, TypeStart)
     if (!startNode) throw new Error('no start node')
@@ -264,6 +354,15 @@ export class EngineImpl implements Engine {
 
   async executeProcessTask(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
     const { task, inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
+    // issues/127 / 规范 11 §11.7「办理时抄送」腿的统一出口：任务更新已在 prepareExecuteTask
+    // 落库，此处建 cc 行并逐人 fire CC_CREATE(4)，再回读实例。
+    // 基准＝Java JeeflowEngineImpl.executeProcessTask（node.execute 之后 handleCcActors、
+    // 然后 persistTasks）——**每条返回路径都执行**，含会签"未完成即停留"的提前返回，
+    // Java 那侧 handleCcActors 同样在这些路径上会跑到。
+    const finishExecute = async (): Promise<ProcessInstance> => {
+      await this.handleCcActors(inst.id, operator, args[KeyCcActors])
+      return (await this.repo.findInstanceById(inst.id))!
+    }
     const now = new Date()
     const curNode = findNode(flow, task.taskName)
     if (curNode) {
@@ -302,17 +401,17 @@ export class EngineImpl implements Engine {
             // 变量源＝实例变量（与建单同档），取时基准＝本行 createTime 用的同一个 now。
             applyNodeExpireTime(nt, curNode.properties?.expireTime, inst.variables, now)
             await this.repo.saveTask(nt)
-            // TASK_CREATE：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler / Rust）
-            await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: curNode.id, operator })
-            return (await this.repo.findInstanceById(inst.id))!
+            // PROCESS_TASK_START：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler / Rust）
+            await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: curNode.id, operator, actors: [...nt.actorIds] })
+            return finishExecute()
           }
         } else {
-          return (await this.repo.findInstanceById(inst.id))!
+          return finishExecute()
         }
       }
       if ((ct === 'PARALLEL' || ct?.startsWith('RATIO')) && !csVeto) {
         const doing = await this.repo.findDoingTasks(inst.id)
-        if (doing.length > 0) return (await this.repo.findInstanceById(inst.id))!
+        if (doing.length > 0) return finishExecute()
       }
       // issues/91：会签节点 merged 后（ONE_VOTE_VETO 否决 / 全部完成任一路径），
       // 废弃该节点剩余 DOING 任务（对齐内置引擎 abandonProcessTask）：
@@ -332,7 +431,7 @@ export class EngineImpl implements Engine {
         await this.executeNode(flow, inst, node, operator, vars, task.id)
       }
     }
-    return (await this.repo.findInstanceById(inst.id))!
+    return finishExecute()
   }
 
   // ─── Reject ────────────────────────────────────────────────────────────────
@@ -342,7 +441,9 @@ export class EngineImpl implements Engine {
     // 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
     inst.reject(new Date())
     await this.repo.updateInstance(inst)
-    await this.fireEvent({ type: EventType.ProcessReject, instanceId: inst.id, taskId, operator })
+    // §11.3 code 2：拒绝也是"实例进入终态"（state=45 落库后 fire，靠载荷 state 与办结分家）；
+    // "任务被退回"这一事实另由 prepareExecuteTask 的 TASK_REJECT(6) 承载（场景 31/32 两支并存）
+    await this.notifyInstanceEnd(inst, operator)
     return (await this.repo.findInstanceById(inst.id))!
   }
 
@@ -407,17 +508,25 @@ export class EngineImpl implements Engine {
     await this.addUserInfo(operator, vars)
 
     const now = new Date()
+    // §11.2 原则 2「码粗、载荷细」＋场景 30/31 互斥：本次动作是"办掉"还是"退回"由 submitType 定，
+    // 同一动作只发其中一支（旧形状无论 submitType 一律 fire TaskComplete 即本案病灶）
+    const submitType = normalizeSubmitType(vars[KeySubmitType])
     // 聚合根：完成任务（子实体状态转换 + 实例变量合并）
     inst.completeTask(task, operator, vars, now)
     await this.repo.updateTask(task)
     // v1.0.1：updateInstance 级联持久化依赖聚合内任务副本为最新状态，
     // completeTask 改的是外部任务对象，需同步回聚合根
     syncTaskToAggregate(inst, task)
-    await this.fireEvent({ type: EventType.TaskComplete, instanceId: inst.id, taskId: task.id, nodeId: task.taskName, operator })
 
     // issues/97：实例变量写回排除操作人 u_*，保留 start 注入的发起人 u_*（u_realName 恒为发起人）
     inst.variables = mergeExecIntoInstance(baseVars, vars)
     await this.repo.updateInstance(inst)
+    // §11.2 原则 3：任务行与实例**都落库之后**才 fire（旧形状排在 updateInstance 之前，
+    // 监听器反查实例读到旧状态——与 issues/121/126 两轮"回写序"同族）
+    await this.fireEvent({
+      type: isRejectSubmitType(submitType) ? EventType.TaskReject : EventType.TaskComplete,
+      instanceId: inst.id, taskId: task.id, nodeId: task.taskName, operator, submitType,
+    })
     return { task, inst, flow, vars }
   }
 
@@ -463,8 +572,8 @@ export class EngineImpl implements Engine {
     const eff = mergeAgents([actor], agents)
     if (eff.length > 1) nt.actorIds = eff
     await this.repo.saveTask(nt)
-    await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id,
-      taskId: nt.id, nodeId: prev.id, operator })
+    await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id,
+      taskId: nt.id, nodeId: prev.id, operator, actors: [...nt.actorIds] })
   }
 
   /**
@@ -513,7 +622,7 @@ export class EngineImpl implements Engine {
             if (eff.length > 1) nt.actorIds = eff
             applyNodeExpireTime(nt, expireExpr, expireArgs, now)
             await this.repo.saveTask(nt)
-            await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
+            await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
           }
           return
         case 'SEQUENTIAL': {
@@ -527,7 +636,7 @@ export class EngineImpl implements Engine {
           if (eff.length > 1) nt.actorIds = eff
           applyNodeExpireTime(nt, expireExpr, expireArgs, now)
           await this.repo.saveTask(nt)
-          await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
+          await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
           return
         }
         default:
@@ -537,7 +646,7 @@ export class EngineImpl implements Engine {
             if (eff.length > 1) nt.actorIds = eff
             applyNodeExpireTime(nt, expireExpr, expireArgs, now)
             await this.repo.saveTask(nt)
-            await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
+            await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
           }
           return
       }
@@ -547,7 +656,7 @@ export class EngineImpl implements Engine {
     if (effActors.length > 1) nt.actorIds = effActors
     applyNodeExpireTime(nt, expireExpr, expireArgs, now)
     await this.repo.saveTask(nt)
-    await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
+    await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -596,7 +705,8 @@ export class EngineImpl implements Engine {
         // issues/97：结束节点写回同样排除操作人 u_*（保留发起人 u_*，与 prepareExecuteTask 一致）
         inst.variables = mergeExecIntoInstance(inst.variables, vars)
         await this.repo.updateInstance(inst)
-        await this.fireEvent({ type: EventType.ProcessFinish, instanceId: inst.id, operator })
+        // §11.3 code 2：办结(20)/拒绝(45) 共用 PROCESS_INSTANCE_END，state 落库后 fire（§11.6）
+        await this.notifyInstanceEnd(inst, operator)
         return
       }
     }
@@ -679,8 +789,8 @@ export class EngineImpl implements Engine {
             if (eff.length > 1) nt.actorIds = eff
             applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 并行会签全员
             await this.repo.saveTask(nt)
-            // TASK_CREATE：任务落库后逐个 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
-            await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
+            // PROCESS_TASK_START：任务落库后逐个 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
+            await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
           }
           return
         case 'SEQUENTIAL': {
@@ -696,7 +806,7 @@ export class EngineImpl implements Engine {
           if (eff.length > 1) nt.actorIds = eff
           applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 串行会签首位成员
           await this.repo.saveTask(nt)
-          await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
+          await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
           return
         }
         default:
@@ -706,7 +816,7 @@ export class EngineImpl implements Engine {
             if (eff.length > 1) nt.actorIds = eff
             applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 未配会签类型＝全员预创建，与并行同档
             await this.repo.saveTask(nt)
-            await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
+            await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
           }
           return
       }
@@ -717,7 +827,7 @@ export class EngineImpl implements Engine {
     if (effActors.length > 1) nt.actorIds = effActors
     applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 普通建单
     await this.repo.saveTask(nt)
-    await this.fireEvent({ type: EventType.TaskCreate, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator })
+    await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
   }
 
   private async resolveActors(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>): Promise<string[]> {

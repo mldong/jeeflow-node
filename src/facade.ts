@@ -10,8 +10,8 @@ import {
 } from './model.js'
 import type { OrgUserProvider, ProcessExtRepository, ProcessRepository, QueryCondition } from './spi.js'
 import type { EngineImpl } from './engine.js'
-import { KeyAutoExecute, KeyAdminID, KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign } from './engine.js'
-import { EventType, type ProcessEvent } from './extensions.js'
+import { KeyAutoExecute, KeyAdminID, KeyCcActorsStart, KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign } from './engine.js'
+import { EventType } from './extensions.js'
 
 // submitType 枚举（对齐 boot3）
 const SUBMIT_APPLY = 0
@@ -177,18 +177,10 @@ export class JeeflowFacade {
       flowArgs[k] = v
     }
     const inst = await this.engine.startProcessInstanceById(defineId, operator, flowArgs)
-    // issues/56 E28：发起时抄送（f_ccActors）创建 cc 实例（对齐 Java enableCcActors 语义）
-    const ccList = Array.isArray(flowArgs.f_ccActors) ? flowArgs.f_ccActors
-      : typeof flowArgs.f_ccActors === 'string' && flowArgs.f_ccActors.trim()
-        ? flowArgs.f_ccActors.split(',').map((x: string) => x.trim()).filter(Boolean) : []
-    if (ccList.length > 0) {
-      await this.repo.createCcInstance(inst.id, operator, ...ccList)
-      // issues/102：CC 实例落库后逐抄送人 fire CcCreate（ccActorId 直传事件体，
-      // 对齐 Go startAndExecute / Python _startAndExecute；监听器据此落抄送知会 NOTICE）
-      for (const actor of ccList) {
-        await this.engine.fireEvent({ type: EventType.CcCreate, instanceId: inst.id, operator, ccActorId: actor })
-      }
-    }
+    // issues/56 E28 ＋ issues/127：发起时抄送（f_ccActors）——cc 行落库后逐人 fire CC_CREATE(4)。
+    // 与办理腿 tf_ccActors、手动腿 createCCInstance 共用引擎那一个漏斗（Java handleCcActors 同形），
+    // 三条路径同一码，不在门面各写一份 fire 循环。
+    await this.engine.handleCcActors(inst.id, operator, flowArgs[KeyCcActorsStart])
     // startAndExecute：自动完成申请节点（assignee="applicant" → 发起人）
     const doing = await this.repo.findDoingTasks(inst.id)
     for (const task of doing) {
@@ -308,6 +300,14 @@ export class JeeflowFacade {
     inst.tasks = withdrawn
     for (const t of withdrawn) await this.repo.updateTask(t)
     await this.repo.updateInstance(inst)
+    // §11.3 code 8：撤回把实例 state 写 30 落库、被撤回任务行也更新完成后 fire **一次**
+    // （每轮撤回只 fire 一次，不逐任务——规范 08 场景 34）。
+    // **撤回只发 8，不补发 2**——规范 11 §11.3 码 2 的语义是「流程自己走到终点」（办结 20／
+    // 拒绝到终态 45），撤回(30)不是走到终点；同轮既发 8 又发 2 会让下游监听器给发起人推一条
+    // 「流程已办结」的错通知（规范 08 场景 32/34 明写「撤回(30)/终止(40) 不发 2」，node 首版即此形状，已纠）。
+    // notifyInstanceEnd 漏斗保留给办结/拒绝路径（engine.executeAndJumpToEnd、结束节点落库），
+    // withdraw 不再进这个漏斗。
+    await this.engine.fireEvent({ type: EventType.TaskWithdraw, instanceId, operator })
   }
 
   // ── 流程任务 ─────────────────────────────────────────────────────────────
@@ -830,11 +830,9 @@ export class JeeflowFacade {
     const operator = operatorArg(args)
     const actors = toStringList2(args.actorIds)
     if (actors.length === 0) throw new Error('actorIds 缺失')
-    await this.repo.createCcInstance(instanceId, operator, ...actors)
-    // issues/102：手动 CC 与发起路径同语义——逐抄送人 fire CcCreate
-    for (const actor of actors) {
-      await this.engine.fireEvent({ type: EventType.CcCreate, instanceId, operator, ccActorId: actor })
-    }
+    // issues/102 ＋ issues/127/132：手动 CC 与发起/办理两条腿同码同漏斗——§11.2 原则 1
+    // "码值表达发生了什么事实，不表达谁触发的"，故手动路径照样 fire CC_CREATE(4)。
+    await this.engine.handleCcActors(instanceId, operator, actors)
   }
 
   private async updateCCStatus(args: Record<string, any>): Promise<void> {
@@ -1053,6 +1051,12 @@ export class JeeflowFacade {
     // 仓储 updateTask 会以任务副本的 actorIds 覆写参与者（memory 语义），须同步为摘/加后的最新值
     task.actorIds = await this.repo.findTaskActors(taskId)
     await this.repo.updateTask(task)
+    // §11.3 code 7：参与者被替换并落库**之后** fire（场景 34：载荷带 fromActor/toActor/operator）。
+    // 转办不碰实例 state，故不发 2；也不发 5/6（任务没被办掉，只是换了人）。
+    await this.engine.fireEvent({
+      type: EventType.TaskTransfer, instanceId: task.processInstanceId, taskId,
+      operator, fromActor, toActor,
+    })
   }
 
   private async taskLatest(args: Record<string, any>): Promise<any> {

@@ -11,7 +11,11 @@ import { JdbcProcessExtRepository } from '../src/jdbc/ext.js'
 import { JeeflowFacade } from '../src/facade.js'
 import { InstanceState, TaskState, SubmitType, type ProcessDefine, ProcessInstance, ProcessTask } from '../src/model.js'
 import type { ExpressionEvaluator, UserProvider } from '../src/spi.js'
-import { type FlowInterceptor, EventType, type EngineExtensions } from '../src/extensions.js'
+import { type FlowInterceptor, EventType, type EngineExtensions, type ProcessEvent,
+  // issues/132 §11.6 改名兼容义务：旧成员名保留一代为别名（enum 外部的同值常量）
+  ProcessStart, ProcessFinish, ProcessReject, TaskCreate, TaskComplete, CcCreate } from '../src/extensions.js'
+// 别名必须从**包门面**（第三方可 import 的面）拿得到，不只是子路径
+import * as pkg from '../src/index.js'
 import { dir as flowsResolverDir } from '../flows-resolver.js'
 import { runParity } from './surrparity.js'
 // issues/130 案 A：判据（只认数值 1）与**边界还原**（驱动串化）分属两层，测试要分别钉住
@@ -350,9 +354,11 @@ describe('jeeflow compliance tests', () => {
         async postHandle() { postCalled = true },
       }],
       listeners: [(e) => {
-        if (e.type === EventType.ProcessStart) events.push('start')
+        // issues/132 码表重排：旧名 ProcessStart/ProcessFinish 换成 §11.3 规范名
+        // ProcessInstanceStart(1)/ProcessInstanceEnd(2)——**断言语义与期望序列一字未改**
+        if (e.type === EventType.ProcessInstanceStart) events.push('start')
         if (e.type === EventType.TaskComplete) events.push('taskDone')
-        if (e.type === EventType.ProcessFinish) events.push('finish')
+        if (e.type === EventType.ProcessInstanceEnd) events.push('finish')
       }],
     })
     const inst = await startAndExecute(engine, repo, def.id, 'applicant')
@@ -366,11 +372,11 @@ describe('jeeflow compliance tests', () => {
     assert.deepStrictEqual(events, ['start', 'taskDone', 'taskDone', 'finish'])
   })
 
-  it('10b TASK_CREATE 事件（落库后 fire / 会签逐任务，对齐 Java CreateTaskHandler / Rust）', async () => {
+  it('10b PROCESS_TASK_START 事件（落库后 fire / 会签逐任务，对齐 Java CreateTaskHandler / Rust）', async () => {
     const creates: Array<{ taskId?: string; nodeId?: string; instanceId: string; operator: string }> = []
     const { engine, repo } = setup()
     engine.setExtensions({
-      listeners: [(e) => { if (e.type === EventType.TaskCreate) creates.push(e) }],
+      listeners: [(e) => { if (e.type === EventType.ProcessTaskStart) creates.push(e) }],
     })
     // ① 普通任务：01-simple startAndExecute → apply 完成 → task1 创建（共 2 个）
     const def = loadFlow(repo, '01-simple.json')
@@ -4486,5 +4492,449 @@ describe('issues/134 案 A 撤回实例状态守卫 20010009：非 10 一律拒�
     assert.equal(again.code, 99999999, `撤回态(30)实例二次撤回应被拒: ${JSON.stringify(again)}`)
     assert.equal(again.msg, NOT_DOING, `二次撤回出口 msg 逐字等值: ${again.msg}`)
     assert.equal((await repo.findInstanceById(iid))?.state, InstanceState.Withdraw, '被拒后实例仍 30')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// issues/127 ＋ issues/132「事件代码腿」
+// 判据源＝jeeflow-doc/docs/spec/11-events.md（§11.3 码表 / §11.6 迁移 / §11.7 抄送联动）
+//        ＋ spec/08-compliance.md 场景 28~36（每支都断"收到 ＋ 顺序 ＋ 时机"，只断出现过不算过）
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('issues/127/132 事件腿：A 套码表 · 办理抄送 · 5/6 互斥 · 6/7/8/9 补支', () => {
+  /** §11.3 权威规范名 ↔ 本栈码值（测试按规范名断言，码值只在"码表钉死"档里出现） */
+  const SPEC_NAME: Record<number, string> = {
+    1: 'PROCESS_INSTANCE_START', 2: 'PROCESS_INSTANCE_END', 3: 'PROCESS_TASK_START',
+    4: 'CC_CREATE', 5: 'TASK_COMPLETE', 6: 'TASK_REJECT', 7: 'TASK_TRANSFER',
+    8: 'TASK_WITHDRAW', 9: 'INSTANCE_TERMINATED',
+  }
+  /** recorder 监听器：按 fire 顺序逐条留档（浅拷贝，防对象复用串档） */
+  function attachRecorder(engine: EngineImpl): ProcessEvent[] {
+    const fired: ProcessEvent[] = []
+    engine.setExtensions({ listeners: [(e) => { fired.push({ ...e }) }] })
+    return fired
+  }
+  const nameOf = (e: ProcessEvent) => SPEC_NAME[e.type]
+  /** 折叠重复后的规范名序列（同一支多次 fire 只留首次出现，顺序保真） */
+  function firstSeen(fired: ProcessEvent[]): string[] {
+    const out: string[] = []
+    for (const e of fired) if (!out.includes(nameOf(e))) out.push(nameOf(e))
+    return out
+  }
+  function facadeOf(engine: EngineImpl, repo: MemoryRepository) {
+    return new JeeflowFacade(engine, repo, new MemoryExtRepository())
+  }
+  async function deploy(facade: JeeflowFacade, file: string): Promise<string> {
+    const r = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + file, 'utf-8') })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    return String(r.data.processDefineId)
+  }
+  async function start(facade: JeeflowFacade, defineId: string, operator: string, extra: Record<string, any> = {}) {
+    const r = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: defineId, operator, ...extra })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    return String(r.data.processInstanceId)
+  }
+
+  /** §11.6 兼容别名表：旧成员名 → 规范成员名 ＋ 旧码值（别名是 enum 外部的同值常量） */
+  const LEGACY_ALIAS: Array<[string, EventType, string, number]> = [
+    ['ProcessStart',  ProcessStart,  'ProcessInstanceStart', 0],
+    ['ProcessFinish', ProcessFinish, 'ProcessInstanceEnd',   1],
+    ['ProcessReject', ProcessReject, 'ProcessInstanceEnd',   2],
+    ['TaskCreate',    TaskCreate,    'ProcessTaskStart',     3],
+    ['TaskComplete',  TaskComplete,  'TaskComplete',         4],
+    ['CcCreate',      CcCreate,      'CcCreate',             5],
+  ]
+  /** 码值 → 本栈 enum 成员名（反向映射判据源；与 SPEC_NAME 的 SCREAMING 权威名一一对应） */
+  const MEMBER_BY_CODE: Record<number, string> = {
+    1: 'ProcessInstanceStart', 2: 'ProcessInstanceEnd', 3: 'ProcessTaskStart', 4: 'CcCreate',
+    5: 'TaskComplete', 6: 'TaskReject', 7: 'TaskTransfer', 8: 'TaskWithdraw', 9: 'InstanceTerminated',
+  }
+
+  it('码表钉死：EventType 整表＝规范 11 §11.3 的 A 套 1..9，旧 0..5 套成员名一律不作 enum 成员（只作 §11.6 外部别名）', () => {
+    assert.deepEqual([
+      EventType.ProcessInstanceStart, EventType.ProcessInstanceEnd, EventType.ProcessTaskStart,
+      EventType.CcCreate, EventType.TaskComplete, EventType.TaskReject, EventType.TaskTransfer,
+      EventType.TaskWithdraw, EventType.InstanceTerminated,
+    ], [1, 2, 3, 4, 5, 6, 7, 8, 9], 'A 套码值（CcCreate 5→4、TaskComplete 4→5、实例终态统一 2、退回走 6）')
+    // 旧形状退场判据**改判**（§11.6「改名兼容义务」）：旧成员名必须还在，但以 **enum 外部的同值常量别名**
+    // 形态存在一代（见下方「兼容别名」格），不能塞回 enum 成员列表——数字枚举同值成员会覆盖反向映射，
+    // 那才是"拿数字码当判据"的温床。故此处只钉：enum 成员名恰 9 支、旧名不在成员名里。
+    const members = Object.keys(EventType).filter(k => isNaN(Number(k)))
+    assert.equal(members.length, 9, `成员数＝9，实测 ${members.join(',')}`)
+    assert.equal(new Set(members.map(m => (EventType as any)[m])).size, 9, '码值唯一，无复用')
+    for (const [legacy, alias, spec] of LEGACY_ALIAS) {
+      if (legacy === spec) continue   // TaskComplete/CcCreate 名未改（只挪码值），本身就是成员名
+      assert.ok(!members.includes(legacy), `旧成员名 ${legacy} 不得回流成 enum 成员（同值成员会覆盖反向映射）`)
+      assert.ok(Number.isInteger(alias as number), `旧名 ${legacy} 的 §11.6 别名必须存在且是整型码`)
+    }
+  })
+
+  it('§11.6 兼容别名：六个旧成员名逐个 === 对应规范名成员（同符号同值），并从包门面 index 出口拿得到', () => {
+    // ① 六支逐个：别名与规范名成员是"同一个成员"（TS 数字枚举里即同一个值），switch 命中同一 case
+    assert.equal(ProcessStart,  EventType.ProcessInstanceStart, '旧 ProcessStart(0) → ProcessInstanceStart(1)')
+    assert.equal(ProcessFinish, EventType.ProcessInstanceEnd,   '旧 ProcessFinish(1) → ProcessInstanceEnd(2)')
+    assert.equal(ProcessReject, EventType.ProcessInstanceEnd,   '旧 ProcessReject(2) → ProcessInstanceEnd(2)')
+    assert.equal(TaskCreate,    EventType.ProcessTaskStart,     '旧 TaskCreate(3) → ProcessTaskStart(3)')
+    assert.equal(TaskComplete,  EventType.TaskComplete,         '旧 TaskComplete(4) → 同名成员，码值 4→5')
+    assert.equal(CcCreate,      EventType.CcCreate,             '旧 CcCreate(5) → 同名成员，码值 5→4')
+    // 逐支的"旧码 → 新码"台账（防改名时把两支接错）：新码即规范成员值，且必须能在反向映射里取回规范名
+    for (const [legacy, alias, spec, oldCode] of LEGACY_ALIAS) {
+      assert.equal(alias, (EventType as any)[spec], `${legacy} 必须＝${spec}`)
+      assert.equal(MEMBER_BY_CODE[alias], spec,
+        `${legacy}：旧码 ${oldCode} → 新码 ${alias}，反向名＝${spec}`)
+    }
+    // ② 别名走**同一条出口**：src/index.ts 是第三方可 import 的面（包门面），旧引用升 pin 后要能编过
+    for (const [legacy, alias] of LEGACY_ALIAS) {
+      assert.equal((pkg as Record<string, unknown>)[legacy], alias,
+        `包门面必须导出旧名别名 ${legacy}（下游 import 面只有 index）`)
+    }
+    assert.equal(((pkg as Record<string, any>).EventType as Record<string, unknown>).ProcessStart, undefined,
+      '别名不得挂在 enum 对象上（数字枚举同值成员会覆盖反向映射）——只作模块级常量导出')
+  })
+
+  it('§11.6 反向映射未被别名污染：EventType[1..9] 九支逐个仍取到规范成员名（sink 靠它写 <code>|<规范名>）', () => {
+    assert.equal(EventType[EventType.ProcessInstanceStart], 'ProcessInstanceStart',
+      '1 的反向名不能被旧别名 ProcessStart 顶掉')
+    for (const [code, member] of Object.entries(MEMBER_BY_CODE)) {
+      assert.equal(EventType[Number(code)], member, `反向映射 ${code} → ${member}`)
+    }
+    // 六支别名逐支反查：拿到的是规范名，不是旧名（把别名写进 enum 成员就会在这一格红）
+    for (const [legacy, alias, spec] of LEGACY_ALIAS) {
+      assert.equal(EventType[alias], spec, `别名 ${legacy} 同值位的反向名＝规范成员名 ${spec}`)
+    }
+    // 反向键集合也恰是 1..9 九个，多一个少一个都算污染
+    assert.deepEqual(Object.keys(EventType).filter(k => !isNaN(Number(k))).map(Number).sort((a, b) => a - b),
+      [1, 2, 3, 4, 5, 6, 7, 8, 9])
+  })
+
+  it('§11.6 合并语义：旧 ProcessFinish / ProcessReject 两支别名同指码 2，一次办结的流水只落一支码 2', async () => {
+    assert.equal(ProcessFinish, 2, '旧 ProcessFinish(1) → 码 2')
+    assert.equal(ProcessReject, 2, '旧 ProcessReject(2) → 码 2')
+    assert.equal(ProcessFinish, ProcessReject, '两支别名＝同一支（"办结/拒绝"合并为实例终态，靠载荷 state 分）')
+    assert.equal(EventType[ProcessFinish], 'ProcessInstanceEnd', '码 2 的反向名仍是规范名')
+    assert.notEqual(EventType.TaskReject, ProcessFinish, '"任务被退回"另立 6，不再混在实例终态里')
+    // 流水判据复用第一轮 5/6 互斥那条 recorder 口径（不重写实现）：一次正常办结，两支旧别名分别命中
+    const { engine, repo } = setup()
+    const fired = attachRecorder(engine)
+    const facade = facadeOf(engine, repo)
+    const instanceId = await start(facade, await deploy(facade, '01-simple.json'), 'zhangsan')
+    const task = (await repo.findDoingTasks(instanceId))[0]
+    fired.length = 0
+    const r = await facade.flow('processTask/execute',
+      { processTaskId: task.id, operator: 'leader', submitType: SubmitType.Agree })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    const byFinish = fired.filter(e => e.type === ProcessFinish)
+    const byReject = fired.filter(e => e.type === ProcessReject)
+    assert.equal(byFinish.length, 1, `一次办结只落一支码 2: ${fired.map(e => e.type)}`)
+    assert.deepEqual(byReject, byFinish, '旧两支别名分别分派命中的是同一条记录（合并，不产生两支码 2）')
+    assert.equal(fired.filter(e => e.type === 2).length, 1, '流水里码 2 恰一条')
+    // sink 串按反向映射取名：旧名绝不能出现在 <code>|<规范名>|<sourceId> 里
+    const sink = fired.map(e => `${e.type}|${EventType[e.type]}|${e.taskId ?? e.instanceId}`)
+    assert.ok(!sink.some(s => /Process(Finish|Reject)|TaskCreate/.test(s)),
+      `sink 规范名只出自反向映射: ${sink.join(',')}`)
+    assert.ok(sink.includes(`2|ProcessInstanceEnd|${instanceId}`), `实例终态那支: ${sink.join(',')}`)
+  })
+
+  it('场景 28~32 主链 recorder：一条流从发起到办结按顺序收 [1,3,5,3,5,2]，规范名序列 [START, TASK_START, COMPLETE, END]', async () => {
+    const { engine, repo } = setup()
+    const fired = attachRecorder(engine)
+    const facade = facadeOf(engine, repo)
+    const defineId = await deploy(facade, '01-simple.json')
+    const instanceId = await start(facade, defineId, 'zhangsan')
+    const doing = await repo.findDoingTasks(instanceId)
+    assert.equal(doing[0].taskName, 'task1', '夹具自证：发起腿自动办掉 apply，剩 task1')
+    const r = await facade.flow('processTask/execute',
+      { processTaskId: doing[0].id, operator: 'leader', submitType: SubmitType.Agree })
+    assert.equal(r.code, 0, JSON.stringify(r))
+
+    // ① 码值序列逐格保序（apply 与 task1 各一对 3/5，末格是实例终态 2）
+    assert.deepEqual(fired.map(e => e.type), [1, 3, 5, 3, 5, 2],
+      `fire 序列逐格: ${fired.map(e => `${e.type}(${nameOf(e)})`).join(',')}`)
+    // ② 规范名序列＝§11.8 L2-30 那一串（缺支或错序都红）
+    assert.deepEqual(firstSeen(fired),
+      ['PROCESS_INSTANCE_START', 'PROCESS_TASK_START', 'TASK_COMPLETE', 'PROCESS_INSTANCE_END'])
+    // ③ 时机：每支都在落库之后——1 之后实例可反查；3 之后任务可反查且参与者已就位；
+    //    2 的 state 与落库值一致
+    assert.ok(await repo.findInstanceById(fired[0].instanceId), '1 fire 时实例行已落库')
+    for (const e of fired.filter(x => x.type === 3)) {
+      assert.ok(await repo.findTaskById(e.taskId!), `3 的 sourceId=${e.taskId} 落库后可反查`)
+      assert.ok(Array.isArray(e.actors) && e.actors.length > 0, `3 必带非空 actors 键: ${JSON.stringify(e)}`)
+      assert.deepEqual(e.actors, await repo.findTaskActors(e.taskId!), '3 的 actors＝落库的参与者列表')
+    }
+    const end = fired[fired.length - 1]
+    assert.equal(end.type, 2)
+    assert.equal(end.state, InstanceState.Done, '2 的 state＝落库后的整数')
+    assert.equal((await repo.findInstanceById(end.instanceId))!.state, InstanceState.Done)
+    // ④ 5 的载荷必备键（§11.3），且不用"省略整键"表达可空字段（issues/122 同族）
+    for (const e of fired.filter(x => x.type === 5)) {
+      assert.ok('submitType' in e && typeof e.submitType === 'number', `5 必带 submitType: ${JSON.stringify(e)}`)
+      assert.ok(e.instanceId && e.taskId && e.operator, `5 的 instanceId/taskId/operator 齐: ${JSON.stringify(e)}`)
+    }
+  })
+
+  it('载荷 submitType 三档：显式值原样透传 / 变量里从未出现过 ⇒ 归一成整数 1(AGREE) / 绝不"省略整键"（issues/122 同族坑）', async () => {
+    // ① 纯引擎路径：startProcessInstanceById 不自动办 apply ⇒ 实例/任务变量里根本没有 submitType
+    const { engine, repo } = setup()
+    const fired = attachRecorder(engine)
+    const def = loadFlow(repo, '01-simple.json')
+    const inst = await engine.startProcessInstanceById(def.id, 'zhangsan')
+    fired.length = 0
+    const apply = (await repo.findDoingTasks(inst.id))[0]
+    await engine.executeProcessTask(apply.id, 'zhangsan')   // 无 args：引擎按默认（同意）办理
+    const bare = fired.filter(e => e.type === 5).pop()!
+    assert.ok(bare, '无 submitType 的办理仍是"任务被办掉"')
+    assert.equal(bare.submitType, SubmitType.Agree, '缺 submitType 时归一成 1（与引擎"非拒绝即办结"同尺）')
+    assert.ok(JSON.stringify(bare).includes('"submitType"'), '序列化后 submitType 键仍在')
+
+    // ② 门面显式提交：载荷原样透传那支码（不重新解释）
+    const e2 = setup()
+    const fired2 = attachRecorder(e2.engine)
+    const facade2 = facadeOf(e2.engine, e2.repo)
+    const iid2 = await start(facade2, await deploy(facade2, '01-simple.json'), 'zhangsan')
+    fired2.length = 0
+    const r2 = await facade2.flow('processTask/execute', {
+      processTaskId: (await e2.repo.findDoingTasks(iid2))[0].id,
+      operator: 'leader', submitType: SubmitType.ReApply,
+    })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    assert.equal(fired2.filter(e => e.type === 5).pop()!.submitType, SubmitType.ReApply)
+
+    // ③ 继承档：apply 提交过的 submitType=0 已合进实例变量，后续直连办理不传 ⇒ 读到的就是那份
+    //    （fire 载荷与 executeNode TypeEnd 的拒绝判据取同一个 vars，两处不得各算一套）
+    const e3 = setup()
+    const fired3 = attachRecorder(e3.engine)
+    const facade3 = facadeOf(e3.engine, e3.repo)
+    const iid3 = await start(facade3, await deploy(facade3, '01-simple.json'), 'zhangsan')
+    fired3.length = 0
+    await e3.engine.executeProcessTask((await e3.repo.findDoingTasks(iid3))[0].id, 'leader')
+    const inherited = fired3.filter(e => e.type === 5).pop()!
+    assert.equal(inherited.submitType, SubmitType.Apply, '合并变量里的 submitType 原样带出，不是又造一个默认值')
+    assert.ok(typeof inherited.submitType === 'number' && Number.isFinite(inherited.submitType))
+  })
+
+  it('issues/127 办理腿：execute 带 tf_ccActors ⇒ cc 行落库后逐人 fire CC_CREATE(4)，fire 时 cc 行已可反查', async () => {
+    const { engine, repo } = setup()
+    const seen: ProcessEvent[] = []
+    const rowVisible: boolean[] = []
+    engine.setExtensions({
+      listeners: [async (e) => {
+        if (e.type !== EventType.CcCreate) return
+        seen.push(e)
+        // 时机判据：监听器被调的当下就该能读到 cc 行（先 fire 后落库 ⇒ 红）
+        rowVisible.push((await repo.pageCcInstances(1, 10, e.ccActorId!)).total >= 1)
+      }],
+    })
+    const facade = facadeOf(engine, repo)
+    const defineId = await deploy(facade, '01-simple.json')
+    const instanceId = await start(facade, defineId, 'zhangsan')
+    assert.deepEqual(seen, [], '不传 tf_ccActors 时零抄送事件（纯增量，不凭空多发）')
+    const task = (await repo.findDoingTasks(instanceId))[0]
+    const r = await facade.flow('processTask/execute', {
+      processTaskId: task.id, operator: 'leader', submitType: SubmitType.Agree,
+      tf_ccActors: 'alice, bob ,alice,',   // 逗号串：空项丢弃、同人去重（一次事实一次 fire）
+    })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    assert.deepEqual(seen.map(e => e.ccActorId), ['alice', 'bob'], '逐抄送人 fire 且顺序保真')
+    assert.deepEqual([...new Set(seen.map(e => e.type))], [EventType.CcCreate], 'CC_CREATE 落 4 号位（旧 5 作废）')
+    for (const e of seen) assert.equal(e.instanceId, instanceId, 'CC_CREATE 的 sourceId＝instanceId')
+    assert.ok(rowVisible.every(v => v), `每条 CC_CREATE 触发时 cc 行已落库：${rowVisible}`)
+    for (const actor of ['alice', 'bob']) {
+      assert.equal((await repo.pageCcInstances(1, 10, actor)).total, 1, `${actor} 的 cc 行存在`)
+    }
+  })
+
+  it('三腿同码：发起 f_ccActors／办理 tf_ccActors／手动 createCCInstance 共用一个漏斗，全部 CC_CREATE(4) 且逐人一次', async () => {
+    const { engine, repo } = setup()
+    const fired = attachRecorder(engine)
+    const facade = facadeOf(engine, repo)
+    const defineId = await deploy(facade, '01-simple.json')
+    const instanceId = await start(facade, defineId, 'zhangsan', { f_ccActors: ['alice', 'bob'] })
+    const task = (await repo.findDoingTasks(instanceId))[0]
+    await facade.flow('processTask/execute',
+      { processTaskId: task.id, operator: 'leader', submitType: SubmitType.Agree, tf_ccActors: 'carol' })
+    const manual = await facade.flow('processInstance/createCCInstance',
+      { processInstanceId: instanceId, operator: 'zhangsan', actorIds: 'dave,eve' })
+    assert.equal(manual.code, 0, JSON.stringify(manual))
+    const ccs = fired.filter(e => e.type === EventType.CcCreate)
+    assert.deepEqual(ccs.map(e => e.ccActorId), ['alice', 'bob', 'carol', 'dave', 'eve'],
+      `三条路径逐人各一次: ${ccs.map(e => e.ccActorId)}`)
+    assert.deepEqual(firstSeen(ccs), ['CC_CREATE'], '三腿同码，路径不进事件名（§11.2 原则 1）')
+    for (const actor of ['alice', 'bob', 'carol', 'dave', 'eve']) {
+      assert.equal((await repo.pageCcInstances(1, 10, actor)).total, 1, `${actor} 有且只有一行 cc`)
+    }
+  })
+
+  it('场景 30/31 互斥：submitType=2 拒绝 ⇒ 只 fire TASK_REJECT(6) 不再 fire 5，实例终态另发 2(state=45)', async () => {
+    const { engine, repo } = setup()
+    const fired = attachRecorder(engine)
+    const facade = facadeOf(engine, repo)
+    const defineId = await deploy(facade, '01-simple.json')
+    const instanceId = await start(facade, defineId, 'zhangsan')
+    fired.length = 0
+    const task = (await repo.findDoingTasks(instanceId))[0]
+    const r = await facade.flow('processTask/execute',
+      { processTaskId: task.id, operator: 'leader', submitType: SubmitType.Reject })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    assert.deepEqual(fired.map(e => e.type), [6, 2], '同一次拒绝：6 一支 ＋ 实例终态 2 一支，5 不得出现')
+    assert.equal(fired[0].submitType, SubmitType.Reject, '6 的载荷带 submitType')
+    assert.equal(fired[0].taskId, task.id, '6 的 sourceId＝taskId')
+    assert.equal(fired[1].state, InstanceState.Reject, '2 的 state＝落库后的 45')
+  })
+
+  it('场景 31 族：submitType=3 退回上一步 / 6 退发起人 / 20 会签软拒绝 ⇒ 各发 6 不发 5', async () => {
+    for (const submitType of [SubmitType.Rollback, SubmitType.RollbackToOperator]) {
+      const { engine, repo } = setup()
+      const fired = attachRecorder(engine)
+      const facade = facadeOf(engine, repo)
+      const defineId = await deploy(facade, '01-simple.json')
+      const instanceId = await start(facade, defineId, 'zhangsan')
+      fired.length = 0
+      const task = (await repo.findDoingTasks(instanceId))[0]
+      const r = await facade.flow('processTask/execute',
+        { processTaskId: task.id, operator: 'leader', submitType })
+      assert.equal(r.code, 0, `submitType=${submitType}: ${JSON.stringify(r)}`)
+      assert.equal(fired.filter(e => e.type === 5).length, 0, `submitType=${submitType} 不得 fire TASK_COMPLETE`)
+      const rejects = fired.filter(e => e.type === 6)
+      assert.equal(rejects.length, 1, `submitType=${submitType} 应恰 fire 一支 TASK_REJECT`)
+      assert.equal(rejects[0].submitType, submitType, '载荷 submitType 原值透传')
+      // 回退复活出来的新待照样 fire 3（场景 29"回退复活行"）
+      assert.ok(fired.some(e => e.type === 3), `submitType=${submitType} 复活行也要 fire 3`)
+      assert.deepEqual(firstSeen(fired).slice(0, 2), ['TASK_REJECT', 'PROCESS_TASK_START'])
+    }
+    // 软拒绝：并行会签节点未完成即停留，本次动作仍是"被退回"
+    const { engine, repo } = setup()
+    const fired = attachRecorder(engine)
+    const facade = facadeOf(engine, repo)
+    const defineId = await deploy(facade, '05-countersign-parallel.json')
+    const instanceId = await start(facade, defineId, 'zhangsan')
+    fired.length = 0
+    const members = await repo.findDoingTasks(instanceId)
+    assert.equal(members.length, 3, '夹具自证：并行会签 3 条 doing 行')
+    const r = await facade.flow('processTask/execute',
+      { processTaskId: members[0].id, operator: members[0].actorIds[0], submitType: SubmitType.CountersignDisagree })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    assert.deepEqual(fired.map(e => e.type), [6], '会签软拒绝＝退回族，只发 6（既没办掉也没生成新待办）')
+    assert.equal(fired[0].submitType, SubmitType.CountersignDisagree)
+  })
+
+  it('场景 34 转办：参与者替换落库之后 fire TASK_TRANSFER(7)，载荷带 instanceId/taskId/fromActor/toActor/operator', async () => {
+    const { engine, repo } = setup()
+    const seen: ProcessEvent[] = []
+    const actorsAtFire: string[][] = []
+    engine.setExtensions({
+      listeners: [async (e) => {
+        if (e.type !== EventType.TaskTransfer) return
+        seen.push(e)
+        actorsAtFire.push(await repo.findTaskActors(e.taskId!))
+      }],
+    })
+    const facade = facadeOf(engine, repo)
+    const defineId = await deploy(facade, '01-simple.json')
+    const instanceId = await start(facade, defineId, 'zhangsan')
+    const task = (await repo.findDoingTasks(instanceId))[0]
+    const r = await facade.flow('processTask/transfer',
+      { processTaskId: task.id, operator: 'leader', fromActor: 'leader', toActor: 'carol', reason: '出差' })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    assert.equal(seen.length, 1, '一次转办 fire 一次')
+    const evt = seen[0]
+    assert.equal(evt.instanceId, instanceId)
+    assert.equal(evt.taskId, task.id, '7 的 sourceId＝taskId（沿用同一任务，不新建）')
+    assert.equal(evt.fromActor, 'leader')
+    assert.equal(evt.toActor, 'carol')
+    assert.equal(evt.operator, 'leader')
+    assert.deepEqual(actorsAtFire[0], ['carol'], 'fire 时参与者已替换落库（原人已摘、新人已在）')
+    assert.ok(!firstSeen(seen).includes('TASK_COMPLETE'), '转办不冒充"任务被办掉"')
+  })
+
+  it('场景 32/34 撤回：TASK_WITHDRAW(8) 每轮只 fire 一次（并行会签 3 条 doing 行也只一次）＋ 不补发 2', async () => {
+    const { engine, repo } = setup()
+    const fired = attachRecorder(engine)
+    const facade = facadeOf(engine, repo)
+    const defineId = await deploy(facade, '05-countersign-parallel.json')
+    const instanceId = await start(facade, defineId, 'zhangsan')
+    fired.length = 0
+    assert.equal((await repo.findDoingTasks(instanceId)).length, 3, '夹具自证：3 条 doing 行')
+    const r = await facade.flow('processInstance/withdraw', { id: instanceId, operator: 'zhangsan' })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    // 本轮契约修正（非自证绿）：依据＝规范 11 §11.3 码 2「实例 state 落库为 20/45 这类『走到终点』
+    // 的状态之后……**30(撤回)/40(终止) 不由本支表达**——各有专属码 8/9；一场撤回同时发 8＋2
+    // 会让下游收到『流程已办结』的错通知」＋ 码 8「撤回只发 8，不补发 2」＋ 规范 08 场景 32
+    // 「**撤回(30)/终止(40) 不发 2**，各发 8/9；同轮既发 8 又发 2 ⇒ 红」。
+    // 故 withdraw 的期望序列从 [8,2] 改为 [8]——这是规范本身改判，不是为了让断言通过。
+    assert.deepEqual(fired.map(e => e.type), [8], '撤回一轮＝只 fire 8 一支，不补发 2（场景 32/34），不逐任务 fire')
+    assert.equal(fired[0].instanceId, instanceId)
+    assert.equal(fired[0].operator, 'zhangsan')
+    assert.equal(fired.filter(e => e.type === 2).length, 0, '撤回不得 fire PROCESS_INSTANCE_END(2)')
+    assert.equal(fired.filter(e => e.type === 8).length, 1, '每轮撤回只 fire 一次 8')
+  })
+
+  it('场景 34 终止：notifyInstanceEnd 漏斗对 state=40 额外 fire INSTANCE_TERMINATED(9)（reason 出空串不省键）；20/30/45 档不发 9', async () => {
+    const { engine, repo } = setup()
+    const fired = attachRecorder(engine)
+    const facade = facadeOf(engine, repo)
+    const defineId = await deploy(facade, '01-simple.json')
+    const instanceId = await start(facade, defineId, 'zhangsan')
+    const inst = (await repo.findInstanceById(instanceId))!
+    fired.length = 0
+    inst.state = InstanceState.Interrupt
+    await repo.updateInstance(inst)
+    await engine.notifyInstanceEnd(inst, 'zhangsan')
+    assert.deepEqual(fired.map(e => e.type), [2, 9], '终止：2(state=40) ＋ 9 各一支')
+    assert.equal(fired[0].state, InstanceState.Interrupt)
+    assert.equal(fired[1].instanceId, instanceId)
+    assert.equal(fired[1].reason, '', 'reason 出空串而非省略整键（§11.3 必备键）')
+    // 负向：其余终态档一律不发 9（多发即红）
+    for (const state of [InstanceState.Done, InstanceState.Withdraw, InstanceState.Reject]) {
+      fired.length = 0
+      inst.state = state
+      await repo.updateInstance(inst)
+      await engine.notifyInstanceEnd(inst, 'zhangsan')
+      assert.deepEqual(fired.map(e => e.type), [2], `state=${state} 只发 2，不发 9`)
+      assert.equal(fired[0].state, state)
+    }
+  })
+
+  it('场景 35 不发清单：定义生命周期（deploy/启停/删除）与抄送状态更新一律零 fire', async () => {
+    const { engine, repo } = setup()
+    const fired = attachRecorder(engine)
+    const facade = facadeOf(engine, repo)
+    const defineId = await deploy(facade, '01-simple.json')
+    const instanceId = await start(facade, defineId, 'zhangsan')
+    fired.length = 0
+    const ops: Array<[string, Record<string, any>]> = [
+      ['processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') }],
+      ['processDefine/upAndDown', { id: defineId, state: 0 }],
+      ['processInstance/updateCCStatus', { processInstanceId: instanceId, operator: 'zhangsan' }],
+      ['processDefine/remove', { id: defineId }],
+    ]
+    for (const [action, args] of ops) {
+      const r = await facade.flow(action, args)
+      assert.equal(r.code, 0, `${action}: ${JSON.stringify(r)}`)
+    }
+    assert.deepEqual(fired, [], '定义生命周期／变量与状态写入不构成独立事实（§11.4 第 2/3 条）')
+  })
+
+  it('场景 36 订阅形状：同一事件挂两个监听器都被调到；零注册时 fire 安全返回', async () => {
+    const { engine, repo } = setup()
+    const hitsA: number[] = []
+    const hitsB: number[] = []
+    engine.setExtensions({ listeners: [
+      (e) => { hitsA.push(e.type) },
+      (e) => { hitsB.push(e.type) },
+    ] })
+    const facade = facadeOf(engine, repo)
+    await start(facade, await deploy(facade, '01-simple.json'), 'zhangsan')
+    assert.ok(hitsA.length >= 3, `监听器 1 收到主链各支: ${hitsA}`)
+    assert.deepEqual(hitsB, hitsA, '一次 fire 送给全部监听器，不得"后注册覆盖前注册"')
+    // 零注册（从未 setExtensions）主流程照常跑完，fire 内部安全返回
+    const bare = setup()
+    const bareFacade = facadeOf(bare.engine, bare.repo)
+    const bareInst = await start(bareFacade, await deploy(bareFacade, '01-simple.json'), 'zhangsan')
+    assert.ok(bareInst, '无监听器时发起＋办理不炸')
+    // 空数组监听器同样安全
+    bare.engine.setExtensions({ listeners: [] })
+    assert.ok(await start(bareFacade, await deploy(bareFacade, '02-multi-task.json'), 'zhangsan'),
+      '空监听器数组时 fire 安全返回')
   })
 })
