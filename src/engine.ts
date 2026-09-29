@@ -6,8 +6,9 @@ import {
 } from './model.js'
 import type { ProcessRepository, ProcessExtRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
 // issues/141 G2：cc 写侧判重的 java `default` 方法在 TS 里的对应物（第三方仓储未实现判重 SPI 时兜旧行为）
-// issues/141 G10：抄送人单值/集合归一的**那一份**判据（漏斗层与写侧层共用，见 spi.normalizeCcActors）
-import { defaultCreateCcInstanceIfAbsent, normalizeCcActors } from './spi.js'
+// issues/141 G10：归属值单值/集合归一的**那一份**判据（漏斗层与写侧层共用；issues/142 B 批
+// 按 spec 06 §2.11 从"只挂 cc 一支"升为 cc 腿与任务腿共用同一枚，见 spi.normalizeActors）
+import { defaultCreateCcInstanceIfAbsent, normalizeActors } from './spi.js'
 import { type EngineExtensions, type FlowInterceptor, type AssignmentHandler, type DecisionHandler, type ProcessEventListener, EventType, type ProcessEvent } from './extensions.js'
 import { HandlerRegistry } from './registry.js'
 
@@ -38,21 +39,29 @@ export const KeyCcActors      = 'tf_ccActors'
 export const KeyCustomReturnVal = 'custom_return_val'
 
 /**
- * issues/127：抄送人入参归一（判据对齐 Java `JeeflowEngineImpl.handleCcActors`）——
+ * issues/127：归属值入参归一（判据对齐 Java `JeeflowEngineImpl.handleCcActors`）——
  * 数组或逗号串都吃，逐项 trim、丢空项、按出现顺序去重。
- * 去重不是锦上添花：`createCcInstance` 逐行 INSERT，内存仓那侧还按实例去重，
+ * 去重不是锦上添花：`createCcInstance`/`insertTaskActors` 逐行 INSERT，内存仓那侧还按实例去重，
  * 同一人写两次会"一行两事件"，破掉 §11.3「逐抄送人 fire 一次 ＝ cc 行粒度一一对应」。
  *
  * <p>issues/141 G10「空不创建行」（spec 06 §2.10）：本函数只留**形态**这一层（逗号串 vs 数组），
- * 单值判据交给 `spi.normalizeCcActors` 那**一份**实现——漏斗层与写侧层（两仓 `createCcInstance`
- * ＋ `defaultCreateCcInstanceIfAbsent`）共用同一条尺子，才不会出现"逗号串修好了、数组腿漏修"
- * 或"门面挡住了、直连仓储照样灌空值"。丢完为空 ⇒ 调用方不建 cc 行、也不 fire 码 4。
+ * 单值判据交给 `spi.normalizeActors` 那**一份**实现——漏斗层与写侧层（两仓 `createCcInstance`／
+ * `addTaskActor` ＋ `defaultCreateCcInstanceIfAbsent`）共用同一条尺子，才不会出现"逗号串修好了、
+ * 数组腿漏修"或"门面挡住了、直连仓储照样灌空值"。丢完为空 ⇒ 调用方不建 cc 行、也不 fire 码 4。
  * 反向哨兵同样由那一条判据保证：`"0"` 这类"看起来像空"的正常 id 不会被吃掉。
+ *
+ * <p>issues/142 B 批（spec 06 §2.11）：本函数从"cc 专用"升为**任务侧与抄送侧共用的形态层**——
+ * 门面 `taskAddActor`（addCandidate/surrogate）、`transfer`、`f_`／`tf_nextNodeOperator` 四条腿
+ * 都收敛到这里，`parseCcActors` 保留为它的别名（旧导出名不删，见下）。
+ * 非数组非字符串（含标量数字）在本形态层按"没有归属人"处理，两仓/两腿同答案。
  */
-export function parseCcActors(v: any): string[] {
+export function parseActorIds(v: any): string[] {
   const list = Array.isArray(v) ? v : (typeof v === 'string' ? v.split(',') : [])
-  return normalizeCcActors(list)
+  return normalizeActors(list)
 }
+
+/** issues/142 B 批：{@link parseActorIds} 的旧名（issues/141 G10 起只挂 cc 一支），别名不是第二份判据。 */
+export const parseCcActors: (v: any) => string[] = parseActorIds
 
 /**
  * 规范 11 §11.3 载荷键 submitType 归一：出**整数**，不用 undefined（⇒ 省略整键）表达
@@ -303,14 +312,14 @@ export class EngineImpl implements Engine {
    * 返回值同步改成那个子集（旧版返回"请求的抄送人"，与"实际新建"不是一回事）。
    * 未实现判重 SPI 的第三方仓储由 `defaultCreateCcInstanceIfAbsent` 兜出旧行为（全量建行＋全量 fire）。
    *
-   * issues/141 G10「空不创建行」（spec 06 §2.10）：`parseCcActors` 已把空串/纯空白/数组里的空元素
+   * issues/141 G10「空不创建行」（spec 06 §2.10）：`parseActorIds` 已把空串/纯空白/数组里的空元素
    * 丢干净，**丢完为空 ⇒ 直接返回、既不建 cc 行也不 fire 码 4**（本栈没有 java 那个
    * `"".split(",")` 得到一个空元素的旧形状）。⚠️ 这一层只是**漏斗**，写侧两仓与
    * `defaultCreateCcInstanceIfAbsent` 各自还要再挡一次——绕过门面/引擎直连仓储的调用方
    * 同样不得把空归属值灌进 `actor_id`（两层缺一层就不算落地）。
    */
   async handleCcActors(instanceId: string, operator: string, ccActors: any): Promise<string[]> {
-    const actors = parseCcActors(ccActors)
+    const actors = parseActorIds(ccActors)
     if (!actors.length || !instanceId) return actors
     const created = this.repo.createCcInstanceIfAbsent
       ? await this.repo.createCcInstanceIfAbsent(instanceId, operator, ...actors)
@@ -959,11 +968,15 @@ export class EngineImpl implements Engine {
       if (Array.isArray(result) && result.length > 0) return result
     }
     // 2. 动态指定下一节点处理人优先（v1.0.1：对齐 boot3 tf_nextNodeOperator）
+    //    issues/142 B 批（spec 06 §2.11 表第三行）：逗号串与数组**两形同判据**——都收敛到
+    //    `parseActorIds` → `spi.normalizeActors` 那一枚单点（逐项 trim、空串/纯空白/null/undefined
+    //    丢弃、同次折叠）。改前的两形两样：串腿 `.filter(Boolean)`（JS 假值判据）、数组腿
+    //    `map(String)`（null→字面量 "null" 的假归属人、不 trim）。标量档本腿历史上就收
+    //    （与 cc 腿不同），保持收单元素但同样过那一判据：数字 0 ⇒ "0" 这个人，不许被当空值丢。
     const nextOp = vars[KeyNextNodeOperator]
     if (nextOp != null) {
-      if (typeof nextOp === 'string') return nextOp.split(',').map(s => s.trim()).filter(Boolean)
-      if (Array.isArray(nextOp)) return nextOp.map(String)
-      return [String(nextOp)]
+      if (typeof nextOp === 'string' || Array.isArray(nextOp)) return parseActorIds(nextOp)
+      return normalizeActors([nextOp])
     }
     // 3. 固定指派 assignee——token 即变量 key，能替换就换，换不了就是字面量（v1.0.1 对齐 boot3 args.get(token, token)）
     const assignee = node.properties?.assignee as string | undefined

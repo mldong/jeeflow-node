@@ -9,8 +9,11 @@ import {
   ProcessDesignHis, ProcessSurrogate, ProcessTask, TaskRow, TaskState,
 } from './model.js'
 import type { OrgUserProvider, ProcessExtRepository, ProcessRepository, QueryCondition } from './spi.js'
+// issues/142 B 批（spec 06 §2.11）：transfer 的 fromActor/toActor 用 cc 侧已落地的那一枚单值判据归一
+// （旧名 normalizeCcActorValue ＝ 新名 normalizeActorValue，同一函数），不在此另写一份 trim＋判空
+import { normalizeActorValue } from './spi.js'
 import type { EngineImpl } from './engine.js'
-import { KeyAutoExecute, KeyAdminID, KeyCcActorsStart, KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign, parseCcActors } from './engine.js'
+import { KeyAutoExecute, KeyAdminID, KeyCcActorsStart, KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign, parseActorIds } from './engine.js'
 import { EventType } from './extensions.js'
 
 // submitType 枚举（对齐 boot3）
@@ -836,10 +839,11 @@ export class JeeflowFacade {
     const instanceId = toId(args.processInstanceId)
     const operator = operatorArg(args)
     // issues/141 G10「空不创建行」（spec 06 §2.10）：手动腿与引擎两条腿走**同一个**归一函数
-    // （`engine.parseCcActors` → `spi.normalizeCcActors`，逗号串与数组两形同判据）——
+    // （`engine.parseActorIds` → `spi.normalizeActors`，逗号串与数组两形同判据；
+    // `parseCcActors` 是 parseActorIds 的旧名，issues/142 B 批把它升为任务侧共用同一枚）——
     // 空串/纯空白/数组里的空元素（含 null，`String(null)` 会变成字面量 "null" 那条假归属人）一律丢弃；
     // 丢完为空 ⇒ 与上面那条"空集合＝actorIds 缺失"同档（沿用既有文案，不新造错误码/文案）。
-    const actors = parseCcActors(args.actorIds)
+    const actors = parseActorIds(args.actorIds)
     if (actors.length === 0) throw new Error('actorIds 缺失')
     // issues/102 ＋ issues/127/132：手动 CC 与发起/办理两条腿同码同漏斗——§11.2 原则 1
     // "码值表达发生了什么事实，不表达谁触发的"，故手动路径照样 fire CC_CREATE(4)。
@@ -1000,8 +1004,16 @@ export class JeeflowFacade {
   }
 
   private async taskAddActor(args: Record<string, any>): Promise<void> {
+    // 主键档（spec 06 §2.11 末段）：processTaskId 缺失/空串/0 由 toId() 响亮报错，
+    // 不新造文案、更不许拿 ''/0 当 id 往下落库——归属值可有可无，主键没有就是调用方写错了。
     const taskId = toId(args.processTaskId)
-    const actors = toStringList2(args.actorIds)
+    // issues/142 B 批（spec 06 §2.11）：`processTask/addCandidate` 与 `processTask/surrogate` 两条
+    // action 同落这一支 ⇒ 同一枚判据。改前的 `toStringList2` 两形两样（逗号串腿 trim＋filter、
+    // 数组腿 `v.map(String)` ⇒ null→"null"、undefined→"undefined"、不 trim、不折叠），
+    // 现换成 cc 侧 issues/141 G10 已落地的那一枚单点（engine.parseActorIds → spi.normalizeActors），
+    // 空串/纯空白/null/undefined 丢弃、trim、同次折叠，反向哨兵 "0" 照落。
+    // 丢完为空 ⇒ 沿用本仓既有"空集合"档文案（'actorIds 缺失'，§2.11 硬要求③不新造错误码/文案）。
+    const actors = parseActorIds(args.actorIds)
     if (actors.length === 0) throw new Error('actorIds 缺失')
     await this.repo.addTaskActor(taskId, actors)
   }
@@ -1013,13 +1025,19 @@ export class JeeflowFacade {
    * 四类明确报错（msg 跨栈统一）。
    */
   private async taskTransfer(args: Record<string, any>): Promise<void> {
+    // 主键档与 taskAddActor 同一条：processTaskId 缺失/空串/0 ⇒ toId() 响亮报错，不许拿 ''/0 往下落库
     const taskId = toId(args.processTaskId)
-    const operator = String(args.operator ?? '').trim()
-    if (!operator) throw new Error('operator 必填')
-    const fromActor = String(args.fromActor ?? '').trim()
-    const toActor = String(args.toActor ?? '').trim()
-    if (!fromActor) throw new Error('fromActor 必填')
-    if (!toActor) throw new Error('toActor 必填')
+    // issues/142 B 批（spec 06 §2.11 表第二行）：fromActor/toActor **归一后再用**——落库值与
+    // "与既有参与者的比较"都取 trim 后的串（改前比较的是未归一的形态：addCandidate 落了 " 8812 "
+    // 之后，转办给 "8812" 判不出是同一个人，同人能再落一行）。
+    // 判空一律用归一后的 `=== ''`（归一只剩空串这一种空形），**严禁** `if (!x)` 这类 JS 假值判据
+    // ——`'0'` 是正常的人；必填档文案沿用既有三条，不新造错误码/文案（§2.11 硬要求③）。
+    const operator = normalizeActorValue(args.operator)
+    if (operator === '') throw new Error('operator 必填')
+    const fromActor = normalizeActorValue(args.fromActor)
+    const toActor = normalizeActorValue(args.toActor)
+    if (fromActor === '') throw new Error('fromActor 必填')
+    if (toActor === '') throw new Error('toActor 必填')
     // 归属判据：只能转自己那一条待办；flow.auto/flow.admin 放行（对齐 isAllowed 既有约定）
     const lower = operator.toLowerCase()
     if (operator !== fromActor && lower !== KeyAutoExecute && lower !== KeyAdminID) {
@@ -1638,12 +1656,6 @@ function idListArgs(args: Record<string, any>): string[] {
     return args.ids.map(toId)
   }
   return [toId(args.id)]
-}
-
-function toStringList2(v: any): string[] {
-  if (Array.isArray(v)) return v.map(String)
-  if (typeof v === 'string') return v.split(',').map(s => s.trim()).filter(Boolean)
-  return []
 }
 
 function toInt(v: any): number {

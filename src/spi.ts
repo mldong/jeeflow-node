@@ -75,48 +75,75 @@ export function hasEffectiveCcOwnership(actorId: unknown, conditions?: QueryCond
 }
 
 /**
- * 抄送人**单个**入参的归一值（issues/141 G10「空不创建行」· spec 06-facade.md §2.10）：
- * `null`/`undefined` ⇒ 空串（即"没有归属人"）；其余取 `String(val).trim()`。
+ * 归属值**单个**入参的归一值（issues/141 G10 spec 06 §2.10 ＋ issues/142 B 批 §2.11 共用的
+ * **那一枚**判据）：`null`/`undefined` ⇒ 空串（即"没有归属人"）；其余取 `String(val).trim()`。
  *
  * ⚠️ 落库与比较一律用这个返回值，`" 123 "` 与 `"123"` 是同一个人——不 trim 就会与 §4 的
  * 写侧判重错开、同一人落两行。反向哨兵：判据只吃空值，`"0"` 这类"看起来像空"的正常 id
  * 归一后是 `"0"`，**不得**被丢掉。
+ *
+ * ⚠️ 判空一律 `String(x).trim() === ''`（即"本函数返回空串"），**严禁** `.filter(Boolean)`／
+ * `if (!x)` 这类语言自带假值判据——它们会吃掉 `'0'`（spec 06 §2.11 硬要求④，php 本轮实测
+ * 无回调 `array_filter` 同款）。
  */
-export function normalizeCcActorValue(val: unknown): string {
+export function normalizeActorValue(val: unknown): string {
   if (val == null) return ''
   return String(val).trim()
 }
 
 /**
- * 抄送人**集合**归一（issues/141 G10「空不创建行」· spec 06-facade.md §2.10，
- * 对齐 java `StringUtils.normalizeCcActors`）：逐元素 {@link normalizeCcActorValue}，
- * **空串 / 纯空白 / null / undefined 一律丢弃**，同一次调用内的重复折叠，顺序保持。
- * 丢完为空 ⇒ 调用方**不得建 cc 行、也不得 fire 码 4**（CC_CREATE）。
+ * 归属值**集合**归一（issues/141 G10「空不创建行」spec 06 §2.10 ＋ issues/142 B 批 §2.11
+ * 「归属值写侧归一」共用的**那一枚**判据，对齐 java `StringUtils.normalizeCcActors`）：
+ * 逐元素 {@link normalizeActorValue}，**空串 / 纯空白 / null / undefined 一律丢弃**，
+ * 同一次调用内的重复折叠，顺序保持。
+ *
+ * <p>丢完为空时调用方的义务分两档（§2.10 要求③ ＋ §2.11 硬要求③，两档都**不新造错误码/文案**）：
+ *   ① 归属值档（抄送人／加签人）：为空 ⇒ 不建行、不 fire 码 4，手动腿与"空集合"既有档同判
+ *      （本栈既有文案 `'actorIds 缺失'`）；
+ *   ② 主键档（`processTaskId`）：**必须响亮报错**——归属值可有可无，主键没有就是调用方写错了，
+ *      静默接受会把脏数据钉进表里（本栈既有信封由 `toId()` 出 `'id 缺失或非法'`）。
  *
  * ⚠️ **单点判据**（本仓 G1 的先例：判据函数放 spi.ts，两仓共用，见 `isBlankOwnershipValue`／
- * `hasEffectiveCcOwnership`）：漏斗层（`engine.parseCcActors` ＋ 门面手动腿）与写侧层
- * （`MemoryRepository.createCcInstance` ＋ `JdbcRepository.createCcInstance` ＋
- * {@link defaultCreateCcInstanceIfAbsent}）都走这一份实现，严禁各抄一遍——
- * 只修漏斗，绕过门面/引擎直连仓储的调用方照样能把空归属值灌进 `actor_id`，
- * 那正是 issues/129 那族"空 operator 读全库"的病根。
+ * `hasEffectiveCcOwnership`）：
+ *   cc 侧——漏斗层（`engine.parseCcActors` ＋ 门面手动腿）＋ 写侧层（两仓 `createCcInstance` ＋
+ *   {@link defaultCreateCcInstanceIfAbsent}）；
+ *   任务侧（§2.11）——漏斗层（门面 `taskAddActor` 的 addCandidate/surrogate 两 action、`transfer`
+ *   的 fromActor/toActor、`f_`／`tf_nextNodeOperator` 两腿）＋ 写侧层（两仓 `addTaskActor` 与
+ *   `insertTaskActors`／`saveTask`／`updateTask` 的参与者落库腿、两仓 `updateCcStatus`）。
+ * 全部走这一份实现，**严禁各抄一遍**：只修漏斗，绕过门面/引擎直连仓储的调用方照样能把空归属值
+ * 灌进 `wf_process_task_actor.actor_id`／`wf_process_cc_instance.actor_id`，那正是 issues/129
+ * 那族"空 operator 读全库"的病根；两份判据迟早分叉（php 本轮实测"归一函数内部严格比较、
+ * 仓储写侧却用松散 in_array ⇒ `'0' == '00'` 静默丢掉第二个人"）。
  *
- * 逗号串与数组两种形态在本函数之上由 `engine.parseCcActors` 收敛成同一个数组再进来，
- * 两形同判据（spec §2.10「别只修一条腿」）。
+ * 逗号串与数组两种形态在本函数之上由 `engine.parseActorIds`（`parseCcActors` 是它的别名）收敛成
+ * 同一个数组再进来，两形同判据（spec §2.10/§2.11「别只修一条腿」）。
  *
- * @param raw 抄送人数组（rest 参数产物 / 已按逗号切开的元素集）；非数组按"没有抄送人"处理
+ * @param raw 归属值数组（rest 参数产物 / 已按逗号切开的元素集）；非数组按"没有归属人"处理
  */
-export function normalizeCcActors(raw: readonly unknown[] | null | undefined): string[] {
+export function normalizeActors(raw: readonly unknown[] | null | undefined): string[] {
   const out: string[] = []
   if (!Array.isArray(raw)) return out
   const seen = new Set<string>()
   for (const item of raw) {
-    const actor = normalizeCcActorValue(item)
-    if (!actor || seen.has(actor)) continue
+    const actor = normalizeActorValue(item)
+    // 判空只认 trim 后的空串（`'0'` 是正常 id，不是空值）；Set 用 SameValueZero，
+    // 不会像松散比较那样把 `'0'` 与 `'00'` 折成一个人
+    if (actor === '' || seen.has(actor)) continue
     seen.add(actor)
     out.push(actor)
   }
   return out
 }
+
+/**
+ * issues/141 G10 的旧名（当时只有 cc 一支用）。issues/142 B 批按 §2.11 尾注的要求把它**升为通用**
+ * 判据（任务侧 addCandidate/surrogate/transfer/nextNodeOperator/写侧两仓共用同一枚），
+ * 改名会破 `@mldong/jeeflow/spi` 的既有导出面 ⇒ 采用"新增通用名 ＋ 旧名转发"：
+ * 下面两枚**就是**上面那两枚（同一个函数对象、不是第二份实现），cc 支继续走同一枚。
+ */
+export const normalizeCcActorValue: (val: unknown) => string = normalizeActorValue
+/** 同 {@link normalizeCcActorValue}：{@link normalizeActors} 的旧名转发，不是第二份判据。 */
+export const normalizeCcActors: (raw: readonly unknown[] | null | undefined) => string[] = normalizeActors
 
 // ── 统计行类型（v1.8.25，issues/103）──
 
@@ -157,6 +184,25 @@ export interface ProcessRepository {
   findHistoryTasks(instanceId: string): Promise<ProcessTask[]>
 
   findTaskActors(taskId: string): Promise<string[]>
+
+  /**
+   * 任务参与者的**最底层写入口**（`wf_process_task_actor.actor_id`，§2.5 口径表里的归属列）。
+   *
+   * <p>issues/142 B 批（spec 06 §2.11「归属值写侧归一」·owner 2026-09-30 拍「八栈一起收：
+   * 两形同判据＋写侧兜底＋trim＋哨兵」）：**本成员自己就必须做归一，不能指望调用方已经归一过**——
+   * 入参逐元素 {@link normalizeActorValue}（空串/纯空白/`null`/`undefined` 一律丢弃、同一次调用内的
+   * 重复折叠），**落库与判重一律取 trim 后的值**（`" 123 "` 与 `"123"` 是同一个人）。判据要落在这一层
+   * 而不只落在门面腿里：绕过 `processTask/addCandidate`／`processTask/surrogate`／`transfer` 直连
+   * 仓储的调用方（集成层、第三方仓储消费者）同样不得把空归属值灌进 `actor_id`——空串／`"  "`／
+   * `"null"`／`"<nil>"` 这一族垃圾值正是 issues/129 那族"空归属值读全库"的上游进水口。
+   *
+   * <p>⚠️ 反向哨兵：判空只认 `String(x).trim() === ''`，**严禁** `.filter(Boolean)`／`if (!x)`
+   * 这类 JS 假值判据（会吃掉 `'0'`），也严禁松散比较（`'0' == '00'` 会把第二个人静默丢掉）。
+   * <p>⚠️ SQL 仓与内存仓**必须同一判据、同一份实现**（都走 {@link normalizeActors}）——
+   * 「同一栈两个仓储两个答案」是 issues/117 场景 27 立过法的形状。
+   * <p>⚠️ 与主键参数分档：`taskId` 缺失/空串属**主键档**，调用方（门面 `toId()`）必须响亮报错，
+   * 不得拿 `''`/`0` 当 id 落库；归属值档才允许"丢了就丢"。
+   */
   addTaskActor(taskId: string, actors: string[]): Promise<void>
   removeTaskActor(taskId: string, actors: string[]): Promise<void>
 
@@ -167,9 +213,19 @@ export interface ProcessRepository {
    * 一律丢弃</b>，落库值取 trim 后的串。判据要落在这一层而不只落在引擎漏斗里——绕过
    * `handleCcActors` 直连仓储的调用方（集成层、第三方仓储消费者）同样不得把空归属值灌进
    * `actor_id`，那正是 issues/129 那族"空 operator 读全库"的病根。实现方请复用
-   * {@link normalizeCcActorValue}／{@link normalizeCcActors}，别各写一套。</p>
+   * {@link normalizeActorValue}／{@link normalizeActors}（旧名 {@link normalizeCcActorValue}／
+   * {@link normalizeCcActors} 是它们的别名，同一枚函数），别各写一套。</p>
    */
   createCcInstance(instanceId: string, creator: string, ...actorIds: string[]): Promise<void>
+
+  /**
+   * 抄送置已读（`wf_process_cc_instance.state` 0→1）。
+   *
+   * <p>issues/142 B 批（spec 06 §2.11 表第四行）：`actorId` 是归属值，**入参归一后再比**——
+   * 取 {@link normalizeActorValue} 的 trim 后值做比较（否则 `" 123 "` 打不中库里的 `"123"`，
+   * 已读点了没反应），且**归一后为空 ⇒ 这一支什么都不做**（空 operator 会把 `state=1`
+   * 打到历史 `actor_id=''` 的脏行上）。两仓同一判据、同一份实现。</p>
+   */
   updateCcStatus(instanceId: string, actorId: string): Promise<void>
 
   /**

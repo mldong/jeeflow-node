@@ -13,7 +13,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { ProcessInstance, ProcessTask, type ProcessDefine, type CcInstanceRow, type DefineRow, type InstanceRow, type TaskRow } from '../model.js'
 import { InstanceState, TaskState } from '../model.js'
 import type { IDGenerator, ProcessRepository, QueryCondition, InstanceStatsRow, TaskStatsRow } from '../spi.js'
-import { isBlankOwnership, isBlankValue, hasEffectiveCcOwnership, defaultCreateCcInstanceIfAbsent, normalizeCcActorValue } from '../spi.js'
+import { isBlankOwnership, isBlankValue, hasEffectiveCcOwnership, defaultCreateCcInstanceIfAbsent, normalizeActorValue, normalizeActors } from '../spi.js'
 
 // ═══ 列白名单（issues/05-5，与 mldong-boot2 别名一致） ═══
 
@@ -431,9 +431,20 @@ export class JdbcRepository implements ProcessRepository {
     await this.insertTaskActors(conn, taskId, actors)
   }
 
-  private async insertTaskActors(conn: SqlConnection, taskId: string, actors: string[]): Promise<void> {
+  /**
+   * `wf_process_task_actor` 的**唯一 INSERT 腿**（`saveTask`/`updateInstance` 级联的
+   * `replaceTaskActors` 与 `addTaskActor` 两条路都从这里下库）。
+   *
+   * <p>issues/142 B 批（spec 06 §2.11「归属值写侧归一」）：绑定进 `actor_id` 的值先过
+   * `spi.normalizeActors` **那一枚**单点——逐元素 trim、空串/纯空白/`null`/`undefined` 丢弃、
+   * 同一次调用内的重复折叠。判据落在这一层而不是只落门面腿：绕过
+   * `processTask/addCandidate`／`surrogate`／`transfer` 直连仓储的调用方（集成层、第三方仓储消费者）
+   * 同样不得把空归属值灌进归属列——那正是 issues/129 那族"空归属值读全库"的上游进水口。
+   * ⚠️ 与内存仓 `MemoryRepository.writeActors` 同一判据、同一份实现，两仓必须同答案。
+   */
+  private async insertTaskActors(conn: SqlConnection, taskId: string, actors: readonly unknown[]): Promise<void> {
     const now = new Date()
-    for (const a of actors) {
+    for (const a of normalizeActors(actors)) {
       await conn.execute(this.sql(
         'INSERT INTO wf_process_task_actor (id, process_task_id, actor_id, create_time, create_user) VALUES (?,?,?,?,?)'),
         [this.idGen.nextId(), taskId, a, now, 'jeeflow'])
@@ -452,11 +463,16 @@ export class JdbcRepository implements ProcessRepository {
   }
 
   async addTaskActor(taskId: string, actors: string[]): Promise<void> {
-    if (actors.length === 0) return
+    // issues/142 B 批（spec 06 §2.11）：写侧兜底——改前这里**判重不判空不 trim**，
+    // `""`/`"  "`/`"null"`（门面数组腿串化出来的假归属人）全放行。
+    // 归一交给 `insertTaskActors` 那一枚单点（与内存仓 writeActors 同一份实现），本方法只多一道
+    // "与库里既有行判重"：判重两侧取的都是 trim 后的值，`" 123 "` 与 `"123"` 是同一个人。
+    const normalized = normalizeActors(actors)
+    if (normalized.length === 0) return
     // 追加语义（对齐 boot2/boot3，issues/03）：查已有参与者，去重后仅插入新增，不清空原参与者
     const existing = await this.findTaskActors(taskId)
     const seen = new Set(existing)
-    const toAdd = actors.filter(a => !seen.has(a))
+    const toAdd = normalized.filter(a => !seen.has(a))
     if (toAdd.length === 0) return
     const conn = await this.c()
     try {
@@ -486,7 +502,8 @@ export class JdbcRepository implements ProcessRepository {
     // （不碰 UPDATE，create_time/update_time 逐字不变）。判重放在**写侧**而不是查询侧：
     // 查询不引入 DISTINCT（owner 2026-09-29 拍），历史重复行也不清理。
     //
-    // issues/141 G10「空不创建行」（spec 06 §2.10）：入参先过 `spi.normalizeCcActorValue`——
+    // issues/141 G10「空不创建行」（spec 06 §2.10）：入参先过 `spi.normalizeActorValue`
+    // （旧名 normalizeCcActorValue 是它的别名，同一枚函数）——
     // 空串/纯空白/null 一律丢弃，绑进 actor_id 的值取 trim 后的串（`" 123 "` 与 `"123"` 是同一个人，
     // 与上面的写侧判重同一条尺子）。绕过引擎/门面直连仓储的第三方调用方也建不出 actor_id='' 的行，
     // 那正是 issues/129 那族"空 operator 读全库"的病根。⚠️ 与内存仓共用一份判据，两仓必须同答案。
@@ -495,8 +512,8 @@ export class JdbcRepository implements ProcessRepository {
     try {
       const now = new Date()
       for (const rawActorId of actorIds) {
-        const actorId = normalizeCcActorValue(rawActorId)
-        if (!actorId || existing.includes(actorId)) continue
+        const actorId = normalizeActorValue(rawActorId)
+        if (actorId === '' || existing.includes(actorId)) continue
         await conn.execute(this.sql(
           'INSERT INTO wf_process_cc_instance (id, process_instance_id, actor_id, state, ' +
           'create_time, create_user, update_time, update_user) VALUES (?,?,?,0,?,?,?,?)'),
@@ -532,11 +549,16 @@ export class JdbcRepository implements ProcessRepository {
   }
 
   async updateCcStatus(instanceId: string, actorId: string): Promise<void> {
+    // issues/142 B 批（spec 06 §2.11 表第四行）：归属值入参**归一后再比**——比较值取 trim 后的串
+    // （`" 123 "` 打不中行里的 `"123"` 就是"点了已读没反应"），归一后为空 ⇒ **一条 UPDATE 都不发**
+    // （空 operator 会把 state=1 打到历史 `actor_id=''` 的脏行上）。与内存仓同一枚判据。
+    const actor = normalizeActorValue(actorId)
+    if (actor === '') return
     const conn = await this.c()
     try {
       await conn.execute(this.sql(
         'UPDATE wf_process_cc_instance SET state=1, update_time=? WHERE process_instance_id=? AND actor_id=?'),
-        [new Date(), instanceId, actorId])
+        [new Date(), instanceId, actor])
     } finally {
       await this.done(conn)
     }

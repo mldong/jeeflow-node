@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { EngineImpl, KeyAutoGenTitle, KeyCustomReturnVal, KeyRealName, KeyUserID } from '../src/engine.js'
+import { EngineImpl, KeyAutoGenTitle, KeyCustomReturnVal, KeyRealName, KeyUserID, parseActorIds, parseCcActors } from '../src/engine.js'
 import { HandlerRegistry, registerBuiltinAssignments } from '../src/index.js'
 import { MemoryRepository } from '../src/memory.js'
 import { MemoryExtRepository } from '../src/memory-ext.js'
@@ -12,7 +12,12 @@ import { JeeflowFacade } from '../src/facade.js'
 import { InstanceState, TaskState, SubmitType, type ProcessDefine, ProcessInstance, ProcessTask } from '../src/model.js'
 import type { ExpressionEvaluator, UserProvider } from '../src/spi.js'
 // issues/141 G10：写侧兜底路径（java `default` 方法的 TS 对应物）＋ 单点判据要能直连测到
-import { defaultCreateCcInstanceIfAbsent } from '../src/spi.js'
+// issues/142 B 批（spec 06 §2.11）：单点升为通用名 normalizeActors/normalizeActorValue，
+// cc 侧旧名保留为别名——测试同时引两名，钉住"别名就是同一枚函数"（严禁第二份判据）
+import {
+  defaultCreateCcInstanceIfAbsent, normalizeActorValue, normalizeActors,
+  normalizeCcActorValue, normalizeCcActors,
+} from '../src/spi.js'
 import { type FlowInterceptor, EventType, type EngineExtensions, type ProcessEvent,
   // issues/132 §11.6 改名兼容义务：旧成员名保留一代为别名（enum 外部的同值常量）
   ProcessStart, ProcessFinish, ProcessReject, TaskCreate, TaskComplete, CcCreate } from '../src/extensions.js'
@@ -6301,6 +6306,493 @@ describe('issues/142 记录类节点 custom 落 DONE 历史行并真落库 ＋ �
     assert.equal(done!.variables.isFirstTaskNode, true, 'start 直接后继 ⇒ 行级首节点标记为 true（建单不变量与 java 同规格）')
     assert.equal(String(done!.parentTaskId), '0', '发起 execution 无当前任务 ⇒ parentTaskId 落字符 0（issues/121 P1）')
     assert.equal((await h.mem.findInstanceById(inst.id))!.variables.custom_return_val, 'LEDGER-1', '返回值随续流写进实例变量')
+  })
+})
+
+// ═══ issues/142 B 批 · 归属值写侧归一（actor_id 与 task id）════════════════════════════
+//
+// 条文＝jeeflow-doc/docs/spec/06-facade.md §2.11（把 §2.10 的四点实现要求**逐字**搬到任务侧）；
+// 普查＝jeeflow-hub/issues/142 §2 B 表 node 行；owner 2026-09-30 拍：
+// 「八栈一起收：两形同判据＋写侧兜底＋trim＋哨兵」。
+//
+// 本栈改前四处病灶（逐处还原现状的实测红格见本轮报告）：
+//   ① 门面 taskAddActor（`processTask/addCandidate` 与 `processTask/surrogate` 两条 action 同体）走
+//      toStringList2，**数组腿** `v.map(String)` ⇒ null→字面量 "null"、undefined→"undefined"、
+//      不 trim、不折叠；只有逗号串腿才 trim＋filter＝两形两把尺子。
+//   ② transfer 的 fromActor/toActor 与**既有参与者**比较时取的是未归一的形态：addCandidate 落了
+//      " 8812 " 之后转办给 "8812" 判不出是同一个人（§2.11 硬要求②「落库与比较取 trim 后的值」）。
+//   ③ 引擎 resolveActors 的 tf_nextNodeOperator 腿：数组 `nextOp.map(String)`（同款串化）＋逗号串
+//      `.filter(Boolean)`（JS 假值判据）；f_ 发起腿经门面原样转投，同一支消费腿。
+//   ④ 两仓 addTaskActor **判重不判空不 trim**（只修门面腿则绕过门面直连仓储的调用方照样灌空值）；
+//      updateCcStatus 的入参也不过归一（空 operator 能把 state=1 打到历史 actor_id='' 的脏行上）。
+//
+// 反向哨兵（§2.10 要求④ ＋ §2.11 硬要求④）：`'0'`／`'00'`／`'a'` 是三个互不相同的**正常 id**，
+// 判空一律 `String(x).trim() === ''`——严禁 `.filter(Boolean)`／`if (!x)` 这类 JS 假值判据。
+// （注意：`' '` 纯空白按条文属"空值"档丢弃，与 `'0'` 那档"看起来像空但不是空"是两件事。）
+//
+// 主键另判一档：`processTaskId` 缺失/空串/0 **必须响亮报错**（沿用本仓既有 'id 缺失或非法' 信封，
+// 不新造文案），不得拿 ''/0 当 id 往下落库——归属值可有可无，主键没有就是调用方写错了。
+// ─────────────────────────────────────────────────────────────────────────────────────
+
+describe('issues/142 B 批 归属值写侧归一（spec 06 §2.11）：两形同判据＋写侧兜底＋trim＋哨兵', () => {
+  function harnessB11() {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    return { engine, repo, facade }
+  }
+  async function defOf11(facade: JeeflowFacade): Promise<string> {
+    const r = await facade.flow('processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    return String(r.data.processDefineId)
+  }
+  /** startAndExecute 走完 apply ⇒ 唯一待办 task1（参与者 leader） */
+  async function start11(facade: JeeflowFacade, defineId: string, extra: Record<string, any> = {}): Promise<string> {
+    const r = await facade.flow('processInstance/startAndExecute', { processDefineId: defineId, operator: 'zhangsan', ...extra })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    return String(r.data.processInstanceId)
+  }
+  async function task11(repo: MemoryRepository, instanceId: string) {
+    const doing = await repo.findDoingTasks(instanceId)
+    assert.equal(doing.length, 1, JSON.stringify(doing.map(t => t.taskName)))
+    return doing[0]
+  }
+  const addBy = (facade: JeeflowFacade, taskId: string, actorIds: any, action = 'processTask/addCandidate') =>
+    facade.flow(action, { processTaskId: taskId, actorIds })
+
+  /**
+   * SQL 仓一路的 T0 假适配器（与 G10 的 ccTableG10 同款姿势：不连库、不开端口）。
+   * 内存里养 `wf_process_task_actor` ＋ `wf_process_cc_instance` 两张表并逐条记语句 ⇒
+   * "空值不得下库"看的是 INSERT/UPDATE **流水**，而不是返回值。
+   */
+  function actorTableB11() {
+    const actorRows: Array<Record<string, any>> = []
+    const ccRows: Array<Record<string, any>> = []
+    const stmts: Array<{ sql: string; args: any[] }> = []
+    const conn: any = {
+      async execute(sql: string, args: any[]) {
+        stmts.push({ sql, args })
+        if (/^INSERT INTO wf_process_task_actor/.test(sql)) {
+          actorRows.push({ process_task_id: args[1], actor_id: args[2] })
+          return
+        }
+        if (/^DELETE FROM wf_process_task_actor/.test(sql)) {
+          if (/actor_id IN/.test(sql)) {
+            const wanted = args.slice(1)
+            for (let i = actorRows.length - 1; i >= 0; i--) {
+              if (String(actorRows[i].process_task_id) === String(args[0]) && wanted.includes(actorRows[i].actor_id)) actorRows.splice(i, 1)
+            }
+          } else {
+            for (let i = actorRows.length - 1; i >= 0; i--) {
+              if (String(actorRows[i].process_task_id) === String(args[0])) actorRows.splice(i, 1)
+            }
+          }
+          return
+        }
+        if (/^INSERT INTO wf_process_cc_instance/.test(sql)) {
+          ccRows.push({ process_instance_id: args[1], actor_id: args[2], state: 0 })
+          return
+        }
+        if (/^UPDATE wf_process_cc_instance/.test(sql)) {
+          for (const r of ccRows) {
+            if (String(r.process_instance_id) === String(args[1]) && r.actor_id === args[2]) r.state = 1
+          }
+          return
+        }
+        throw new Error(`假适配器收到未预期语句: ${sql}`)
+      },
+      async fetchAll(sql: string, args: any[]) {
+        stmts.push({ sql, args })
+        if (/^SELECT actor_id FROM wf_process_task_actor/.test(sql)) {
+          return actorRows.filter(r => String(r.process_task_id) === String(args[0])).map(r => ({ actor_id: r.actor_id }))
+        }
+        if (/^SELECT actor_id FROM wf_process_cc_instance/.test(sql)) {
+          return ccRows.filter(r => String(r.process_instance_id) === String(args[0])).map(r => ({ actor_id: r.actor_id }))
+        }
+        throw new Error(`假适配器收到未预期语句: ${sql}`)
+      },
+      async fetchOne() { return null },
+      async begin() {}, async commit() {}, async rollback() {},
+    }
+    const adapter: any = { placeholder: '?', async acquire() { return conn }, async release() {} }
+    const repo = new JdbcRepository(adapter)
+    return {
+      repo, actorRows, ccRows, stmts,
+      actorInserts: () => stmts.filter(s => /^INSERT INTO wf_process_task_actor/.test(s.sql)),
+      ccUpdates: () => stmts.filter(s => /^UPDATE wf_process_cc_instance/.test(s.sql)),
+    }
+  }
+
+  // ═══ 正向对照（B 批不得把好行为改坏）═══
+
+  for (const action of ['processTask/addCandidate', 'processTask/surrogate']) {
+    it(`B11 正向对照 · ${action} 非空参与者照旧追加（两条 action 同落 taskAddActor，同一判据）`, async () => {
+      const { repo, facade } = harnessB11()
+      const instanceId = await start11(facade, await defOf11(facade))
+      const task = await task11(repo, instanceId)
+
+      const r = await addBy(facade, task.id, ['9101', '9102'], action)
+      assert.equal(r.code, 0, JSON.stringify(r))
+      assert.deepEqual(await repo.findTaskActors(task.id), ['leader', '9101', '9102'], '追加语义（issues/03）不受本批影响')
+    })
+  }
+
+  // ═══ 要求① 门面腿：两形同判据 ═══
+
+  it('B11 数组腿 · null/undefined 是空值，不是字面量 "null"/"undefined" 假归属人（toStringList2 数组腿旧形状）', async () => {
+    for (const action of ['processTask/addCandidate', 'processTask/surrogate']) {
+      const { repo, facade } = harnessB11()
+      const instanceId = await start11(facade, await defOf11(facade))
+      const task = await task11(repo, instanceId)
+
+      const r = await addBy(facade, task.id, ['8801', null, undefined, '', '  '], action)
+      assert.equal(r.code, 0, JSON.stringify(r))
+      assert.deepEqual(await repo.findTaskActors(task.id), ['leader', '8801'],
+        `${action}：null/undefined/空串/纯空白一律丢弃，不得被 String() 串化成 "null"/"undefined" 落进 actor_id`)
+    }
+  })
+
+  it('B11 两形同判据 · 逗号串与数组给同一组人必须得同一个集合（只修一条腿＝本条要抓的形状）', async () => {
+    const { repo, facade } = harnessB11()
+    const defineId = await defOf11(facade)
+
+    const byString = await start11(facade, defineId)
+    const t1 = await task11(repo, byString)
+    assert.equal((await addBy(facade, t1.id, '8802,,8803,')).code, 0)
+
+    const byArray = await start11(facade, defineId)
+    const t2 = await task11(repo, byArray)
+    assert.equal((await addBy(facade, t2.id, ['8802', '', '8803'])).code, 0)
+
+    assert.deepEqual(await repo.findTaskActors(t2.id), await repo.findTaskActors(t1.id),
+      '数组腿与逗号串腿同判据（改前：串腿 trim＋filter、数组腿 map(String) 原样照收）')
+    assert.deepEqual(await repo.findTaskActors(t1.id), ['leader', '8802', '8803'], '空元素/尾随逗号丢弃')
+  })
+
+  it('B11 trim · 落库与比较取 trim 后的值：" 8804 " 与 "8804" 是同一个人，不得落两行', async () => {
+    const { repo, facade } = harnessB11()
+    const instanceId = await start11(facade, await defOf11(facade))
+    const task = await task11(repo, instanceId)
+
+    assert.equal((await addBy(facade, task.id, [' 8804 '])).code, 0)
+    assert.deepEqual(await repo.findTaskActors(task.id), ['leader', '8804'], '入库值必须是 trim 后的串')
+
+    assert.equal((await addBy(facade, task.id, ['8804'])).code, 0)
+    assert.deepEqual(await repo.findTaskActors(task.id), ['leader', '8804'], '带空格与不带空格命中写侧判重（不 trim 就把判重打穿）')
+  })
+
+  it('B11 同一次调用内的重复折叠 · ["8805","8805"," 8805 "] ⇒ 只落一行', async () => {
+    const { repo, facade } = harnessB11()
+    const instanceId = await start11(facade, await defOf11(facade))
+    const task = await task11(repo, instanceId)
+
+    assert.equal((await addBy(facade, task.id, ['8805', '8805', ' 8805 '])).code, 0)
+    assert.deepEqual(await repo.findTaskActors(task.id), ['leader', '8805'], '同次调用折叠（与 cc 侧 G10 同一枚判据）')
+  })
+
+  it('B11 反向哨兵 · "0"/"00"/"a" 是三个互不相同的正常 id，只有 " " 才是空值', async () => {
+    const { repo, facade } = harnessB11()
+    const defineId = await defOf11(facade)
+
+    const t = await task11(repo, await start11(facade, defineId))
+    assert.equal((await addBy(facade, t.id, ['0', '00', ' ', 'a'])).code, 0)
+    assert.deepEqual(await repo.findTaskActors(t.id), ['leader', '0', '00', 'a'],
+      "判空只吃空串/纯空白：'0' 与 '00' 与 'a' 各自独立，不得被假值判据吃掉、也不得互相折叠成一个人")
+
+    // 逗号串腿同一档（`.filter(Boolean)` 在这一腿就是条文点名的反面判据）
+    const t2 = await task11(repo, await start11(facade, defineId))
+    assert.equal((await addBy(facade, t2.id, '0,00,a')).code, 0)
+    assert.deepEqual(await repo.findTaskActors(t2.id), ['leader', '0', '00', 'a'], "逗号串里的 '0' 同样是正常 id")
+
+    // 数字 0 也走同一枚（String(0)='0'），不得因 `!x` 被判成空
+    const t3 = await task11(repo, await start11(facade, defineId))
+    assert.equal((await addBy(facade, t3.id, [0, 'a'])).code, 0)
+    assert.deepEqual(await repo.findTaskActors(t3.id), ['leader', '0', 'a'], '数字 0 归一为 "0"，是人不是空')
+  })
+
+  it('B11 空入参档沿用既有错误信封 · 丢完为空 ⇒ "actorIds 缺失"，一行不落（不新造文案）', async () => {
+    const { repo, facade } = harnessB11()
+    const defineId = await defOf11(facade)
+    const ref = await addBy(facade, (await task11(repo, await start11(facade, defineId))).id, [])
+    assert.equal(ref.code, 99999999, `参照档应报错: ${JSON.stringify(ref)}`)
+    assert.ok(ref.msg.includes('actorIds 缺失'), ref.msg)
+
+    for (const [label, actorIds] of [
+      ["'' 空串", ''], ["'   ' 纯空白", '   '], ["['']", ['']], ["['  ']", ['  ']],
+      ["[null]", [null]], ["[undefined]", [undefined]], ["[null, undefined]", [null, undefined]],
+      ["' , , '", ' , , '],
+    ] as Array<[string, any]>) {
+      const task = await task11(repo, await start11(facade, defineId))
+      const r = await addBy(facade, task.id, actorIds)
+      assert.equal(r.code, ref.code, `${label} 应与空集合同档（code）: ${JSON.stringify(r)}`)
+      assert.equal(r.msg, ref.msg, `${label} 应与空集合同档（msg 逐字）`)
+      assert.deepEqual(await repo.findTaskActors(task.id), ['leader'], `B11：${label} 一行参与者都不许落`)
+    }
+  })
+
+  it('B11 主键另判一档 · processTaskId 缺失/空串/"0" 必须响亮报错，不得拿 \'\'/0 落库', async () => {
+    const { repo, facade } = harnessB11()
+    const defineId = await defOf11(facade)
+    const okTask = await task11(repo, await start11(facade, defineId))
+
+    for (const action of ['processTask/addCandidate', 'processTask/surrogate', 'processTask/transfer']) {
+      for (const [label, taskId] of [['缺失', undefined], ['空串', ''], ["'0'", '0'], ['纯空白', '  '], ['非数字', 'abc']] as Array<[string, any]>) {
+        const args: Record<string, any> = { processTaskId: taskId, actorIds: ['8899'] }
+        if (action === 'processTask/transfer') Object.assign(args, { fromActor: 'leader', toActor: '8899', operator: 'leader' })
+        const r = await facade.flow(action, args)
+        assert.equal(r.code, 99999999, `${action}/${label} 主键档必须报错: ${JSON.stringify(r)}`)
+        assert.ok(String(r.msg).includes('id 缺失或非法'), `${action}/${label} 沿用既有信封: ${r.msg}`)
+      }
+      // 主键报错不牵连正常腿：同一实例上真任务的参与者没被动，也没有任何地方落进 8899
+      assert.deepEqual(await repo.findTaskActors(okTask.id), ['leader'], `${action} 主键报错后既有参与者不变`)
+      for (const bogus of ['', '0', '  ', 'abc']) {
+        assert.deepEqual(await repo.findTaskActors(bogus), [], `不得拿 ${JSON.stringify(bogus)} 当 taskId 落库`)
+      }
+    }
+  })
+
+  // ═══ transfer 腿（§2.11 表第二行）═══
+
+  it('B11 transfer · 入参归一后再用：与既有参与者的比较取 trim 后的值', async () => {
+    const { repo, facade } = harnessB11()
+    const instanceId = await start11(facade, await defOf11(facade))
+    const task = await task11(repo, instanceId)
+
+    assert.equal((await addBy(facade, task.id, [' 8812 '])).code, 0)
+    assert.deepEqual(await repo.findTaskActors(task.id), ['leader', '8812'],
+      '参与者落库值先是 trim 后的串（改前落 " 8812 "，下面两档的比较全部错开）')
+
+    const dup = await facade.flow('processTask/transfer',
+      { processTaskId: task.id, fromActor: 'leader', toActor: ' 8812 ', operator: 'leader' })
+    assert.equal(dup.code, 99999999, JSON.stringify(dup))
+    assert.ok(String(dup.msg).includes('目标人已是该任务参与人'), `归一后比较应命中同人: ${dup.msg}`)
+
+    const ok = await facade.flow('processTask/transfer',
+      { processTaskId: task.id, fromActor: ' 8812 ', toActor: ' lisi ', operator: '8812' })
+    assert.equal(ok.code, 0, JSON.stringify(ok))
+    assert.deepEqual(await repo.findTaskActors(task.id), ['leader', 'lisi'],
+      'fromActor 带空白照样命中那一行；toActor 落库值也是 trim 后的串')
+  })
+
+  it('B11 transfer · 必填档沿用既有文案，"0" 是正常的人不是空值', async () => {
+    const { repo, facade } = harnessB11()
+    const instanceId = await start11(facade, await defOf11(facade))
+    const task = await task11(repo, instanceId)
+
+    for (const [label, patch, keyword] of [
+      ['fromActor 空串', { fromActor: '', toActor: 'lisi', operator: 'leader' }, 'fromActor 必填'],
+      ['fromActor null', { fromActor: null, toActor: 'lisi', operator: 'leader' }, 'fromActor 必填'],
+      ['fromActor 纯空白', { fromActor: '  ', toActor: 'lisi', operator: 'leader' }, 'fromActor 必填'],
+      ['toActor undefined', { fromActor: 'leader', toActor: undefined, operator: 'leader' }, 'toActor 必填'],
+      ['toActor 纯空白', { fromActor: 'leader', toActor: '  ', operator: 'leader' }, 'toActor 必填'],
+      ['operator 缺失', { fromActor: 'leader', toActor: 'lisi' }, 'operator 必填'],
+    ] as Array<[string, any, string]>) {
+      const r = await facade.flow('processTask/transfer', { processTaskId: task.id, ...patch })
+      assert.equal(r.code, 99999999, `${label}: ${JSON.stringify(r)}`)
+      assert.ok(String(r.msg).includes(keyword), `${label} 应报「${keyword}」: ${r.msg}`)
+      assert.deepEqual(await repo.findTaskActors(task.id), ['leader'], `报错后参与者不变（${label}）`)
+    }
+
+    const zero = await facade.flow('processTask/transfer',
+      { processTaskId: task.id, fromActor: 'leader', toActor: '0', operator: 'leader' })
+    assert.equal(zero.code, 0, `反向哨兵：转办给 '0' 是正常调用 ${JSON.stringify(zero)}`)
+    assert.deepEqual(await repo.findTaskActors(task.id), ['0'], "转办给 '0' 照旧成立，落库值就是 '0'")
+  })
+
+  // ═══ nextNodeOperator 两条腿（§2.11 表第三行：发起人指定的下一节点参与者）═══
+
+  async function actorsViaNextOperator(value: any): Promise<string[]> {
+    const { engine, repo } = setup()
+    const def = loadFlow(repo, '01-simple.json')
+    const inst = await engine.startProcessInstanceById(def.id, 'zhangsan')
+    const apply = (await repo.findDoingTasks(inst.id))[0]
+    await engine.executeProcessTask(apply.id, 'zhangsan', { tf_nextNodeOperator: value })
+    const doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing.length, 1, JSON.stringify(doing.map(t => t.taskName)))
+    return doing[0].actorIds
+  }
+
+  it('B11 tf_nextNodeOperator · 数组腿不过 String() 串化，与逗号串腿同判据', async () => {
+    assert.deepEqual(await actorsViaNextOperator(['BOSS1', '', null, undefined, '  ', ' BOSS2 ']), ['BOSS1', 'BOSS2'],
+      '数组里的 null/undefined/空串/纯空白丢弃，有效值取 trim 后的串（改前落 "null"/"undefined"/""/" BOSS2 "）')
+    assert.deepEqual(await actorsViaNextOperator('BOSS1,,BOSS2,'), ['BOSS1', 'BOSS2'], '逗号串腿照旧')
+    assert.deepEqual(await actorsViaNextOperator(['BOSS1', 'BOSS2']), await actorsViaNextOperator('BOSS1,BOSS2'),
+      '两形同判据（本条要抓的形状就是只修一条腿）')
+  })
+
+  it('B11 tf_nextNodeOperator 反向哨兵 · "0"/"00"/"a" 三个人不得被假值判据吃掉', async () => {
+    assert.deepEqual(await actorsViaNextOperator('0,00,a'), ['0', '00', 'a'], "逗号串腿：'0' 不是空值")
+    assert.deepEqual(await actorsViaNextOperator(['0', '00', ' ', 'a']), ['0', '00', 'a'],
+      "数组腿同判据：' ' 按条文是空值丢弃，'0'/'00'/'a' 三个人各立")
+  })
+
+  it('B11 tf_nextNodeOperator 标量档不被本批改动带崩 · 数字仍收成字符串参与者，"0" 仍是人', async () => {
+    assert.deepEqual(await actorsViaNextOperator(8801), ['8801'], '标量档历史上就收，本批改的是两形判据不是收窄')
+    assert.deepEqual(await actorsViaNextOperator(0), ['0'], "数字 0 ⇒ '0' 这个人（`!x` 判据会把它当空）")
+  })
+
+  it('B11 f_nextNodeOperator 发起腿 · 与 tf_ 腿同一条判据（经门面转投后仍归一）', async () => {
+    const { repo, facade } = harnessB11()
+    const defineId = await defOf11(facade)
+
+    const r = await facade.flow('processInstance/startAndExecute', {
+      processDefineId: defineId, operator: 'zhangsan', f_nextNodeOperator: ['userA', '', null, undefined, ' userB '],
+    })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    const doing = await repo.findDoingTasks(String(r.data.processInstanceId))
+    assert.equal(doing[0].taskName, 'task1')
+    assert.deepEqual(doing[0].actorIds, ['userA', 'userB'],
+      `发起腿数组形态同样丢空＋trim（改前落 ["userA","","null","undefined",""," userB "]）: ${JSON.stringify(doing[0].actorIds)}`)
+
+    const r2 = await facade.flow('processInstance/startAndExecute', {
+      processDefineId: defineId, operator: 'zhangsan', f_nextNodeOperator: 'userA,userB',
+    })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    assert.deepEqual((await repo.findDoingTasks(String(r2.data.processInstanceId)))[0].actorIds,
+      ['userA', 'userB'], 'f_ 腿的逗号串与数组两形同判据')
+
+    const r3 = await facade.flow('processInstance/startAndExecute', {
+      processDefineId: defineId, operator: 'zhangsan', f_nextNodeOperator: ['0', ' ', '00'],
+    })
+    assert.deepEqual((await repo.findDoingTasks(String(r3.data.processInstanceId)))[0].actorIds, ['0', '00'],
+      '反向哨兵：发起腿数组里的 "0" 不得被吃掉')
+  })
+
+  // ═══ 要求：仓储写侧兜底（§2.11 表第五行，两仓同一判据）═══
+
+  it('B11 内存仓写侧兜底 · 直连 addTaskActor：trim＋丢空＋判重，全空入参一行不落', async () => {
+    const { repo } = setup()
+
+    await repo.addTaskActor('B11-M1', ['', '  ', null as any, undefined as any, ' 8501 ', '8501'])
+    assert.deepEqual(await repo.findTaskActors('B11-M1'), ['8501'],
+      '仓储写侧空串/纯空白/null 都不落，值取 trim 后的串，同人折叠（改前：判重不判空不 trim，五条全进）')
+
+    await repo.addTaskActor('B11-M1', [' 8501 '])
+    assert.deepEqual(await repo.findTaskActors('B11-M1'), ['8501'], 'trim 后同值命中既有行 ⇒ 不多落一行')
+
+    await repo.addTaskActor('B11-M2', ['', '   '])
+    assert.deepEqual(await repo.findTaskActors('B11-M2'), [], '全空入参 ⇒ 一行都不建（本条普查的正主）')
+
+    await repo.addTaskActor('B11-M3', ['0', '00', ' ', 'a'])
+    assert.deepEqual(await repo.findTaskActors('B11-M3'), ['0', '00', 'a'], '反向哨兵在写侧同样成立')
+  })
+
+  it('B11 内存仓写侧兜底 · saveTask/updateTask 落的 aggregate.actorIds 也过同一枚判据', async () => {
+    const { repo } = setup()
+    const task = new ProcessTask({
+      id: 'B11-SA-1', processInstanceId: 'B11-INST-1', taskName: 'n1', displayName: 'N1',
+      taskType: 0, performType: 0, taskState: TaskState.Doing, actorId: '', variables: {},
+      createTime: new Date(), createUser: 'tester', updateTime: new Date(), updateUser: 'tester',
+    })
+    task.actorIds = [' 8701 ', '', null as any, undefined as any, '8701']
+    await repo.saveTask(task)
+    assert.deepEqual(await repo.findTaskActors('B11-SA-1'), ['8701'], '建单腿同样挡空（与 SQL 仓 insertTaskActors 同一条尺子）')
+
+    task.actorIds = ['8702', '   ', ' 8703 ']
+    await repo.updateTask(task)
+    assert.deepEqual(await repo.findTaskActors('B11-SA-1'), ['8702', '8703'], '更新腿：丢空＋trim')
+  })
+
+  it('B11 SQL 仓写侧兜底 · 直连 addTaskActor：空值一条 INSERT 都不发，落库值取 trim 后的串', async () => {
+    const { repo, actorRows, actorInserts } = actorTableB11()
+
+    await repo.addTaskActor('900401', ['', '  ', null as any, undefined as any, ' 8501 ', '8501'])
+    assert.equal(actorInserts().length, 1, `空串/纯空白/null 不得下库，实发 ${actorInserts().length} 条 INSERT`)
+    assert.deepEqual(actorRows.map(r => r.actor_id), ['8501'])
+
+    const before = actorInserts().length
+    await repo.addTaskActor('900401', ['', '   '])
+    assert.equal(actorInserts().length, before, '全空入参 ⇒ 一条 INSERT 都不许多发')
+
+    await repo.addTaskActor('900401', [' 8501 '])
+    assert.equal(actorInserts().length, before, 'trim 后同值命中写侧判重 ⇒ 不多发')
+
+    await repo.addTaskActor('900402', ['0', '00', ' ', 'a'])
+    assert.deepEqual(actorRows.filter(r => String(r.process_task_id) === '900402').map(r => r.actor_id),
+      ['0', '00', 'a'], '反向哨兵：SQL 写侧也只丢纯空白')
+  })
+
+  it('B11 两仓同答案 · 同一组入参在内存仓与 SQL 仓得到同一个参与者集合（issues/117 场景 27 那把尺子）', async () => {
+    const vectors: Array<{ label: string; actors: any[] }> = [
+      { label: '空串/纯空白/null/未 trim 同人混给', actors: ['', '   ', null, undefined, ' 8501 ', '8501'] },
+      { label: '有效人夹空元素', actors: ['8502', '', '8503'] },
+      { label: '只有带空格的一个人', actors: [' 8504 '] },
+      { label: '反向哨兵 "0"/"00"/"a" 与纯空白', actors: ['0', '00', ' ', 'a'] },
+      { label: '全空', actors: ['', '  '] },
+      { label: '同一次调用内的重复', actors: ['8505', ' 8505 ', '8505'] },
+      { label: '数字与布尔元素', actors: [0, 8506, 'a'] },
+    ]
+    for (const [idx, { label, actors }] of vectors.entries()) {
+      const mem = new MemoryRepository()
+      const sql = actorTableB11()
+      await mem.addTaskActor(`B11-X-${idx}`, actors as string[])
+      await sql.repo.addTaskActor(`9005${idx}0`, actors as string[])
+      const a = await mem.findTaskActors(`B11-X-${idx}`)
+      const b = await sql.repo.findTaskActors(`9005${idx}0`)
+      assert.deepEqual(a, b, `「${label}」两仓必须同答案：内存仓出 ${JSON.stringify(a)}，SQL 仓出 ${JSON.stringify(b)}`)
+    }
+    // 同答案还不够，答案还得是"只丢空的、取 trim 的"那一个
+    const mem = new MemoryRepository()
+    await mem.addTaskActor('B11-X-9', ['', '   ', null as any, undefined as any, ' 8501 ', '8501'])
+    assert.deepEqual(await mem.findTaskActors('B11-X-9'), ['8501'], '混给档的期望真值')
+  })
+
+  // ═══ updateCCStatus 的 operator（§2.11 表第四行，cc 侧同一条尺子）═══
+
+  it('B11 updateCcStatus 两仓 · 入参归一后再比：空值不挡任何行，" 8601 " 命中 "8601"', async () => {
+    const { repo } = setup()
+    await repo.createCcInstance('B11-C1', 'zhangsan', ' 8601 ')
+    assert.deepEqual(await repo.findCcActorIds('B11-C1'), ['8601'], '前置：cc 行落的是 trim 后的串')
+
+    await repo.updateCcStatus('B11-C1', ' 8601 ')
+    assert.equal(repo.ccRowsForTest('B11-C1')[0].state, 1, '" 8601 " 与 "8601" 是同一个人，已读必须打中那一行')
+
+    await repo.createCcInstance('B11-C2', 'zhangsan', '8602')
+    await repo.updateCcStatus('B11-C2', '   ')
+    assert.equal(repo.ccRowsForTest('B11-C2')[0].state, 0, '空 operator 不许把 state=1 打到别人的行上')
+
+    const sql = actorTableB11()
+    await sql.repo.createCcInstance('900601', 'zhangsan', '8601')
+    const updatesBefore = sql.ccUpdates().length
+    await sql.repo.updateCcStatus('900601', ' 8601 ')
+    assert.equal(sql.ccUpdates().length, updatesBefore + 1, '归一后仍要发那一条 UPDATE')
+    assert.equal(sql.ccUpdates()[updatesBefore].args[2], '8601', '绑进 actor_id 的比较值是 trim 后的串')
+    assert.equal(sql.ccRows.find(r => r.actor_id === '8601')!.state, 1, '" 8601 " 命中 "8601"（改前比较不命中 ⇒ 一直打不中）')
+
+    const after = sql.ccUpdates().length
+    await sql.repo.updateCcStatus('900601', '')
+    await sql.repo.updateCcStatus('900601', '  ')
+    await sql.repo.updateCcStatus('900601', null as any)
+    assert.equal(sql.ccUpdates().length, after, `空 operator 一条 UPDATE 都不许发，实多发 ${sql.ccUpdates().length - after} 条`)
+  })
+
+  it('B11 判据单点复用 · 任务腿与 cc 腿走同一枚函数（严禁第二份判据），旧导出名是别名不是转发实现', async () => {
+    // 别名＝**同一个函数对象**（不是"再抄一份"）。§2.11 尾注点名本栈的归一单点是
+    // `spi.normalizeCcActors` ⇒ 升通用名走"新增 normalizeActors ＋ 旧名转发"，导出面不破、判据只一枚。
+    assert.equal(normalizeCcActors, normalizeActors, 'spi.normalizeCcActors 必须就是 spi.normalizeActors')
+    assert.equal(normalizeCcActorValue, normalizeActorValue, 'spi.normalizeCcActorValue 必须就是 spi.normalizeActorValue')
+    assert.equal(parseCcActors, parseActorIds, 'engine.parseCcActors 必须就是 engine.parseActorIds')
+
+    // 同一枚判据的读数（cc 支继续走它 ⇒ 任务侧这轮改动不会让两腿分叉）
+    const mixed = ['0', '00', ' ', 'a', '', null, undefined, ' 42 ', '42']
+    assert.deepEqual(normalizeActors(mixed), ['0', '00', 'a', '42'])
+    assert.deepEqual(normalizeCcActors(mixed), normalizeActors(mixed), '旧名读数与新名逐字相同')
+    assert.equal(normalizeActorValue('0'), '0', "反向哨兵：'0' 归一后仍是 '0'（不是空值）")
+    assert.equal(normalizeActorValue('  '), '', "纯空白才是空值：归一后是空串")
+    assert.equal(normalizeActorValue(null), '')
+    assert.equal(normalizeActorValue(undefined), '')
+
+    // 跨腿同答案：同一组入参给任务侧（addCandidate）与抄送侧（createCCInstance）得同一个集合
+    const { repo, facade } = harnessB11()
+    const instanceId = await start11(facade, await defOf11(facade))
+    const task = await task11(repo, instanceId)
+    const vector = ['8901', '', null, undefined, ' 8902 ', '8902', '0']
+    assert.equal((await addBy(facade, task.id, vector)).code, 0)
+    assert.equal((await facade.flow('processInstance/createCCInstance',
+      { processInstanceId: instanceId, operator: 'zhangsan', actorIds: vector })).code, 0)
+    const onTask = (await repo.findTaskActors(task.id)).filter(a => a !== 'leader')
+    assert.deepEqual(onTask, await repo.findCcActorIds(instanceId),
+      `任务腿与 cc 腿同判据（两把尺子迟早分叉，本条就是抓它的）：任务侧 ${JSON.stringify(onTask)}`)
+    assert.deepEqual(onTask, ['8901', '8902', '0'])
   })
 })
 

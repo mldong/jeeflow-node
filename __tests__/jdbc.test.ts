@@ -12,6 +12,7 @@ import mysql from 'mysql2/promise'
 import pg from 'pg'
 import { EngineImpl } from '../src/engine.js'
 import { JdbcRepository, TsIDGenerator, convertPlaceholder } from '../src/jdbc/index.js'
+import { MemoryRepository } from '../src/memory.js'
 import { JdbcProcessExtRepository } from '../src/jdbc/ext.js'
 import { MemoryExtRepository } from '../src/memory-ext.js'
 import { type ProcessDesign, type ProcessDesignHis, type ProcessSurrogate } from '../src/model.js'
@@ -939,6 +940,95 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
       await cleanupN116()
     } finally {
       await cleanup(); await cleanupN116()
+    }
+  })
+
+  // ── issues/142 B 批 · 归属值写侧归一（spec 06 §2.11）：真库那一路 ────────────────────
+  // 为什么必须有这一格：内存单测绿 ≠ 落库（issues/142 §8.2 那课——rust/moon 的 save_task
+  // 少一列时内存全绿、真库恒 NULL）。这一格读的是 `wf_process_task_actor.actor_id` 与
+  // `wf_process_cc_instance.actor_id|state` 的**列值**。
+  // 连接走本仓既有 env（JEFFLOW_DB_HOST/PORT/USER/PWD，默认 192.168.1.160 的 jeeflow 库；
+  // 库不可达时本文件整体连不上，与既有格同跳法）。自清理：实例段走 cleanup()，
+  // 合成 taskId 段显式 DELETE（该表无外键，不会牵连子表）。
+  it('issues/142 B 批（真库）：addTaskActor 写侧兜底 trim＋丢空＋判重，门面腿与内存仓同答案', async () => {
+    await cleanup()
+    const idGen = new SeqIDGen()          // 全程共用一枚 ⇒ id 严格升序，ORDER BY id ASC 读回即写入序
+    const parTaskId = idGen.nextId()      // ⑥ 两仓同答案档用的合成 taskId
+    try {
+      await applySchema(); await insertDefine()
+      const repo = new JdbcRepository(makeAdapter(pool), idGen)
+      const engine = new EngineImpl(repo, userProv, idGen)
+      const inst = await engine.startProcessInstanceById(DEFINE_ID, 'zhangsan', { amount: '100' })
+      const apply = (await repo.findDoingTasks(inst.id))[0]
+      const readActors = async (taskId: string) =>
+        (await q(pool, 'SELECT actor_id FROM wf_process_task_actor WHERE process_task_id = ? ORDER BY id ASC', [taskId]))
+          .map((r: any) => String(r.actor_id))
+
+      // ① 混给只丢空的：真库列里只剩 trim 后的串
+      await repo.addTaskActor(apply.id, ['', '   ', null as any, undefined as any, ' 8501 ', '8501'])
+      assert.deepEqual(await readActors(apply.id), ['zhangsan', '8501'],
+        '真库 actor_id 不得含空串/纯空白/串化后的 "null"/"undefined"，落库值取 trim 后的串')
+
+      // ② 反向哨兵：'0'/'00'/'a' 三个人各立，只有纯空白被丢
+      await repo.addTaskActor(apply.id, ['0', '00', ' ', 'a'])
+      assert.deepEqual(await readActors(apply.id), ['zhangsan', '8501', '0', '00', 'a'],
+        "真库：'0' 是正常 id，不得被假值判据当空值丢掉")
+
+      // ③ trim 后同值命中写侧判重 ⇒ 不多发一行（不 trim 就与既有行错开、同一人落两行）
+      await repo.addTaskActor(apply.id, [' 8501 '])
+      assert.equal((await readActors(apply.id)).filter(x => x === '8501').length, 1, '真库判重两侧都取 trim 后的值')
+
+      // ④ 全空入参 ⇒ 一条都不许多
+      const before = await readActors(apply.id)
+      await repo.addTaskActor(apply.id, ['', '   ', null as any, undefined as any])
+      assert.deepEqual(await readActors(apply.id), before, '真库：全空入参行数不变')
+
+      // ⑤ 门面腿（processTask/addCandidate 的数组形态）经归一后下库
+      const facade = new JeeflowFacade(engine, repo, undefined)
+      const r5 = await facade.flow('processTask/addCandidate',
+        { processTaskId: apply.id, actorIds: [' 8502 ', null, undefined, ''] })
+      assert.equal(r5.code, 0, JSON.stringify(r5))
+      assert.deepEqual(await readActors(apply.id), [...before, '8502'],
+        '真库：门面数组腿也不许把 null/undefined 串化成假归属人下库')
+
+      // ⑤bis 主键另判一档：processTaskId 空串 ⇒ 响亮报错，不拿 '' 当 id 落库
+      const r5b = await facade.flow('processTask/addCandidate', { processTaskId: '', actorIds: ['8503'] })
+      assert.equal(r5b.code, 99999999, `主键档必须报错: ${JSON.stringify(r5b)}`)
+      assert.ok(String(r5b.msg).includes('id 缺失或非法'), r5b.msg)
+      assert.deepEqual(await readActors(apply.id), [...before, '8502'], '报错后既有参与者不变')
+
+      // ⑥ 两仓同答案（issues/117 场景 27 那把尺子 · 真库版）：同一组入参、同一起点（空参与者）
+      const vector = ['', '   ', null as any, undefined as any, ' 8501 ', '8501', '0', '00', ' ', 'a', 8506, ' 8506 ']
+      const mem = new MemoryRepository()
+      await mem.addTaskActor('b11-parity', vector)
+      await repo.addTaskActor(parTaskId, vector)
+      assert.deepEqual(await mem.findTaskActors('b11-parity'), await readActors(parTaskId),
+        '两仓同答案（真库 SQL 仓 vs 内存仓）')
+      assert.deepEqual(await readActors(parTaskId), ['8501', '0', '00', 'a', '8506'],
+        '真库那一格的期望真值：只丢空的、取 trim 的、同次折叠')
+
+      // ⑦ updateCcStatus 入参归一（§2.11 表第四行）：' 8601 ' 打得中库里那行；
+      //    空 operator 不得把 state=1 打到**历史 actor_id='' 的脏行**上（这条脏行就是本批要堵的库存量）
+      await repo.createCcInstance(inst.id, 'zhangsan', ' 8601 ')
+      const dirtyNow = new Date()
+      await q(pool, 'INSERT INTO wf_process_cc_instance (id, process_instance_id, actor_id, state,' +
+        ' create_time, create_user, update_time, update_user) VALUES (?,?,?,0,?,?,?,?)',
+        [idGen.nextId(), inst.id, '', dirtyNow, 'node-test', dirtyNow, 'node-test'])
+      await repo.updateCcStatus(inst.id, ' 8601 ')
+      let ccState = await q(pool, 'SELECT actor_id, state FROM wf_process_cc_instance WHERE process_instance_id = ?', [inst.id])
+      const stateOf = (who: string) => Number((ccState.find((r: any) => String(r.actor_id) === who) as any)?.state)
+      assert.equal(stateOf('8601'), 1, '" 8601 " 与 "8601" 是同一个人，已读必须打中那一行（改前比较不命中 ⇒ 一直打不中）')
+      assert.equal(stateOf(''), 0, '前置：历史脏行仍未读')
+
+      await repo.updateCcStatus(inst.id, '')
+      await repo.updateCcStatus(inst.id, '   ')
+      await repo.updateCcStatus(inst.id, null as any)
+      ccState = await q(pool, 'SELECT actor_id, state FROM wf_process_cc_instance WHERE process_instance_id = ?', [inst.id])
+      assert.equal(stateOf(''), 0, '真库：空 operator 一条 UPDATE 都不发 ⇒ 脏行不许被误标已读')
+      assert.equal(stateOf('8601'), 1, '既有已读行不受影响')
+    } finally {
+      await q(pool, 'DELETE FROM wf_process_task_actor WHERE process_task_id = ?', [parTaskId])
+      await cleanup()
     }
   })
 })

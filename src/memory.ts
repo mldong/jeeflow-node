@@ -2,7 +2,7 @@ import { TaskState } from './model.js'
 import type { CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDefine } from './model.js'
 import { cloneInstance, cloneTask, type ProcessInstance, type ProcessTask } from './model.js'
 import type { ProcessRepository, QueryCondition } from './spi.js'
-import { hasEffectiveCcOwnership, isBlankOwnership, defaultCreateCcInstanceIfAbsent, normalizeCcActorValue } from './spi.js'
+import { hasEffectiveCcOwnership, isBlankOwnership, defaultCreateCcInstanceIfAbsent, normalizeActorValue, normalizeActors } from './spi.js'
 
 // ═══ 条件匹配基建（issues/05-5，对齐 JDBC 白名单语义） ═══
 
@@ -169,7 +169,9 @@ export class MemoryRepository implements ProcessRepository {
       const tc = cloneTask(t)
       tc.actorIds = []
       this.tasks.set(t.id, tc)
-      if (t.actorIds?.length) this.actors.set(t.id, [...t.actorIds])
+      // issues/142 B 批（spec 06 §2.11）：级联腿同样过那一枚写侧闸（"只有真写了参与者才动 Map"
+      // 的既有前置条件不变，动的是**落库值**：trim＋丢空＋同次折叠）
+      if (t.actorIds?.length) this.writeActors(t.id, t.actorIds, false)
     }
   }
   async findInstanceById(id: string) {
@@ -199,13 +201,14 @@ export class MemoryRepository implements ProcessRepository {
     const cp = cloneTask(task)
     cp.actorIds = []
     this.tasks.set(task.id, cp)
-    if (task.actorIds?.length) this.actors.set(task.id, [...task.actorIds])
+    // issues/142 B 批（spec 06 §2.11）：建单腿的参与者落库值也过那一枚写侧闸（trim＋丢空＋同次折叠）
+    if (task.actorIds?.length) this.writeActors(task.id, task.actorIds, false)
   }
   async updateTask(task: ProcessTask) {
     const cp = cloneTask(task)
     cp.actorIds = []
     this.tasks.set(task.id, cp)
-    if (task.actorIds?.length) this.actors.set(task.id, [...task.actorIds])
+    if (task.actorIds?.length) this.writeActors(task.id, task.actorIds, false)
   }
   async findDoingTasks(instanceId: string, taskNames?: string[]) {
     const result: ProcessTask[] = []
@@ -242,11 +245,34 @@ export class MemoryRepository implements ProcessRepository {
     return result
   }
   async findTaskActors(taskId: string) { return this.actors.get(taskId) ?? [] }
-  async addTaskActor(taskId: string, actors: string[]) {
+
+  /**
+   * 参与者落到本仓 Map 之前的**写侧闸**（issues/142 B 批 · spec 06 §2.11）：
+   * `addTaskActor`（追加语义）与 `saveTask`/`updateTask`（整体替换语义）三条腿都过
+   * `spi.normalizeActors` **那一枚**单点——逐元素 trim、空串/纯空白/`null`/`undefined` 丢弃、
+   * 同一次调用内的重复折叠。判据只有那一处，本方法只是把三条腿接到同一枚上（不是第二份尺子）。
+   *
+   * ⚠️ 与 SQL 仓 `JdbcRepository.insertTaskActors` **同一判据、同一份实现**（两仓必须同答案，
+   * issues/117 场景 27 那把尺子）；只修门面腿的话，绕过门面直连仓储的调用方照样能把
+   * 空归属值灌进 `wf_process_task_actor.actor_id`——那正是 issues/129 那族"空归属值读全库"的病根。
+   *
+   * @param append true 追加并判重（addTaskActor）／false 整体替换（saveTask／updateTask）
+   */
+  private writeActors(taskId: string, actors: readonly unknown[], append: boolean): void {
+    const normalized = normalizeActors(actors)
+    if (!append) {
+      this.actors.set(taskId, normalized)
+      return
+    }
     const existing = this.actors.get(taskId) ?? []
     const seen = new Set(existing)
-    for (const a of actors) { if (!seen.has(a)) { existing.push(a); seen.add(a) } }
+    for (const a of normalized) { if (!seen.has(a)) { existing.push(a); seen.add(a) } }
     this.actors.set(taskId, existing)
+  }
+
+  async addTaskActor(taskId: string, actors: string[]) {
+    // issues/142 B 批：改前这里**判重不判空不 trim**（`""`/`"  "`/`"null"` 全放行）
+    this.writeActors(taskId, actors, true)
   }
   async removeTaskActor(taskId: string, actors: string[]) {
     const remove = new Set(actors)
@@ -258,12 +284,13 @@ export class MemoryRepository implements ProcessRepository {
     // ③不更新原行时间（createTime/updateTime 逐字不变）。判重在写侧，查询侧不引入去重。
     //
     // issues/141 G10「空不创建行」（spec 06 §2.10）：与 JdbcRepository 同一判据、同一份实现
-    // （`spi.normalizeCcActorValue`）——空串/纯空白/null 丢弃，落库值取 trim 后的串。
+    // （`spi.normalizeActorValue`，旧名 normalizeCcActorValue 是它的别名）——空串/纯空白/null 丢弃，
+    // 落库值取 trim 后的串。
     // 两仓必须同答案（issues/117 场景 27 那把尺子），且这一层是"绕过引擎/门面直连仓储"的兜底。
     const rows = this.ccInstances.get(instanceId) ?? []
     for (const rawActorId of actorIds) {
-      const actorId = normalizeCcActorValue(rawActorId)
-      if (!actorId || rows.some(r => r.actorId === actorId)) continue
+      const actorId = normalizeActorValue(rawActorId)
+      if (actorId === '' || rows.some(r => r.actorId === actorId)) continue
       const now = new Date()
       rows.push({ actorId, state: 0, createTime: now, updateTime: now })
     }
@@ -282,8 +309,15 @@ export class MemoryRepository implements ProcessRepository {
   async updateCcStatus(instanceId: string, actorId: string) {
     // 已读：state 0→1 ＋ 刷 updateTime（对齐 `wf_process_cc_instance.state` 与 java 内存仓同款）。
     // G2 之前这里是纯 no-op ⇒ 「重复抄送不得把已读抹回未读」这一档在内存仓根本测不出来。
+    //
+    // issues/142 B 批（spec 06 §2.11 表第四行）：`actorId` 是归属值，**入参归一后再比**——
+    // 比较值取 `spi.normalizeActorValue` 的 trim 后串（否则 `" 123 "` 打不中库里的 `"123"`，
+    // 用户点了已读没反应），归一后为空 ⇒ **这一支什么都不做**（空 operator 会把 state=1
+    // 打到历史 `actor_id=''` 的脏行上）。与 SQL 仓同一枚判据、两仓同答案。
+    const actor = normalizeActorValue(actorId)
+    if (actor === '') return
     for (const row of this.ccInstances.get(instanceId) ?? []) {
-      if (row.actorId === actorId) {
+      if (row.actorId === actor) {
         row.state = 1
         row.updateTime = new Date()
       }
