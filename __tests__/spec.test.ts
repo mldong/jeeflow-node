@@ -28,6 +28,19 @@ import { runParity } from './surrparity.js'
 // issues/130 案 A：判据（只认数值 1）与**边界还原**（驱动串化）分属两层，测试要分别钉住
 import { surrogateEnabled, surrogateHydrateEnabled } from '../src/surrogate-rule.js'
 
+// 测试用 id 发生器：**必须是单调计数器，不能用 Date.now()+随机数**。
+// 旧写法 `Date.now()*1000 + Math.floor(Math.random()*1000)` 在同一毫秒内取值空间只有 1000，
+// 一轮用例连发 40 个 id 的撞号率实测 54%（B 批派工会话实测）⇒ 撞上的两个 id 在
+// 内存仓的 Map 里后者覆盖前者，任务/血缘凭空消失，表现为**随机复现的假红**（同一个用例
+// 连跑 13 次红 1 次那种最难查的读数）。计数器 base 取 ms*1000（1.77e15，仍在 JS 双精度
+// 安全整数 2^53≈9.007e15 内），序号单调递增 ⇒ 同毫秒也不自撞。
+// 共享真库那一路另有栈位常量（见 __tests__/jdbc.test.ts 的 STACK_SEQ，issues/118 §2.5），
+// 与本 helper 是两个问题：这里治的是**自撞**，那里治的是**跨栈同毫秒撞车**。
+function mkSeqIdGen() {
+  const base = Date.now() * 1000
+  let n = 0
+  return { nextId() { n += 1; return String(base + n) } }
+}
 const flowDir = flowsResolverDir() + '/'
 
 function setup() {
@@ -35,7 +48,7 @@ function setup() {
   const userProv: UserProvider = {
     async getUser(userId) { return { userId, realName: '用户' + userId, deptId: 'D01', deptName: '测试部门', postId: 'P01', postName: '测试岗位' } },
   }
-  const idGen = { nextId() { return String(Date.now() * 1000 + Math.floor(Math.random() * 1000)) } }
+  const idGen = mkSeqIdGen()
   const exprEval: ExpressionEvaluator = {
     async eval(expr, vars) {
       const amt = Number(vars.amount ?? 0)
@@ -1327,7 +1340,7 @@ describe('jeeflow compliance tests', () => {
     }
     const registry = new HandlerRegistry()
     registerBuiltinAssignments(registry, userProv, orgProv)
-    const idGen = { nextId() { return String(Date.now() * 1000 + Math.floor(Math.random() * 1000)) } }
+    const idGen = mkSeqIdGen()
     const exprEval: ExpressionEvaluator = {
       async eval(expr, vars) {
         const amt = Number(vars.amount ?? 0)
@@ -1385,7 +1398,7 @@ describe('jeeflow compliance tests', () => {
     }
     const registry = new HandlerRegistry()
     registerBuiltinAssignments(registry, userProv, orgProv)
-    const idGen = { nextId() { return String(Date.now() * 1000 + Math.floor(Math.random() * 1000)) } }
+    const idGen = mkSeqIdGen()
     const exprEval: ExpressionEvaluator = { async eval() { return false } }
     const engine = new EngineImpl(repo, userProv, idGen, exprEval)
     engine.setRegistry(registry)
@@ -1407,7 +1420,7 @@ describe('jeeflow compliance tests', () => {
 
   it('24 candidatePage 双源候选（issues/16 GlobalCandidateHandler 语义）', async () => {
     const repo = new MemoryRepository()
-    const idGen = { nextId() { return String(Date.now() * 1000 + Math.floor(Math.random() * 1000)) } }
+    const idGen = mkSeqIdGen()
     const exprEval: ExpressionEvaluator = {
       async eval() { return false },
     }
