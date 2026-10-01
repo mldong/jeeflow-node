@@ -4,6 +4,8 @@
 // action（boot2/boot3 端点短名）路由。返回统一结构 {code, msg, data}
 // （code=0 成功 / 99999999 失败）。操作人约定：args.operator 显式传入。
 
+import { dirname as pathDirname, join as pathJoin, sep as pathSep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   CcInstanceRow, DefineRow, InstanceRow, InstanceState, ProcessDefine, ProcessDesign,
   ProcessDesignHis, ProcessSurrogate, ProcessTask, TaskRow, TaskState,
@@ -27,6 +29,179 @@ const SUBMIT_TRANSFER = 7
 const SUBMIT_COUNTERSIGN_DISAGREE = 20
 
 export type UserSearch = (query: Record<string, any>) => Promise<[Record<string, any>[], number]> | [Record<string, any>[], number]
+
+// ═══ issues/137 §3-1（spec 06 §2.12）· 门面内部异常出口：固定文案 ＋「谁写的这段文案」判别式 ═══
+//
+// 门面顶层 catch 捕获到的异常**不是都能把 message 原样放进 msg**。判据是「这段文案是谁写的」：
+// 引擎自己写的中文契约文案（八栈、十三个集成壳与前端 toast 都按原文逐字对齐）必须照旧透出；
+// 运行时／驱动／JSON 解析器／集成方 provider 写的原文属**内部实现细节**，透出去就是泄漏
+// （`Cannot read properties of undefined (reading 'x')`、`Expected property name or '}' in JSON at
+// position 1`、`ER_LOCK_WAIT_TIMEOUT: …`、`ENOENT: no such file or directory` 一类），对外一律只给
+// 下面这一句固定文案；原文只进**日志与错误对象的 cause**，不得拼进 msg 或任何其它对外字段。
+
+/** 内部异常对外只说这一句（八栈逐字同串，措辞不许改——owner 2026-10-02 第 3 问拍 A） */
+export const INTERNAL_FAILURE_MSG = '流程处理失败'
+
+/**
+ * 第 4 条的异常族清单（java 12 类 → node 等价类型）。实测映射：
+ *  - `NullPointerException` / `ClassCastException` / `ReflectiveOperationException` → **TypeError**
+ *    （空引用解引用在 node 就是 TypeError：`Cannot read properties of undefined (reading 'x')`）
+ *  - `NumberFormatException` / `IndexOutOfBoundsException` / `ArithmeticException` / `StackOverflowError`
+ *    → **RangeError**（`Invalid array length`、`Maximum call stack size exceeded`）
+ *  - JSON 解析器与数字解析（`JSON.parse` 的 `Expected property name or '}' …`、`BigInt('12x')` 的
+ *    `Cannot convert 12x to a BigInt`）→ **SyntaxError**
+ *  - 未声明标识符 → **ReferenceError**；另含 node 自带的 `EvalError` / `URIError` / `AggregateError`
+ *
+ * ⚠️ **裸 `Error` 不在这一族**：本栈引擎的契约文案一律是裸 `new Error(中文文案)` 形状（现读全仓
+ * 81 处 throw 全是这个形状、零 `class *Error extends`），把 `Error` 加进来等于把整个契约面静默换成
+ * 固定文案——正是 spec §2.12「⚠️ 因此不能简单收窄」点名的事故。
+ * ⚠️ IO／驱动（java 的 `IOException` / `SQLException`）在 node 里 ctor 名**恰好也是 `Error`**
+ * （实测 fs 的 ENOENT、mysql2/pg 的查询错都这样），族清单抓不到 ⇒ 由第 5 条按抛出点归属兜住。
+ */
+const FOREIGN_ERROR_CTORS = new Set([
+  'TypeError', 'RangeError', 'SyntaxError', 'ReferenceError', 'EvalError', 'URIError', 'AggregateError',
+])
+
+/**
+ * 第 3 条「裸包装」的 node 补充形状：`new Error(innerErr)` 会把 `String(innerErr)` 塞进 message
+ * 且**不保留** `.cause`（实测 `String(e.cause) === 'undefined'`），所以除了比对 cause 还要认这个
+ * `"SomeError: …"` 头部——首个空白前的那一段必须以 `Error`/`Exception` 结尾、紧跟 `": "`。
+ * 实测能认出：`Error: …`、`TypeError: …`、`java.lang.IllegalStateException: …`、
+ * `com.mysql.cj.jdbc.exceptions.SQLException: …`。
+ * 引擎 51 条契约文案没有一条长这样（全仓现读核过，并由测试 A9 那格自动守着：全部中文，或
+ * `define not found:` / `persist: …` / `operator … not allowed` 一类小写英文开头，首段都不以
+ * Error/Exception 结尾），不会误杀。
+ */
+const STRINGIFIED_ERROR_RE = /^\S*(?:Error|Exception): /
+
+const CASE_INSENSITIVE_FS = process.platform === 'win32' || process.platform === 'darwin'
+
+/** 路径归一：统一分隔符；Windows/macOS 文件系统大小写不敏感 ⇒ 一并折叠 */
+function canonPath(p: string): string {
+  const n = p.replace(/\\/g, '/')
+  return CASE_INSENSITIVE_FS ? n.toLowerCase() : n
+}
+
+/**
+ * 引擎自身代码所在目录（第 5 条「抛出点不在引擎包」的归属基准）。从**本模块**的 `import.meta.url`
+ * 反推，因此四种运行形态都自洽：tsx 直跑 `src/*.ts`、发版跑 `dist/*.js`、被打包器 bundle、
+ * 被集成方装进 `node_modules/@mldong/jeeflow/dist/`（此时基准跟着搬进 node_modules，
+ * 驱动仍在**别的** node_modules 目录 ⇒ 判据照样咬得上）。同时收 `file://` URL 形态，
+ * 因为部分运行时/打包器把栈帧写成 URL 而不是裸路径。
+ */
+const ENGINE_DIRS: string[] = (() => {
+  const out: string[] = []
+  const push = (d: string) => {
+    if (!d) return
+    const c = canonPath(d.endsWith('/') ? d : d + '/')
+    if (!out.includes(c)) out.push(c)
+  }
+  try {
+    const selfPath = fileURLToPath(import.meta.url)   // <pkg>/src/facade.ts 或 <pkg>/dist/facade.js
+    const selfDir = pathDirname(selfPath)             // <pkg>/src 或 <pkg>/dist
+    const pkgDir = pathDirname(selfDir)               // <pkg>
+    push(selfDir)
+    push(pathJoin(pkgDir, 'src') + pathSep)
+    push(pathJoin(pkgDir, 'dist') + pathSep)
+  } catch { /* 推不出裸路径形态 ⇒ 只留下面的 URL 形态 */ }
+  try {
+    const urlDir = import.meta.url.replace(/[^/]*$/, '')       // file://…/src/
+    const urlPkg = urlDir.replace(/[^/]*\/$/, '')              // file://…/
+    push(urlDir)
+    push(urlPkg + 'src/')
+    push(urlPkg + 'dist/')
+  } catch { /* 推不出引擎位置 ⇒ 第 5 条整条失败开放（见 thrownInsideEngine） */ }
+  return out
+})()
+
+/**
+ * 取栈顶帧（＝抛出点）的位置串，取不到归属信息时返回 null。
+ * 认两种 V8 帧形状：`at fn (path:line:col)` 与 `at path:line:col`；`<anonymous>` / `native`
+ * （实测 `JSON.parse` 的 SyntaxError 栈顶就是 `at JSON.parse (<anonymous>)`，压根没有文件路径）
+ * 一律当"拿不到归属"。行尾的 `:line:col` 不剥——目录前缀匹配用不上它。
+ */
+function topFrameLocation(stack: unknown): string | null {
+  if (typeof stack !== 'string' || stack === '') return null
+  for (const raw of stack.split('\n')) {
+    const line = raw.trim()
+    if (!line.startsWith('at ')) continue            // 跳过首行 `Name: message`
+    let loc = line.slice(3).trim()
+    const open = loc.lastIndexOf('(')
+    if (open >= 0 && loc.endsWith(')')) loc = loc.slice(open + 1, -1).trim()
+    if (loc === '' || loc === '<anonymous>' || loc === 'native' || loc === 'unknown') return null
+    return canonPath(loc)
+  }
+  return null
+}
+
+/**
+ * 栈顶帧是否落在引擎自身代码里（java `thrownInsideEngine` 的 node 对应件）。
+ *
+ * ⚠️ **失败方向与 java 相反，是刻意的**：java 在 trace 为空时返回 false（⇒ 判成外来 ⇒ 挡掉），
+ * node 这里在"推不出引擎目录"或"栈顶帧拿不到路径"时返回 true（⇒ 判成引擎写的 ⇒ 放行）。
+ * 理由：node 的 `stack` 是 V8 私有格式、不是语言标准，`<anonymous>`/`native` 帧、`Error.stackTraceLimit`
+ * 截断、跨 worker 序列化丢栈、source-map 与打包器改写路径都会让它拿不到可用归属；而判据一旦误判成
+ * "外来"，后果是**把引擎契约文案静默换成固定文案**（spec §2.12「⚠️ 因此不能简单收窄」点名的事故，
+ * 八栈＋十三壳＋前端 toast 全按原文对齐，没人会报警）。反过来误判成"引擎写的"只是漏挡一条内部原文，
+ * 而那条原文仍被第 1/3/4 条与日志兜着（`JSON.parse` 的 SyntaxError 正是第 4 条抓的，压根不依赖栈）。
+ * 两害相权，这条一律失败开放。
+ */
+function thrownInsideEngine(stack: unknown): boolean {
+  if (ENGINE_DIRS.length === 0) return true
+  const loc = topFrameLocation(stack)
+  if (loc == null) return true
+  return ENGINE_DIRS.some(d => loc.startsWith(d))
+}
+
+/**
+ * 判「这条异常的 message 能不能原样进出口 msg」——抽成**纯函数**（java 参考实现＝
+ * `JeeflowFacade.isForeignDetail(type, message, cause, trace)`，rust `parse_error_message`／
+ * moon `ParseErrorWithCause` ＋ `detail()` 同姿势），文案判据与副作用（日志）各自可测：
+ * 本函数不读全局、不打日志、不抛异常，四个入参全是可序列化的裸值。
+ *
+ * 五条判据（顺序即优先级，返回 true ⇒ 属内部信息 ⇒ 出口只给 {@link INTERNAL_FAILURE_MSG}）：
+ *  1. `message` 缺失／非字符串／纯空白 ⇒ 内部。兜底会吐 `String(e)` 的类名头部；空白串也不是
+ *     "失败原因"（§2.1 要求 msg 承载原因）。
+ *  2. 属**契约异常族** ⇒ 逐字透出（本条返回 false）。⚠️ **本栈无处落**：node 引擎零
+ *     `class *Error extends`，契约文案一律是裸 `Error` ＋ 中文文案，没有可判的类型
+ *     （见 docs/批三-3-1-落地记录 §1.5 node 行）⇒ 判据重心在第 4/5 条，此处**不留空实现假装覆盖**。
+ *  3. `message` 恰是 cause 的串化（"裸包装"，只是搬运下层原文）⇒ 内部。node 两种形状都认：
+ *     `new Error(String(e), { cause: e })`（有 cause）与 `new Error(e)`（message＝`String(e)`、
+ *     不保留 cause，靠 {@link STRINGIFIED_ERROR_RE} 认头部）。
+ *  4. 类型属运行时／解析器／反射自己抛的族 ⇒ 内部（见 {@link FOREIGN_ERROR_CTORS}）。
+ *     **node 的第 4 条比 java 好落**：`Error` 与 `TypeError`/`RangeError`/`SyntaxError`/
+ *     `ReferenceError` 是可区分的构造器，而引擎契约文案一律用裸 `new Error(...)`。
+ *  5. 抛出点不在引擎包（node 内置模块、驱动 node_modules、集成方 provider、测试桩）⇒ 内部。
+ *     这一条是 node 覆盖 IO／驱动／第三方 provider 的**唯一**判据（它们的 ctor 名恰好都是 `Error`），
+ *     失败开放，理由见 {@link thrownInsideEngine}。
+ *
+ * @param ctorName 异常构造器名（`e?.constructor?.name ?? e?.name`）
+ * @param message  异常文案（可为 null/undefined/非字符串）
+ * @param cause    异常原因（可为 null；node 的 `{ cause }` 选项）
+ * @param stack    栈串（可为 null/undefined；格式不稳，见第 5 条）
+ * @returns true ⇒ 属内部信息，出口只给固定文案
+ */
+export function isForeignDetail(
+  ctorName: string | null | undefined,
+  message: unknown,
+  cause: unknown,
+  stack: unknown,
+): boolean {
+  // 1) message 缺失／非字符串／纯空白
+  if (typeof message !== 'string' || message.trim() === '') return true
+  // 2) 契约异常族：本栈无此类型（引擎契约文案＝裸 Error），无处落 ⇒ 直接进第 3 条
+  // 3) 裸包装
+  if (cause != null) {
+    if (message === String(cause)) return true
+    const cm = (cause as { message?: unknown }).message
+    if (typeof cm === 'string' && cm !== '' && message === cm) return true
+  }
+  if (STRINGIFIED_ERROR_RE.test(message)) return true
+  // 4) 运行时／解析器／反射族
+  if (typeof ctorName === 'string' && FOREIGN_ERROR_CTORS.has(ctorName)) return true
+  // 5) 抛出点不在引擎包
+  return !thrownInsideEngine(stack)
+}
 
 export class JeeflowFacade {
   private userSearch?: UserSearch
@@ -69,6 +244,16 @@ export class JeeflowFacade {
       const data = await this.dispatch(action, args)
       return { code: 0, msg: '成功', data: data ?? null }
     } catch (e: any) {
+      // issues/137 §3-1（spec 06 §2.12）：判别规则与理由见 isForeignDetail——引擎写的中文契约文案
+      // 照旧逐字透出（八栈＋十三壳＋前端 toast 都按原文对齐，不能在这条上收窄），只把**外来/内部
+      // 异常**（运行时／驱动／JSON 解析器／集成方 provider）的原文换成固定文案。
+      // 原文只进日志：console.error 把整个错误对象交出去，node 会连栈带 `[cause]:` 一起打出来
+      // ⇒ 批二 issues/139 挂在 `{ cause }` 里的解析器原文也在日志里，且**绝不**进 msg 或其它对外字段
+      // （实测 `String(err)` / `err.toString()` / `JSON.stringify(err)` 都不含 cause，不会顺带带出去）。
+      if (isForeignDetail(e?.constructor?.name ?? e?.name, e?.message, e?.cause, e?.stack)) {
+        console.error(`[jeeflow] action 执行失败: action=${action}`, e)
+        return { code: 99999999, msg: INTERNAL_FAILURE_MSG }
+      }
       return { code: 99999999, msg: e?.message ?? String(e) }
     }
   }
@@ -229,7 +414,9 @@ export class JeeflowFacade {
       flow = JSON.parse(content)
     } catch (e) {
       // issues/139：八栈同一条腿用 java 逐字原文（ModelParser.java:47「读取流程定义 JSON 失败」），
-      // 原始异常只作 cause——门面顶层会把 message 原样送进出口 msg。
+      // 原始异常只作 cause。issues/137 §3-1 之后门面顶层带判别式（isForeignDetail）：这条是引擎自己
+      // 写的契约文案 ⇒ 仍逐字送进出口 msg；cause 里的 SyntaxError 原文只进日志，不会被带进 msg
+      // （`String(err)`/`err.toString()` 都不含 cause，见 flow() 顶层 catch 的注释）。
       throw new Error('读取流程定义 JSON 失败', { cause: e })
     }
     const name = flow?.name
@@ -255,7 +442,9 @@ export class JeeflowFacade {
       flow = JSON.parse(content)
     } catch (e) {
       // issues/139：八栈同一条腿用 java 逐字原文（ModelParser.java:47「读取流程定义 JSON 失败」），
-      // 原始异常只作 cause——门面顶层会把 message 原样送进出口 msg。
+      // 原始异常只作 cause。issues/137 §3-1 之后门面顶层带判别式（isForeignDetail）：这条是引擎自己
+      // 写的契约文案 ⇒ 仍逐字送进出口 msg；cause 里的 SyntaxError 原文只进日志，不会被带进 msg
+      // （`String(err)`/`err.toString()` 都不含 cause，见 flow() 顶层 catch 的注释）。
       throw new Error('读取流程定义 JSON 失败', { cause: e })
     }
     await this.repo.updateDefine({
