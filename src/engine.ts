@@ -1173,10 +1173,25 @@ function parseAbsTime(s: string): Date | null {
  *  分发，`d` 档走日历加天不乘 86400，负数＝历日倒退，同病），所以这一处判据把四档一起拦住。
  *
  *  只裁负、**不裁加号**：正则里的 `+` 保留。各栈整数解析（python `[+-]?`、php `[+-]?\d{1,18}`、
- *  java Integer.parseInt）都收 '+'，把它去掉等于新造一处跨栈分叉 ⇒ `+2h` 仍是合法的 now+7200s。 */
+ *  java Integer.parseInt）都收 '+'，把它去掉等于新造一处跨栈分叉 ⇒ `+2h` 仍是合法的 now+7200s。
+ *
+ *  issues/137 E（owner 2026-10-01 拍"统一 trim" · spec 04 §「相对档前缀允许两端空白」，基准＝jeeflow-java
+ *  `bf1f401` 的 `Integer.parseInt(text.trim())`）：**判整数之前**先裁掉串的两端空白。理由是各栈整数解析
+ *  对空白的容忍度天然不同（go 在 `Atoi` 前显式 `TrimSpace`、rust `.trim()`、python `int()` 与 .NET
+ *  `TryParse` 默认就收，本栈的正则校验原本偏偏不吃）⇒ 不裁就是"同一份流程定义在别家有到期时间、这一家没有"
+ *  （到期表达式是设计器手填/JSON 搬运的字符串，夹一个空格是常态）。
+ *  三条分界（裁的位置**只在传入的前缀切片**，`processTime` 那边取末位单位符的 `charAt` 一律不动）：
+ *  ① `" 2h"` / `"2 h"`（空格落在前缀区内、末位仍是单位符）⇒ 裁完照样算得出；
+ *  ② `"2h "`（单位符后面还带空白）⇒ 末位是空格、认不出单位 ⇒ 按误配落穿绝对档 ⇒ null，
+ *     把整串去空白是另一件没立过法的事，不许顺手做进来；
+ *  ③ `" 2.5h"` ⇒ 裁完仍是小数误配 ⇒ 仍落穿 —— trim ≠ "裁容错"。
+ *  判负（137 D）位置在裁之后、照常生效：`" -5h"` ⇒ `-5` ⇒ 下面 `n >= 0` 拦下 ⇒ null。
+ *  ⚠️ 正则一个字都不改（不塞 `\s*`、`[-+]?` 保留）：判据用的是同一个 `t`，`Number(t)` 也用它，
+ *  两处必须吃同一个裁过的串，否则"认得出却转不了"或反之就分叉了。 */
 function intPrefix(s: string): number | null {
-  if (!/^[-+]?\d+$/.test(s)) return null
-  const n = Number(s)
+  const t = s.trim()
+  if (!/^[-+]?\d+$/.test(t)) return null
+  const n = Number(t)
   return Number.isSafeInteger(n) && n >= 0 && n <= 2147483647 ? n : null
 }
 
@@ -1188,7 +1203,11 @@ function intPrefix(s: string): number | null {
  *     → 该时刻；字符串解析失败 → **null**（不是 now）；其它类型（布尔/数组/对象/小数）→ **落穿**到下面两档
  *     （Java/C# 都是落穿，不许当"解析失败"提前 return null）。
  *  2. 否则 expr 以 `s`/`m`/`h`/`d` 结尾且前缀是整数 ⇒ now + N 秒/分/时/天（`d` 走**日历加天**，不乘 86400 秒）。
+ *     前缀**允许两端空白**（issues/137 E · owner 拍"统一 trim"）：`intPrefix` 在判整数前裁掉
+ *     `expr.slice(0, -1)` 的两端空白 ⇒ `" 2h"`、`"2 h"` 照样算得出；裁的边界只到前缀，末位单位符那一位
+ *     （下面 `expr.charAt(expr.length - 1)`）**不跟着 trim** ⇒ `"2h "` 仍按误配落穿。
  *  3. 否则把 expr 本身按 `"yyyy-MM-dd HH:mm:ss"` 解析 → 时刻；失败 → null。
+ *     ⚠️ 档 1 的键名与档 3 的串本身**都不 trim**：那是键名/时间串本身，裁它会改的是另一件事。
  *
  * ⚠️ 任何一档都不得退回 now()——"算不出来就写当前时间"正是 issues/126 的病灶（建单即逾期，逾期统计恒失真）。
  *

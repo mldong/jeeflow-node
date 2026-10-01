@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { EngineImpl, KeyAutoGenTitle, KeyCustomReturnVal, KeyRealName, KeyUserID, parseActorIds, parseCcActors } from '../src/engine.js'
+import { EngineImpl, KeyAutoGenTitle, KeyCustomReturnVal, KeyRealName, KeyUserID, parseActorIds, parseCcActors, processTime } from '../src/engine.js'
 import { HandlerRegistry, registerBuiltinAssignments } from '../src/index.js'
 import { MemoryRepository } from '../src/memory.js'
 import { MemoryExtRepository } from '../src/memory-ext.js'
@@ -4364,6 +4364,96 @@ describe('issues/126 案 A 任务行到期时间：建单五处写点按节点�
       assert.equal(row!.expireTime ?? null, null,
         `"${expr}" 前缀非整数 ⇒ 落穿绝对档 ⇒ NULL（issues/137 C 口径不变，实得 ${String(row!.expireTime)}）`)
     }
+  })
+
+  // ── issues/137 E（owner 2026-10-01 拍"统一 trim" · spec 04 §相对档前缀允许两端空白）─────────
+  // 判据形状照 jeeflow-java ExpireTimeOnCreateTest#paddedRelativePrefixStillApplies（bf1f401）：
+  // **判整数之前**裁掉前缀的两端空白，裁完才走 137 D 那条"非负"判定；本栈落点是 intPrefix 里的
+  // `s.trim()`（`processTime` 传进来的就是 `expr.slice(0, -1)` 那一片，末位单位符一位不动）。
+  // 动机：各栈整数解析对空白的容忍度天然不同（go 在 `Atoi` 前 `TrimSpace`、rust `.trim()`、python `int()`
+  // 与 .NET `TryParse` 默认就收，本栈的校验正则原本偏偏不吃）⇒ 不裁就是"同一份流程定义在别家有到期
+  // 时间、这一家没有"（到期表达式是设计器手填 / JSON 搬运的字符串，夹一个空格是常态）。
+  it('issues/137 E ① 前缀带空白（" 2h" / "2 h"）⇒ 照样算得出，同行差值仍≈2h', async () => {
+    // 两形都钉：前导空格、数字与单位符之间的空格——两者都落在**前缀区内**、末位仍是单位符 h
+    for (const expr of [' 2h', '2 h']) {
+      const row = await rowAfterStart({ expireTime: expr })
+      assert.ok(row, `issues/137 E ① 行没读到：${expr}`)
+      assertExpireAbout2h(row!.expireTime, row!.createTime, `issues/137 E ① 前缀带空白（"${expr}"）`)
+    }
+    // 天档同判（走日历加天那一支，带空白的键同样要能算）
+    const day = await rowAfterStart({ expireTime: ' 1d' })
+    assert.ok(day, 'issues/137 E ① 天档行没读到： 1d')
+    assertDayDelta(day!.expireTime, day!.createTime, 1, 'issues/137 E ① 天档带空白（" 1d"）')
+  })
+
+  it('issues/137 E ② 单位符后面还带空白（"2h " / "\\t+2h " / "2h\\t"）⇒ 末位认不出单位 ⇒ 落穿成 NULL', async () => {
+    // 这一格专门挡"把 trim 做成整串去空白"（expr.strip() 后再判末位）那种顺手放宽：
+    // 那样 "2h " 会被算成 now+2h，这里当场红。裁的边界只到前缀，单位符与末尾空白不动。
+    for (const expr of ['2h ', '\t+2h ', '2h\t', ' 2h  ', '30s ']) {
+      const row = await rowAfterStart({ expireTime: expr })
+      assert.ok(row, `issues/137 E ② 行本身要读到（否则"值为空"这条恒真）：${expr}`)
+      assert.equal(row!.expireTime ?? null, null,
+        `"${expr}" 末位是空白、不是 s/m/h/d ⇒ 按误配落穿绝对档 ⇒ NULL（实得 ${String(row!.expireTime)}）`)
+    }
+  })
+
+  it('issues/137 E ③④ 裁完仍是误配 / 仍是负数 ⇒ 照旧 NULL；正向对照与变量档不 trim 一起钉', async () => {
+    // ③ trim ≠ 裁容错：小数与非整数前缀裁完还是误配 ⇒ 仍落穿
+    // ④ 判负（137 D）位置在 trim 之后 ⇒ 加了裁空白不能把负号绕过去
+    for (const expr of [' 2.5h', ' xh', ' -5h', ' -5d']) {
+      const row = await rowAfterStart({ expireTime: expr })
+      assert.ok(row, `issues/137 E ③④ 行没读到：${expr}`)
+      assert.equal(row!.expireTime ?? null, null,
+        `"${expr}" 裁完仍是误配/负数 ⇒ 应落穿成 NULL（实得 ${String(row!.expireTime)}）`)
+    }
+
+    // 正向对照：不带空格的 2h / +2h 照旧算得出 ⇒ 上面几格不是恒真，也证明裁空白没误伤加号档
+    const plain = await rowAfterStart({ expireTime: '2h' })
+    assert.ok(plain, 'issues/137 E 正向对照行没读到：2h')
+    assertExpireAbout2h(plain!.expireTime, plain!.createTime, 'issues/137 E 正向对照（2h 无空白）')
+    const plus = await rowAfterStart({ expireTime: '+2h' })
+    assert.ok(plus, 'issues/137 E 正向对照行没读到：+2h')
+    assertExpireAbout2h(plus!.expireTime, plus!.createTime, 'issues/137 E 正向对照（+2h 无空白）')
+
+    // 变量档不 trim：带空白的表达式名去 args 里取键 ⇒ 取不到 ⇒ 按既有落穿路径 NULL
+    const paddedKey = await rowAfterStart({ expireTime: ' dueAt ' }, { dueAt: '2026-12-31 10:00:00' })
+    assert.ok(paddedKey, 'issues/137 E 变量档行没读到：" dueAt "')
+    assert.equal(paddedKey!.expireTime ?? null, null,
+      `变量档的键名不 trim：" dueAt " ≠ "dueAt" ⇒ 取不到值 ⇒ 落穿 ⇒ NULL（实得 ${String(paddedKey!.expireTime)}）`)
+    // 对照：同一份 args 下不带空白的键名取得到 ⇒ 上一格不是恒真
+    const exactKey = await rowAfterStart({ expireTime: 'dueAt' }, { dueAt: '2026-12-31 10:00:00' })
+    assert.ok(exactKey, 'issues/137 E 变量档对照行没读到：dueAt')
+    assert.equal(new Date(exactKey!.expireTime as Date).getTime(), new Date(2026, 11, 31, 10, 0, 0).getTime(),
+      '对照：不带空白的键名照旧取到变量值 ⇒ "不 trim" 这条没把变量档一起弄坏')
+  })
+
+  it('issues/137 E 求值器档位矩阵（直调 processTime）：档②前缀 trim、末位单位符与档①③的串都不 trim', () => {
+    const now = new Date(2026, 9, 1, 12, 0, 0, 0)   // 固定取时基准，差值判据不依赖真实钟
+    // ① 前缀区内带空白 ⇒ 四档都算得出，且偏移量与无空白同形
+    for (const [expr, ms] of [[' 2h', 2 * 3600_000], ['2 h', 2 * 3600_000], ['\t+3h', 3 * 3600_000],
+                              [' 30s', 30_000], [' 45m', 45 * 60_000]] as Array<[string, number]>) {
+      const got = processTime(expr, undefined, now)
+      assert.ok(got, `issues/137 E ① 带空白的 ${expr} 应算得出`)
+      assert.equal(got!.getTime() - now.getTime(), ms, `${expr} 的偏移量应=${ms}ms`)
+    }
+    // ② 单位符后带空白 / ③ 裁完仍是误配 / ④ 裁完仍是负数 ⇒ 一律 null
+    for (const expr of ['2h ', '2h\t', ' 2h  ', '30s ', ' 2.5h', ' xh', ' 3hh', ' -5h', ' -5d', '\t-30s']) {
+      assert.equal(processTime(expr, undefined, now), null, `issues/137 E 落穿档 ${expr} 应为 null`)
+    }
+    // 正向对照（无空白，保证上面两组不是恒真）
+    for (const expr of ['2h', '+2h', '30s', '45m']) {
+      assert.ok(processTime(expr, undefined, now), `无空白的 ${expr} 照旧该算得出`)
+    }
+    // 档①键名不 trim：带空白取不到；对照＝不带空白取得到
+    const at = new Date(2028, 7, 8, 8, 8, 8, 0)
+    assert.equal(processTime(' dueAt ', { dueAt: at }, now), null, '变量档不 trim ⇒ " dueAt " 取不到 dueAt')
+    assert.equal(processTime('dueAt', { dueAt: at }, now)!.getTime(), at.getTime(),
+      '对照：不带空白的键名照旧取值')
+    // 档③串本身不 trim：带前导空白的合法时间串仍解析不出 ⇒ null；对照＝不带空白成功
+    assert.equal(processTime(' 2026-12-31 10:00:00', undefined, now), null,
+      '绝对档不 trim ⇒ 前导空白仍按解析不出处理')
+    assert.equal(processTime('2026-12-31 10:00:00', undefined, now)!.getTime(),
+      new Date(2026, 11, 31, 10, 0, 0, 0).getTime(), '对照：绝对档无空白照旧成功')
   })
 
   // ── §1.8 第五处写点：串行会签**推进出的下一位成员**（绕过建单 helper 直建行）────
