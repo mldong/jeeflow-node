@@ -7071,3 +7071,221 @@ describe('issues/141 G4 义务 2 未知节点档必须留一条带 nodeId＋实�
     }
   })
 })
+
+// ═══ issues/137 A · 裁定 A（批二 §3-4）· 实例行 expire_time ＝ 定义**顶层**表达式的求值结果 ═══════
+//
+// 立法依据：jeeflow-hub/docs/goal-批二-引擎收尾发版轮-启动词.md §3-4 ＋ issues/137 A
+// （owner 拍 A 案：实例级 expire_time 是**定义级表达式的求值结果**，不是表达式原串、也不是 now()）。
+// 基准＝java：JeeflowEngineImpl.java:93-96（发起时取流程定义**顶层** `model.getExpireTime()`，
+// 非空才 `instance.setExpireTime(FlowUtil.processTime(expireTime, args))`）
+//      ＋ boot2 内置版 ProcessInstanceServiceImpl.java:157-160（先判非空再写，同一形状）。
+// spec 02:21/55「流程期望完成时间」＝流程 JSON **根上**那个 expireTime 键（与节点 properties 里那份
+// 是两个位置：任务行读 properties，实例行读根，两列各判各的，不许互相冒充）。
+//
+// 本栈原形状＝**这一处写点压根没有**：`FlowModel` 没有顶层 expireTime 声明（本栈连解析层都没有，
+// `JSON.parse(content)` 直接当模型用），发起腿也一句没赋 ⇒ wf_process_instance.expire_time 恒 NULL。
+// 本轮补两半：① `FlowModel.expireTime?: string` 声明（值靠 JSON 形状本身带进来）；
+// ② 发起腿在 `saveInstance` **之前**用**既有那把尺子**（`processTime`，套在 `applyNodeExpireTime`
+// 的"非空才写"守卫里）求值后落到实例行——不新造第二把尺子，档位顺序与语义一字不动。
+//
+// ⚠️ 判据全部打在**仓储读回的持久行**上（`repo.findInstanceById`／SQL 通道的位置参取证），
+//    不看引擎返回的那个聚合对象——issues/113 的形状：只有读回值能证明这一列真进了库。
+// ⚠️ 判据打在**值**上（具体时刻 / 同行 expire−create 带宽 / 空），**不是"非空"空判**：
+//    "非空"既放过 now() 占位（差值≈0＝建单即逾期，issues/126 病灶），也放过把原串搬进 datetime 列。
+//
+// 五条判据 → 格子对照：
+//  ① 进列的是求值结果（时刻）不是原串 → T0①（相对档那一格对"搬原串"最敏感：'2h' 算不出时刻）
+//     ＋ SQL 位置参那一格（`expire_time` 绑的必须是 Date）；真库读数见 __tests__/jdbc.test.ts 的
+//     「实例 expire_time」段（160 MySQL STRICT_TRANS_TABLES，兄弟栈 rust/php 实测
+//     1292/22007 Incorrect datetime value: '2h' for column 'expire_time'）。
+//  ② 求值的 args＝发起参数（已注入用户信息与 autoGenTitle 的那份）→ T0② ＋ T0④
+//  ③ 定义没配（缺键／空串／纯空白／null）⇒ 该列保持空 → T0③
+//  ④ 配了但算不出（误配／负数档）⇒ 空，沿用既有落穿语义，不许兜底 now → T0⑤
+//  ⑤ 求值器复用既有那一枚，档位顺序与语义一字不改 → T0⑥（变量档压过相对档）＋ T0⑦（与任务行同尺子）
+describe('issues/137 A 裁定 A 实例行到期时间：发起腿按定义顶层表达式求值（五判据 + SQL 位置参取证）', () => {
+
+  /** 「根上不写 expireTime 键」这一档的哨兵（与 undefined / null / '' 四种形态都得可构造） */
+  const MISSING = Symbol('no-expireTime-key')
+
+  /** 根上带/不带 expireTime 的流程 JSON；节点默认**不配**到期表达式 ⇒ 实例那一列是本组唯一变量 */
+  function i137aFlow(root: any = MISSING, nodeExpr?: string, name = 'expire137a'): string {
+    const raw: Record<string, any> = {
+      name, displayName: '实例到期测试', type: 'approval',
+      nodes: [
+        { id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } },
+        { id: 'task1', type: 'snaker:task',
+          properties: { assignee: 'userA', taskType: 0, performType: 0,
+            ...(nodeExpr === undefined ? {} : { expireTime: nodeExpr }) }, text: { value: '审批' } },
+        { id: 'end', type: 'snaker:end', properties: {}, text: { value: '结束' } },
+      ],
+      edges: [
+        { id: 'e1', sourceNodeId: 'start', targetNodeId: 'task1', properties: {} },
+        { id: 'e2', sourceNodeId: 'task1', targetNodeId: 'end', properties: {} },
+      ],
+    }
+    // MISSING＝根上不写这个键；null / '' / '   ' 原样进 JSON（三档都得是"没配"或"算不出"）
+    if (root !== MISSING) raw.expireTime = root
+    return JSON.stringify(raw)
+  }
+
+  /** 发起一条流，返回 (repo, 引擎返回值, **仓储读回的持久行**)——判据只吃第三项 */
+  async function i137aStart(root: any = MISSING, args: Record<string, any> = {},
+                            nodeExpr?: string, name = 'expire137a') {
+    const repo = new MemoryRepository()
+    const engine = new EngineImpl(repo, undefined, seqIdGen(`e137a-${name}`))
+    const def = { id: '', name, displayName: '实例到期测试', type: 'test', state: 1,
+      content: i137aFlow(root, nodeExpr, name), version: 1,
+      createTime: new Date(), createUser: 't', updateTime: new Date(), updateUser: 't' } as ProcessDefine
+    repo.addDefine(def)
+    const returned = await engine.startProcessInstanceById(def.id, 'userA', args)
+    const row = await repo.findInstanceById(returned.id)
+    assert.ok(row, `夹具自证：实例行没读回（${name}）`)
+    return { repo, returned, row: row! }
+  }
+
+  /** 同行 expire − create 带宽判据（不拿 now 当基准，也不放宽成"非空"） */
+  function i137aDelta(expire: unknown, create: unknown, who: string): number {
+    assert.ok(expire != null, `${who}：实例行 expire_time 为空（写点没生效？）`)
+    assert.ok(expire instanceof Date || typeof expire === 'string',
+      `${who}：列里必须是时刻，实得类型 ${typeof expire}（${String(expire)}）`)
+    // 原串搬运在这一句就断掉：'2h' / 'dueAt' 既不是 Date 也解析不成时刻
+    const at = expire instanceof Date ? expire : (/\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/.test(String(expire))
+      ? new Date(String(expire).replace(' ', 'T')) : null)
+    assert.ok(at instanceof Date && !Number.isNaN(at.getTime()),
+      `${who}：expire_time 存的不是求值结果，实得 ${String(expire)} — `
+      + `把表达式原串搬进 DATETIME 列在真库上是服务端硬错（160 STRICT_TRANS_TABLES ⇒ 1292/22007）`)
+    assert.ok(create != null, `${who}：对照列 create_time 应有值（整行得先落进库）`)
+    return (at.getTime() - new Date(create as Date | string).getTime()) / 1000
+  }
+
+  it('T0① 判据① 相对档 "2h/90s/30m/1d"：进列的是求值结果，同一行 expire−create≈偏移（不是原串、不是 now）', async () => {
+    for (const [expr, seconds, who] of [['2h', 2 * 3600, '小时档'], ['90s', 90, '秒档'],
+                                        ['30m', 30 * 60, '分钟档'], ['1d', 86400, '天档']] as Array<[string, number, string]>) {
+      const { row } = await i137aStart(expr, {}, undefined, `i137a-t01-${who}`)
+      const delta = i137aDelta(row.expireTime, row.createTime, `${who} 配 "${expr}"`)
+      assert.ok(delta >= seconds - 5 && delta <= seconds + 60,
+        `${who} 配 "${expr}"：同行 expire − create = ${delta}s，want ≈${seconds}s；`
+        + `差值≈0 就是 now() 占位（建单即逾期），算不出差值就是原串没求值`)
+    }
+    // 绝对档对照：原串与时刻同形，这一档**抓不到搬原串那一刀**，只证明第③档没被改动
+    const abs = await i137aStart('2026-12-31 10:00:00', {}, undefined, 'i137a-t01-abs')
+    assert.equal(new Date(abs.row.expireTime as Date).getTime(),
+      new Date(2026, 11, 31, 10, 0, 0).getTime(),
+      `绝对档应算成那一刻，实得 ${String(abs.row.expireTime)}`)
+  })
+
+  it('T0② 判据② 表达式是变量名 ⇒ 吃**发起参数**里那份值（三形态同一时刻）', async () => {
+    const want = new Date(2026, 11, 31, 10, 0, 0)
+    for (const [label, value] of [['契约格式文本', '2026-12-31 10:00:00'],
+                                  ['毫秒时间戳', want.getTime()],
+                                  ['Date 对象', want]] as Array<[string, any]>) {
+      const { row } = await i137aStart('dueAt', { dueAt: value }, undefined, `i137a-t02-${label}`)
+      assert.ok(row.expireTime != null, `变量档（${label}）必须取到值——取错那份参数这里就是空`)
+      assert.equal(new Date(row.expireTime as Date).getTime(), want.getTime(),
+        `变量档（${label}）应取 args 里那份值得 ${want.toISOString()}，实得 ${String(row.expireTime)}`)
+    }
+  })
+
+  it('T0③ 判据③ 定义没配（键缺失 / 空串 / 纯空白 / null）⇒ 该列保持空，绝不写 now() 也绝不写空串', async () => {
+    for (const [label, root] of [['键缺失', MISSING], ['空串', ''], ['纯空白', '   '], ['null', null]] as Array<[string, any]>) {
+      const { row } = await i137aStart(root, {}, undefined, `i137a-t03-${label}`)
+      assert.ok(row.createTime, `T0③ 对照列 create_time 应有值（${label}）`)
+      assert.equal(row.expireTime ?? null, null,
+        `根上${label}时实例行不得被赋任何时间（实得 ${String(row.expireTime)}）`)
+    }
+  })
+
+  it('T0④ 判据② 取的是**注入之后**那份参数：autoGenTitle 已被引擎覆写 ⇒ 解析不出 ⇒ 空', async () => {
+    // 引擎发起腿在求值**之前**把 autoGenTitle 写成 "<实名>的<流程名>-yyyy-MM-dd HH:mm"（标题串），
+    // 那份值解析不出 ⇒ 该列空。写点若吃的是注入**前**的 caller dict，这里会读出 2030-06-01 08:30:00。
+    // 基准侧同判据：java JeeflowEngineImpl 是 addUserInfoToArgs/addAutoGenTitle 就地改过的 args
+    // 才递给 FlowUtil.processTime（顺序不可换）。
+    const { row } = await i137aStart(KeyAutoGenTitle, { [KeyAutoGenTitle]: '2030-06-01 08:30:00' },
+                                     undefined, 'i137a-t04')
+    assert.equal(row.expireTime ?? null, null,
+      `实例级求值必须吃注入之后那份参数，实得 ${String(row.expireTime)}（读出 2030-06-01 就是取了 caller 原始 args）`)
+    assert.notEqual(row.variables[KeyAutoGenTitle], '2030-06-01 08:30:00',
+      '夹具自证：注入确实覆写了这个键（否则上一句恒真）')
+
+    // 正向对照：没被注入覆写的键照样取得到值 ⇒ 这一格不是"永远为空"的恒真判据
+    const ok2 = await i137aStart('dueAt', { dueAt: '2030-06-01 08:30:00' }, undefined, 'i137a-t04-ctrl')
+    assert.equal(new Date(ok2.row.expireTime as Date).getTime(), new Date(2030, 5, 1, 8, 30).getTime(),
+      `正向对照：未覆写的变量应取到值，实得 ${String(ok2.row.expireTime)}`)
+  })
+
+  it('T0⑤ 判据④ 配了但算不出（误配 / 负数档）⇒ 空，沿用既有落穿语义，不许兜底 now()', async () => {
+    for (const expr of ['not-a-time', 'xh', '12x3h', '2.5h', '-5h', '-5d', '-30s',
+                        '2026-13-31 10:00:00', '2O26-12-31 10:00:00']) {
+      const { row } = await i137aStart(expr, {}, undefined, 'i137a-t05')
+      assert.ok(row.createTime, `T0⑤ 对照列 create_time 应有值：${expr}`)
+      assert.equal(row.expireTime ?? null, null,
+        `"${expr}" 算不出必须留空，实得 ${String(row.expireTime)}；`
+        + `≈create_time＝兜了 now()（建单即逾期），早于 create_time＝放行了负数档`)
+    }
+  })
+
+  it('T0⑥ 判据⑤ 档位顺序照旧：变量档压过相对档（实例行与任务行同序）', async () => {
+    const { row } = await i137aStart('2h', { '2h': '2030-01-01 00:00:00' }, undefined, 'i137a-t06')
+    assert.equal(new Date(row.expireTime as Date).getTime(), new Date(2030, 0, 1, 0, 0, 0).getTime(),
+      `args 里真有个键叫 "2h" 时取的是变量值那一刻，不是 now+2h；实得 ${String(row.expireTime)}`)
+  })
+
+  it('T0⑦ 判据⑤ 与任务行共用同一把尺子：同一表达式两行同值，且等于直调 processTime', async () => {
+    const want = new Date(2026, 11, 31, 10, 0, 0)
+    const { repo, returned, row } = await i137aStart('dueAt', { dueAt: '2026-12-31 10:00:00' },
+                                                     'dueAt', 'i137a-t07')
+    const doing = (await repo.findDoingTasks(returned.id)).filter(t => t.taskName === 'task1')
+    assert.equal(doing.length, 1, `夹具自证：task1 进行中行应恰好 1 条，实得 ${doing.length}`)
+    const taskRow = await repo.findTaskById(doing[0].id)
+    assert.equal(new Date(row.expireTime as Date).getTime(), want.getTime(),
+      `实例行：want ${want.toISOString()}，实得 ${String(row.expireTime)}`)
+    assert.equal(new Date(taskRow!.expireTime as Date).getTime(), want.getTime(),
+      `任务行：want ${want.toISOString()}，实得 ${String(taskRow!.expireTime)}（两行不同尺子＝分叉）`)
+    assert.equal(processTime('dueAt', { dueAt: '2026-12-31 10:00:00' }, new Date())?.getTime(),
+      want.getTime(), '尺子本身的行为被改动了')
+
+    // 相对档：同一枚尺子给两行的偏移量同档（差值只来自取时的毫秒级先后）
+    const rel = await i137aStart('2h', {}, '2h', 'i137a-t07-rel')
+    const relTask = (await rel.repo.findDoingTasks(rel.returned.id)).find(t => t.taskName === 'task1')
+    assert.ok(relTask?.expireTime instanceof Date && rel.row.expireTime instanceof Date,
+      `相对档两行都该是时刻：实例 ${String(rel.row.expireTime)} 任务 ${String(relTask?.expireTime)}`)
+    assert.ok(Math.abs((rel.row.expireTime as Date).getTime() - (relTask!.expireTime as Date).getTime()) <= 5000,
+      '同一份 "2h" 在实例行与任务行上差 >5s ⇒ 两处用了不同的尺子')
+  })
+
+  it('T0⑧ 落库绑定取证（内存绿≠落库绿）：真 JdbcRepository 的 INSERT 位置参里必须是 Date，不是原串', async () => {
+    // 本栈 T0 没有可连的库（真库腿在 __tests__/jdbc.test.ts），这里用**零连接记录型适配器**
+    // 取"位置参"这一层的证：issues/113 的形状是"聚合对象有值但列没进库"，只断仓储返回体挡不住。
+    const stmts: Array<{ sql: string; args: any[] }> = []
+    const conn: any = {
+      async execute(sql: string, args: any[]) { stmts.push({ sql, args }) },
+      async fetchAll() { return [] }, async fetchOne() { return null },
+      async begin() {}, async commit() {}, async rollback() {},
+    }
+    const adapter: any = { placeholder: '?', async acquire() { return conn }, async release() {} }
+    const repo = new JdbcRepository(adapter)
+
+    for (const [root, wantMoment, who] of [
+      ['2h', null, '相对档'], ['dueAt', new Date(2026, 11, 31, 10, 0, 0), '变量档'],
+      [MISSING, null, '没配']] as Array<[any, Date | null, string]>) {
+      stmts.length = 0
+      const { returned } = await i137aStart(root, root === 'dueAt' ? { dueAt: '2026-12-31 10:00:00' } : {},
+                                            undefined, `i137a-t08-${who}`)
+      await repo.saveInstance(returned)
+      const ins = stmts.find(s => /^INSERT INTO wf_process_instance/.test(s.sql))
+      assert.ok(ins, `夹具自证：没看到实例 INSERT 语句（实得 ${stmts.map(s => s.sql).join(' | ')}）`)
+      // 列序：id, parent_id, process_define_id, state, parent_node_name, business_no, operator,
+      //       **expire_time**(下标 7), variable, create_time, create_user, update_time, update_user
+      const bound = ins!.args[7]
+      if (root === MISSING) {
+        assert.equal(bound, null, `没配那一档绑进库的必须是 NULL，实得 ${String(bound)}`)
+      } else if (wantMoment) {
+        assert.ok(bound instanceof Date, `${who}：expire_time 绑的必须是 Date，实得 ${typeof bound}（${String(bound)}）`)
+        assert.equal(bound.getTime(), wantMoment.getTime(), `${who}：绑的时刻不对，实得 ${String(bound)}`)
+      } else {
+        assert.ok(bound instanceof Date, `${who}：expire_time 绑的必须是 Date，实得 ${typeof bound}（${String(bound)}）`)
+        assert.notEqual(String(bound), '2h', `${who}：绑的是表达式原串，不是求值结果`)
+      }
+    }
+  })
+})

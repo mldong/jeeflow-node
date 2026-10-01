@@ -1032,3 +1032,159 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
     }
   })
 })
+
+// ═══ issues/137 A · 裁定 A（批二 §3-4）· 实例行 expire_time 的**真库腿** ═══════════════════
+//
+// 病灶形状：本栈发起腿**一处都没给** wf_process_instance.expire_time 赋过值（该列恒 NULL），
+// 本轮补的是"流程定义顶层 expireTime 表达式 → 求值 → 写实例行"这一处写点
+// （基准＝java JeeflowEngineImpl.java:93-96 ＋ boot2 ProcessInstanceServiceImpl.java:157-160）。
+//
+// 这一段独有的卖点＝**内存绿 ≠ 落库绿**，两条只能在真库上证：
+//   ① 列里进的必须是**求值结果（DATETIME 时刻）**，不是表达式原串——160 这台 MySQL 的
+//      @@sql_mode 含 STRICT_TRANS_TABLES，把 '2h' 绑进 DATETIME(3) 列是**服务端硬错**
+//      （兄弟栈 rust/php 本轮实测服务端给 1292 / 22007
+//      "Incorrect datetime value: '2h' for column 'expire_time'"），整条发起腿直接炸；
+//      内存仓/MemoryRepository 那一路不会报这个错，所以 T0 全绿也可能真库红。
+//   ② 定义没配／算不出 ⇒ 列必须 **IS NULL**（不是空串、不是 now()）。
+//
+// 判据一律**直查数据库那一列**（不看引擎返回的聚合对象，issues/113 的形状）。
+// 夹具自带定义行（id 段与既有各段错开：mysql 900064–900070 / postgres 910064–910070），
+// **根上**配 expireTime、节点一律不配 ⇒ 实例那一列是这一段唯一变量。
+describe(`实例行 expire_time 真库腿（${dbType} @ 192.168.1.160）· issues/137 A 裁定 A`, () => {
+  /** 「根上不写 expireTime 键」这一档的哨兵（与 undefined / null / '' / '   ' 四种形态都得可构造） */
+  const MISSING137 = Symbol('no-expireTime-key')
+  const IDS = [DEFINE_ID + 60, DEFINE_ID + 61, DEFINE_ID + 62, DEFINE_ID + 63,
+               DEFINE_ID + 64, DEFINE_ID + 65, DEFINE_ID + 66]
+
+  /** start → approve(leader) → end；root=MISSING 即**根上不写** expireTime 键（节点一律不配） */
+  function flow137a(root: any, name: string): string {
+    const raw: Record<string, any> = {
+      name, displayName: '实例到期真库', type: 'approval',
+      nodes: [
+        { id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } },
+        { id: 'approve', type: 'snaker:task',
+          properties: { assignee: 'leader', taskType: 0, performType: 0 }, text: { value: 'approve' } },
+        { id: 'end', type: 'snaker:end', properties: {}, text: { value: '结束' } },
+      ],
+      edges: [
+        { id: 'e1', sourceNodeId: 'start', targetNodeId: 'approve', properties: {} },
+        { id: 'e2', sourceNodeId: 'approve', targetNodeId: 'end', properties: {} },
+      ],
+    }
+    if (root !== MISSING137) raw.expireTime = root
+    return JSON.stringify(raw)
+  }
+
+  async function purge137(): Promise<void> {
+    for (const did of IDS) {
+      await q(pool, 'DELETE FROM wf_process_task_actor WHERE process_task_id IN' +
+        ' (SELECT id FROM wf_process_task WHERE process_instance_id IN' +
+        ' (SELECT id FROM wf_process_instance WHERE process_define_id = ?))', [did])
+      await q(pool, 'DELETE FROM wf_process_task WHERE process_instance_id IN' +
+        ' (SELECT id FROM wf_process_instance WHERE process_define_id = ?)', [did])
+      await q(pool, 'DELETE FROM wf_process_cc_instance WHERE process_instance_id IN' +
+        ' (SELECT id FROM wf_process_instance WHERE process_define_id = ?)', [did])
+      await q(pool, 'DELETE FROM wf_process_instance WHERE process_define_id = ?', [did])
+      await q(pool, 'DELETE FROM wf_process_define WHERE id = ?', [did])
+    }
+  }
+
+  async function seedDefine(did: number, content: string): Promise<void> {
+    const now = new Date()
+    await q(pool, 'INSERT INTO wf_process_define (id, name, display_name, type, state, content,' +
+      ' version, create_time, create_user, update_time, update_user) VALUES (?,?,?,?,1,?,1,?,?,?,?)',
+      [did, `node-expire137a-${did}`, '实例到期真库', 'approval', content,
+        now, 'node-test', now, 'node-test'])
+  }
+
+  /** 直查实例行的 (expire_time, create_time)——只看库里的值 */
+  async function cols137(iid: string): Promise<[any, any]> {
+    const rows = await q(pool, 'SELECT expire_time, create_time FROM wf_process_instance WHERE id = ?', [iid])
+    return rows.length ? [rows[0].expire_time, rows[0].create_time] : [undefined, undefined]
+  }
+
+  it('⑱ 前提：@@sql_mode 含 STRICT_TRANS_TABLES（原串进 datetime 列才会硬错，pg 侧如实标注不限此判据）', async () => {
+    if (isPg) {
+      // Postgres 的 datetime 列对 '2h' 同样是服务端硬错（22007 invalid input syntax for type timestamp），
+      // 但没有 @@sql_mode 这个开关可查；本段判据在 pg 侧照样跑，只跳过这一条前提取证。
+      return
+    }
+    const rows = await q(pool, 'SELECT @@sql_mode AS m')
+    const mode = String(rows[0].m)
+    assert.ok(mode.toUpperCase().includes('STRICT_TRANS_TABLES'),
+      `判据前提不成立：这台库不是严格模式，"没报错"就不能当证据 ⇒ @@sql_mode=${mode}`)
+  })
+
+  it('⑱ 正向：根上 "2h" ⇒ 真库列是时刻（datetime），同行 expire − create ≈ 7200s，仓储读回同值', async () => {
+    await purge137()
+    try {
+      const repo = new JdbcRepository(makeAdapter(pool), new SeqIDGen())
+      const engine = new EngineImpl(repo, userProv, new SeqIDGen())
+      await seedDefine(IDS[0], flow137a('2h', `node-expire137a-${IDS[0]}`))
+      let inst: ProcessInstance | null = null
+      let err = ''
+      try {
+        inst = await engine.startProcessInstanceById(String(IDS[0]), 'zhangsan', { amount: '1' })
+      } catch (e: any) {
+        err = `${e?.code ?? ''} ${e?.errno ?? ''}: ${e?.message ?? e}`
+      }
+      // 把 '2h' 原串绑进 DATETIME(3) 列＝服务端硬错（rust/php 实测 1292 / 22007
+      // Incorrect datetime value: '2h' for column 'expire_time'），这一句就是那一刀的取证点
+      assert.ok(inst, `发起腿在真库上炸了（原串进 datetime 列的形状）：${err}`)
+      const [exp, cre] = await cols137(String(inst!.id))
+      assert.ok(exp != null, '真库列 expire_time 为空 ⇒ 发起腿那处写点没生效/没落库')
+      assert.ok(exp instanceof Date, `真库列里必须是时刻（datetime），实得 ${typeof exp} ${String(exp)}`)
+      assert.ok(cre instanceof Date, `对照列 create_time 应是 datetime，实得 ${String(cre)}`)
+      const delta = (exp.getTime() - cre.getTime()) / 1000
+      assert.ok(delta >= 2 * 3600 - 5 && delta <= 2 * 3600 + 60,
+        `同行 expire − create = ${delta}s，want ≈7200s（差值≈0＝now() 占位／算不出＝搬了原串）`)
+      const back = await repo.findInstanceById(String(inst!.id))
+      assert.ok(back?.expireTime instanceof Date &&
+        Math.abs(back.expireTime.getTime() - exp.getTime()) <= 1000,
+        `仓储读回与直查列不是同一时刻（列没进 SELECT 映射？）：直查 ${String(exp)} 读回 ${String(back?.expireTime)}`)
+    } finally {
+      await purge137()
+    }
+  })
+
+  it('⑱ 变量档真库腿：根上写变量名 ⇒ 列里是**发起参数**里那个时刻（不是变量名原串）', async () => {
+    await purge137()
+    try {
+      const repo = new JdbcRepository(makeAdapter(pool), new SeqIDGen())
+      const engine = new EngineImpl(repo, userProv, new SeqIDGen())
+      await seedDefine(IDS[1], flow137a('dueAt', `node-expire137a-${IDS[1]}`))
+      const inst = await engine.startProcessInstanceById(String(IDS[1]), 'zhangsan',
+        { dueAt: '2026-12-31 10:00:00' })
+      const [exp] = await cols137(String(inst.id))
+      assert.ok(exp instanceof Date, `真库列应是时刻，实得 ${typeof exp} ${String(exp)}`)
+      assert.equal(new Date(exp).getTime(), new Date(2026, 11, 31, 10, 0, 0).getTime(),
+        `变量档吃的是发起参数那份值，实得 ${String(exp)}`)
+    } finally {
+      await purge137()
+    }
+  })
+
+  it('⑱ 没配 / 误配 / 负数档真库腿：列必须 IS NULL（不写空串、不写 now）', async () => {
+    await purge137()
+    try {
+      const repo = new JdbcRepository(makeAdapter(pool), new SeqIDGen())
+      const engine = new EngineImpl(repo, userProv, new SeqIDGen())
+      const vectors: Array<[string, any]> = [
+        ['键缺失', MISSING137], ['空串', ''], ['纯空白', '   '],
+        ['误配', 'not-a-time'], ['负数档', '-5h'],
+      ]
+      for (let i = 0; i < vectors.length; i++) {
+        const [label, root] = vectors[i]
+        const did = IDS[2 + i]
+        await seedDefine(did, flow137a(root, `node-expire137a-${did}`))
+        const inst = await engine.startProcessInstanceById(String(did), 'zhangsan')
+        const [exp, cre] = await cols137(String(inst.id))
+        assert.equal(exp ?? null, null,
+          `${label} 那一档真库列必须 NULL（对照列 create_time=${String(cre)} 已落库），实得 ${String(exp)}`)
+        assert.ok(cre != null, `${label}：对照列 create_time 应有值（整行确实落了库）`)
+      }
+    } finally {
+      await purge137()
+    }
+  })
+})

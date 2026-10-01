@@ -4,6 +4,16 @@ export interface FlowModel {
   name: string
   displayName: string
   type: string
+  /**
+   * 流程定义**顶层**的「期望完成时间」表达式（spec 02:21/55，设计器 JSON 根上的 `expireTime` 键；
+   * 对齐 Java `ProcessModel.expireTime` / `LfModel.expireTime`）。
+   * 存的是**表达式原串**（`'2h'` / `'2026-12-31 10:00:00'` / 变量名），不是时刻——
+   * 求值成时刻由发起腿用那把唯一的尺子 `processTime` 做（issues/137 A 裁定 A，批二 §3-4）。
+   * 缺键／空串／纯空白 ⇒ 实例那一列保持 NULL（不赋 now()、不赋空串）。
+   * ⚠️ 本栈没有解析层（`JSON.parse(content)` 直接当 FlowModel 用），所以这一条只是**声明层**补齐，
+   *    取值靠 JSON 形状本身；类型标 `?:` 正因为"根上没这个键"是常态而不是空值。
+   */
+  expireTime?: string
   nodes: FlowNode[]
   edges: FlowEdge[]
 }

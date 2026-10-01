@@ -367,6 +367,18 @@ export class EngineImpl implements Engine {
     const now = new Date()
     // 聚合根工厂创建实例
     const inst = ProcessInstance.create(this.nextId(), defineId, operator, vars, now)
+    // issues/137 A · 裁定 A（批二 §3-4）· **实例级 expire_time 的唯一写点**：
+    // 取流程定义**顶层** expireTime 表达式（spec 02:21/55「流程期望完成时间」），非空才求值写入。
+    // 基准＝Java JeeflowEngineImpl.java:93-96（`if (StringUtils.isNotEmpty(...)) instance.setExpireTime(
+    // FlowUtil.processTime(expireTime, args))`）＋ boot2 内置版 ProcessInstanceServiceImpl.java:157-160；
+    // 本栈原形状是**这一句都没有** ⇒ wf_process_instance.expire_time 恒 NULL（本案病灶）。
+    // 三条口径逐条落在这里：① 进列的是**求值结果（时刻）**不是表达式原串——原串在 STRICT_TRANS_TABLES
+    // 的 MySQL 上是服务端硬错（rust/php 本轮实测 1292/22007 Incorrect datetime value: '2h'）；
+    // ② 变量源＝**发起参数**（上面 addUserInfo/addAutoGenTitle 注入完的那份 `vars`，与 Java 就地改过的
+    // `args` 同档，取成 caller 原始 args 会让被注入覆写的键判错档）；③④ 没配／算不出都留 NULL，
+    // 不兜底 now()。尺子是既有那一枚（`applyNodeExpireTime` 包着的 `processTime`，
+    // 档位顺序与语义一字不改，不许新造第二把）。
+    applyNodeExpireTime(inst, flow.expireTime, vars, now)
     await this.repo.saveInstance(inst)
     // §11.3 code 1：实例行 insert **之后** fire（场景 28：发起前先 fire ⇒ 红）
     await this.fireEvent({ type: EventType.ProcessInstanceStart, instanceId: inst.id, operator })
@@ -1268,19 +1280,28 @@ export function processTime(expr: string, args: Record<string, any> | undefined,
 }
 
 /**
- * issues/126 案 A · 任务行 expire_time 的**唯一**写入口（五处写点共用同一把尺子）：
- * 普通建单 / 串行会签首位成员 / 并行会签全员 / 回退新建 / 串行会签推进出的下一位成员。
+ * issues/126 案 A · 到期时间的**唯一**写入口：任务行五处写点 + 实例行发起写点共用同一把尺子。
  *
- * 节点没配（undefined / null / 空串 / 纯空白）⇒ **该列保持空**：不写 now()、不写 ''、不写 0
+ * 任务侧五处：普通建单 / 串行会签首位成员 / 并行会签全员 / 回退新建 / 串行会签推进出的下一位成员。
+ * 实例侧一处（issues/137 A 裁定 A · 批二 §3-4）：发起腿的 `wf_process_instance.expire_time`，
+ * 表达式来自流程定义**顶层**（`FlowModel.expireTime`，spec 02:21/55），不是节点 properties 那份。
+ *
+ * 没配（undefined / null / 空串 / 纯空白）⇒ **该列保持空**：不写 now()、不写 ''、不写 0
  * （owner 2026-09-28 口径，对齐 boot2 `if(StrUtil.isNotEmpty(expireTime))` 的先判再写）。
+ * 算不出（误配 / 负数档）⇒ 同样保持空（`processTime` 返回 null 时**不赋值**，不许兜底 now）。
  *
  * 变量源两档：建单路径＝**实例变量**（boot2 的 `execution.getArgs()`），
  * 回退新建＝**随行拷贝那份变量**（boot2 的 `hisVariable`）。搞混会让"表达式是个变量名"这一档跨栈得到不同答案。
+ * 实例级写点＝**发起参数**（`addUserInfo`/`addAutoGenTitle` 注入完的那份 `vars`，
+ * 基准＝Java `JeeflowEngineImpl:93-96` 就地改过的 `args`）。
+ *
+ * `target` 取结构位（带 `expireTime?: Date` 槽的行对象：`ProcessTask` / `ProcessInstance`），
+ * 目的是让实例那一列与任务那一列**共用同一条"非空才写"守卫**，不许另起一份判据。
  */
-function applyNodeExpireTime(task: ProcessTask, expr: unknown, args: Record<string, any> | undefined, now: Date): void {
-  if (!task) return
+function applyNodeExpireTime(target: { expireTime?: Date }, expr: unknown, args: Record<string, any> | undefined, now: Date): void {
+  if (!target) return
   const s = expr == null ? '' : String(expr)
   if (s.trim() === '') return
   const at = processTime(s, args, now)
-  if (at) task.expireTime = at
+  if (at) target.expireTime = at
 }
