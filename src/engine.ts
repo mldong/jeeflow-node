@@ -1199,8 +1199,9 @@ function parseAbsTime(s: string): Date | null {
 }
 
 /** 相对档前缀取整：必须是**纯整数、非负**且落在 int32 内（C# int.TryParse 同判据），否则返回 null ⇒ 落穿。
- *  与 Java 的差异是故意的：Java 的 Integer.parseInt 遇 "xh" 会抛异常**打断建单**，
- *  owner 2026-09-28 定的口径是按 C# 落穿→NULL（配置写错不该让流程卡死）；要改回"跟 Java 一样抛"必须八栈同批改。
+ *  误配档（"xh"／"2.5h"／"3hh"）一律**落穿 → 绝对档 → NULL**＝**八栈一致**口径（issues/137 C，
+ *  owner 2026-09-28：配置写错不该让流程卡死）。⚠️ 旧文那句"与 Java 的差异是故意的：Java 的
+ *  Integer.parseInt 会抛异常打断建单"**已过期**——java 参考实现已改成同款落穿（`6bdf41b`，随 1.8.36 发出）。
  *
  *  issues/137 D（owner 2026-10-01 拍"判非负"，见 jeeflow-doc spec/04 §「相对档前缀必须是非负整数」）：
  *  **负数前缀同样算解析不出** ⇒ 落穿到绝对档 ⇒ 仍解析不出就 NULL。放行 `-5h` 会算出一个**过去**的时刻，
