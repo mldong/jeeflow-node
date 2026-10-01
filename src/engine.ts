@@ -1162,13 +1162,22 @@ function parseAbsTime(s: string): Date | null {
   return dt
 }
 
-/** 相对档前缀取整：必须是**纯整数**且落在 int32 内（C# int.TryParse 同判据），否则返回 null ⇒ 落穿。
+/** 相对档前缀取整：必须是**纯整数、非负**且落在 int32 内（C# int.TryParse 同判据），否则返回 null ⇒ 落穿。
  *  与 Java 的差异是故意的：Java 的 Integer.parseInt 遇 "xh" 会抛异常**打断建单**，
- *  owner 2026-09-28 定的口径是按 C# 落穿→NULL（配置写错不该让流程卡死）；要改回"跟 Java 一样抛"必须八栈同批改。 */
+ *  owner 2026-09-28 定的口径是按 C# 落穿→NULL（配置写错不该让流程卡死）；要改回"跟 Java 一样抛"必须八栈同批改。
+ *
+ *  issues/137 D（owner 2026-10-01 拍"判非负"，见 jeeflow-doc spec/04 §「相对档前缀必须是非负整数」）：
+ *  **负数前缀同样算解析不出** ⇒ 落穿到绝对档 ⇒ 仍解析不出就 NULL。放行 `-5h` 会算出一个**过去**的时刻，
+ *  新建的行当场就是逾期——比"没配到期时间"更难发现，也正与本函数上方"任何一档都不许退回当前时间"
+ *  （issues/126 的病灶形状）冲突。四个单位档 `s/m/h/d` 共用本函数（processTime 只在下面调一次再按后缀
+ *  分发，`d` 档走日历加天不乘 86400，负数＝历日倒退，同病），所以这一处判据把四档一起拦住。
+ *
+ *  只裁负、**不裁加号**：正则里的 `+` 保留。各栈整数解析（python `[+-]?`、php `[+-]?\d{1,18}`、
+ *  java Integer.parseInt）都收 '+'，把它去掉等于新造一处跨栈分叉 ⇒ `+2h` 仍是合法的 now+7200s。 */
 function intPrefix(s: string): number | null {
   if (!/^[-+]?\d+$/.test(s)) return null
   const n = Number(s)
-  return Number.isSafeInteger(n) && Math.abs(n) <= 2147483647 ? n : null
+  return Number.isSafeInteger(n) && n >= 0 && n <= 2147483647 ? n : null
 }
 
 /**

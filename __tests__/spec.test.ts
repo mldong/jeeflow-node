@@ -4252,6 +4252,17 @@ describe('issues/126 案 A 任务行到期时间：建单五处写点按节点�
       `${who} 同行 create→expire 差值应≈2h，实得 ${delta}s（占位写法算出≈0 ⇒ 新建即逾期）`)
   }
 
+  /** 天档判据：同一行 create→expire 差值≈n 天。带宽 ±1h 而不是紧贴 n*86400——`d` 走**日历加天**
+   *  （见 processTime 的 setDate 分支），跨夏令时/月末的自然日可以是 23/25 小时；
+   *  下界仍把"退回 now() 的占位写法算出≈0"夹在外面，不放宽成"非空"。 */
+  function assertDayDelta(expire: unknown, create: unknown, days: number, who: string): void {
+    assert.ok(expire != null, `${who} 必须带到期时间（实得 ${String(expire)}）`)
+    assert.ok(create != null, `${who} 的 createTime 应有值（内部对照）`)
+    const delta = (new Date(expire as Date | string).getTime() - new Date(create as Date | string).getTime()) / 1000
+    assert.ok(delta >= days * 86400 - 3600 && delta <= days * 86400 + 3600,
+      `${who} 同行 create→expire 差值应≈${days} 天（日历加天），实得 ${delta}s`)
+  }
+
   /** 取该实例里参与者含某用户的那条 DOING 行本身（读不到返回 null） */
   async function memberRow(repo: MemoryRepository, instId: string, actor: string) {
     const doing = await repo.findDoingTasks(instId)
@@ -4304,6 +4315,55 @@ describe('issues/126 案 A 任务行到期时间：建单五处写点按节点�
     const boolVar = await rowAfterStart({ expireTime: 'dueAt' }, { dueAt: true })
     assert.ok(boolVar, 'T0④ 落穿档行没读到')
     assert.equal(boolVar!.expireTime ?? null, null, '变量值类型不认识 ⇒ 落穿 ⇒ 最终 null')
+  })
+
+  // ── issues/137 D（owner 2026-10-01 拍"判非负" · spec 04 §相对档前缀必须是非负整数）──────
+  // 判据形状照 jeeflow-java ExpireTimeOnCreateTest#negativeRelativeExpressionStaysNull（1649955）。
+  // 负数相对档不是合法偏移：放行 `-5h` 会算出一个**过去**的时刻 ⇒ 新建的行当场就是逾期，
+  // 比"没配到期时间"更难发现，也和本卡"算不出就 NULL、绝不退化成 now"的精神同向（issues/126 病灶）。
+  // 四档 `s/m/h/d` 各钉一格：本栈 processTime 只在②档调一次 intPrefix 再按后缀分发，
+  // `d` 走日历加天（负数＝历日倒退，不是乘 86400），所以 `d` 与 `s/m/h` 是两条独立的病灶形状。
+  it('issues/137 D 负数相对档 -30s/-5m/-5h/-5d ⇒ 落穿成 NULL（不是异常、不是 now、不是回拨时刻）', async () => {
+    for (const expr of ['-30s', '-5m', '-5h', '-5d']) {
+      const row = await rowAfterStart({ expireTime: expr })
+      assert.ok(row, `issues/137 D 负档行本身要读到（否则"值为空"这条恒真）：${expr}`)
+      assert.ok(row!.createTime, `issues/137 D 对照：createTime 应有值：${expr}`)
+      assert.equal(row!.expireTime ?? null, null,
+        `"${expr}" 的负前缀必须算解析不出 ⇒ 落穿绝对档 ⇒ NULL；`
+        + `退化成 now() 等于静默造一个"建单即逾期"，放行负数则是真算出一个过去时刻（实得 ${String(row!.expireTime)}）`)
+    }
+    // 能读到行本身＝本栈"误配不打断建单"（issues/137 C 落穿口径）没被这次改动破坏
+  })
+
+  it('issues/137 D 正向对照：加号档/天档/绝对档/坏前缀档都照旧（保证上一格不是恒真）', async () => {
+    // ② 加号档仍合法：正则里的 `+` 是各栈整数解析（python `[+-]?`、php `[+-]?\d{1,18}`、java
+    //    Integer.parseInt）的公共口径，"只裁负不裁加号"——这一格就是挡住顺手把加号也裁掉
+    const plus = await rowAfterStart({ expireTime: '+2h' })
+    assert.ok(plus, 'issues/137 D 对照行没读到：+2h')
+    assertExpireAbout2h(plus!.expireTime, plus!.createTime, 'issues/137 D 正向对照（+2h 收加号 ⇒ now+7200s）')
+
+    // ② 天档正数照旧：`2d` 与 `+1d`（跨天/跨月的日历加天算术由这两格继续覆盖，负档删掉的只是回拨方向）
+    const twoDays = await rowAfterStart({ expireTime: '2d' })
+    assert.ok(twoDays, 'issues/137 D 对照行没读到：2d')
+    assertDayDelta(twoDays!.expireTime, twoDays!.createTime, 2, 'issues/137 D 天档 2d')
+
+    const plusOneDay = await rowAfterStart({ expireTime: '+1d' })
+    assert.ok(plusOneDay, 'issues/137 D 对照行没读到：+1d')
+    assertDayDelta(plusOneDay!.expireTime, plusOneDay!.createTime, 1, 'issues/137 D 天档 +1d')
+
+    // ③ 绝对档不受影响：判非负只裁第 2 档的前缀，第 3 档原样
+    const abs = await rowAfterStart({ expireTime: '2026-12-31 10:00:00' })
+    assert.ok(abs, 'issues/137 D 绝对档行没读到')
+    assert.equal(new Date(abs!.expireTime as Date).getTime(), new Date(2026, 11, 31, 10, 0, 0).getTime(),
+      '绝对档 "2026-12-31 10:00:00" 照旧成功 ⇒ 第 3 档没被一起裁掉')
+
+    // ④ 坏前缀行为不变（本来就落穿）：小数与带字母两类，负号版同样落穿且不与正数档分叉
+    for (const expr of ['2.5h', 'xh', '-2.5h']) {
+      const row = await rowAfterStart({ expireTime: expr })
+      assert.ok(row, `issues/137 D 误配档行没读到：${expr}`)
+      assert.equal(row!.expireTime ?? null, null,
+        `"${expr}" 前缀非整数 ⇒ 落穿绝对档 ⇒ NULL（issues/137 C 口径不变，实得 ${String(row!.expireTime)}）`)
+    }
   })
 
   // ── §1.8 第五处写点：串行会签**推进出的下一位成员**（绕过建单 helper 直建行）────
