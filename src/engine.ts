@@ -1,6 +1,7 @@
 import {
   type FlowModel, type FlowNode,
   TypeStart, TypeEnd, TypeTask, TypeDecision, TypeFork, TypeJoin, TypeCustom,
+  KnownNodeTypes,
   ProcessInstance, type ProcessTask, type ProcessDefine,
   InstanceState, TaskState, SubmitType,
 } from './model.js'
@@ -753,6 +754,29 @@ export class EngineImpl implements Engine {
         await this.notifyInstanceEnd(inst, operator)
         return
       }
+      default:
+        // issues/141 G4 义务 2（spec/02「类型键的三条义务」第 2 条）：**未知档不得静默丢节点**
+        // ——类型不在表里时先记一条可诊断日志，再决定跳过。
+        //
+        // 落点为什么在执行腿而不是解析期：本栈连"解析"这一步都没有——`JSON.parse(content)` 直接
+        // 当 FlowModel 用（见 startProcessInstanceById / prepareExecuteTask 那两处），节点一律留在
+        // 模型里，不存在 java `ModelParser` 那种"查不到解析器就 continue"的解析期丢弃臂。真正
+        // "这个节点什么都不做、出边也没人走"的决定点就是本 switch 走完没人认领。⇒ 每次令牌落到
+        // 该节点打一条；令牌停在原地不再有后续推进，所以不存在按请求刷屏
+        // （反例：挂到每次读定义的出口上，start/execute/highLight/detail 各打一遍）。
+        //
+        // **为什么必须带实得类型串原文**：spec/02 义务 3 段 owner 二拍「子流程暂不进契约面」，
+        // 六栈不补 `snaker:subProcess` 档 ⇒ 设计器画出的子流程节点在本栈唯一的痕迹就是这条日志。
+        // 少了 type= 那一半，"snaker:subProcess 被吞了"和"手写的 snaker:Task 拼错大小写被吞了"
+        // 长得一模一样，那条裁定就没有可诊断面，等于没立法依据。nodeId 同理：没它连哪个节点都找不到。
+        //
+        // ⚠️ 只记日志，不改行为：跳过形状（不建行、不沿出边推进、令牌停住）已由 issues/143 在
+        // java/php/c# 收口，本栈本来就是"按 id 现查目标、查不到就停"那一派，行为已对。
+        if (!KnownNodeTypes.has(node.type)) {
+          console.warn(`[jeeflow] 流程定义里的节点类型不在类型表里，该节点及其出边将被跳过` +
+            `（不建行、不推进，令牌停在此处）: nodeId=${node.id}, type=${node.type}`)
+        }
+        return
     }
     } finally { await this.firePost(node, inst) }
   }

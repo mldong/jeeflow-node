@@ -6960,3 +6960,114 @@ describe('issues/142 B 批 归属值写侧归一（spec 06 §2.11）：两形同
 })
 
 
+
+// ═══ issues/141 G4 义务 2 · 未知节点档的可诊断日志（node 腿 · 批二 §3-5）══════════════════════
+//
+// 契约逐字（jeeflow-doc/docs/spec/02-flow-definition.md:113-124「类型键的三条义务」第 2 条）：
+//   「未知档不得静默丢节点：类型不在表里时，必须**记一条可诊断日志（带节点 id 与实得类型串）**
+//    再决定跳过，不允许"静默丢节点＋连带丢它的出边"。」
+// 同文件 :107-111（owner 2026-10-01 二拍「子流程暂不进契约面」）：六栈**不补** snaker:subProcess 档，
+// 设计器画出的子流程节点就靠这条未知档日志被显式暴露 ⇒ 日志不是装饰，是那条裁定唯一的可诊断面。
+//
+// 落点是**执行期**（`executeNode` 那个 switch 走完没人认领的 default 支），不是解析期：
+// 本栈连"解析"这一步都没有——`JSON.parse(content)` 直接当 FlowModel 用，节点一律留在模型里，
+// 不存在 java `ModelParser` 的"查不到解析器就 continue"臂 ⇒ 未知类型只有令牌撞上它时才可观测。
+// 挂到读定义的出口上反而会跟着每一次 start/execute/highLight/detail 各打一遍（那才是刷屏）。
+//
+// 本轮**只加日志**：后半"指向被丢弃节点的边落穿停住、不许打崩办理"已由 issues/143 在 java/php/c#
+// 落过，本栈本来就是"按 id 现查目标、查不到就停"那一派，行为已对 ⇒ 下面顺带钉住行为没漂。
+const G4_MARKER = '不在类型表里'
+
+describe('issues/141 G4 义务 2 未知节点档必须留一条带 nodeId＋实得类型串的可诊断日志（spec/02 类型键三条义务）', () => {
+
+  /** start → apply(applicant，办掉后令牌才走进被测节点) → mid → end */
+  function chainContent(mid: { id: string; type: string; properties?: Record<string, any> }): string {
+    return JSON.stringify({
+      name: 'g4unknown', displayName: '未知档测试', type: 'approval',
+      nodes: [
+        { id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } },
+        { id: 'apply', type: 'snaker:task',
+          properties: { assignee: 'applicant', taskType: 0, performType: 0 }, text: { value: '发起申请' } },
+        { id: mid.id, type: mid.type, properties: mid.properties ?? {}, text: { value: '被测节点' } },
+        { id: 'end', type: 'snaker:end', properties: {}, text: { value: '结束' } },
+      ],
+      edges: [
+        { id: 'e0', sourceNodeId: 'start', targetNodeId: 'apply', properties: {} },
+        { id: 'e1', sourceNodeId: 'apply', targetNodeId: mid.id, properties: {} },
+        { id: 'e2', sourceNodeId: mid.id, targetNodeId: 'end', properties: {} },
+      ],
+    })
+  }
+
+  /** 发起并办掉申请腿，让令牌真走进被测节点（本栈引擎无 startAndExecute，两拍要走） */
+  async function runInto(h: { mem: MemoryRepository; engine: EngineImpl; def: ProcessDefine }, operator = 'alice') {
+    const started = await h.engine.startProcessInstanceById(h.def.id, operator)
+    for (const t of await h.mem.findDoingTasks(started.id)) await h.engine.executeProcessTask(t.id, operator)
+    return started
+  }
+
+  /** console.warn 捕获：本栈没有可注入的 logger 门面（既有诊断腿一律 console.warn/error），
+   *  测试临时换掉再恢复——**不为此改产品代码的接口形状**。同 `issues/142` 那格的 captureWarnings 口径。 */
+  async function captureWarn(fn: () => Promise<unknown>): Promise<string[]> {
+    const lines: string[] = []
+    const orig = console.warn
+    console.warn = (...args: any[]) => { lines.push(args.map(String).join(' ')) }
+    try { await fn() } finally { console.warn = orig }
+    return lines
+  }
+
+  function g4Harness(content: string) {
+    const mem = new MemoryRepository()
+    const engine = new EngineImpl(mem, undefined, seqIdGen('g4'))
+    const def = {
+      id: '', name: JSON.parse(content).name, displayName: 'G4 测试', type: 'test', state: 1,
+      content, version: 1, createTime: new Date(), createUser: 't', updateTime: new Date(), updateUser: 't',
+    } as ProcessDefine
+    mem.addDefine(def)
+    return { mem, engine, def }
+  }
+
+  it('①未知档矩阵：每个实得类型串都留下一条同时带 nodeId 与 type 原串的日志；行为侧不建行、不推进、不炸办理', async () => {
+    const vectors: Array<[string, string]> = [
+      ['snaker:subProcess', '设计器实际输出的驼峰子流程串——owner 二拍暂不进契约面，全靠这条日志显影'],
+      ['snaker:subprocess', '契约里那条小写档同样不在表里（查表大小写敏感，不许偷偷认）'],
+      ['snaker:Task', '拼错大小写：不许再塌成 Custom/Task 任一档'],
+      ['task', '裸名（没带 snaker: 前缀）不在本栈表里'],
+      ['snaker:not-a-node', '纯杜撰'],
+      ['', 'type 缺失／空串'],
+    ]
+    for (const [rawType, why] of vectors) {
+      const h = g4Harness(chainContent({ id: 'ghost', type: rawType }))
+      let started!: ProcessInstance
+      const lines = await captureWarn(async () => { started = await runInto(h) })
+      const hits = lines.filter(l => l.includes(G4_MARKER))
+
+      assert.equal(hits.length, 1,
+        `[${rawType || '<空串>'}] 未知档应恰好留一条可诊断日志（${why}），实得 ${JSON.stringify(lines)}`)
+      assert.ok(hits[0].includes('nodeId=ghost'), `[${rawType}] 日志必须带节点 id，否则不知道哪个节点被吞: ${hits[0]}`)
+      assert.ok(hits[0].includes(`type=${rawType}`),
+        `[${rawType}] 日志必须带**实得类型串原文**（子流程裁定靠它暴露）: ${hits[0]}`)
+      assert.ok(hits[0].includes('[jeeflow]'), `[${rawType}] 日志走本栈既有的 [jeeflow] 前缀惯例，方便横扫: ${hits[0]}`)
+
+      // 行为零改动（本轮只加日志）：不建行、令牌停住、办理没被打崩——实例还在，只是不再前进
+      const inst = await h.mem.findInstanceById(started.id)
+      assert.equal(inst?.state, InstanceState.Doing,
+        `[${rawType}] 实例停在进行中（既不许抛错炸办理，也不许假装办结）: ${inst?.state}`)
+      assert.equal((await h.mem.findDoingTasks(started.id)).length, 0,
+        `[${rawType}] 未知节点不产生待办行（也不许把令牌甩到 end）`)
+      assert.equal(inst?.tasks.filter(t => t.taskName === 'ghost').length, 0,
+        `[${rawType}] 未知节点没被解析成任何模型 ⇒ 连历史行也不该有（丢留痕是义务 2 的另一半病）`)
+    }
+  })
+
+  it('②反向哨兵：类型表里那 7 档一律不许被报成"不在类型表里"', async () => {
+    for (const known of ['snaker:task', 'snaker:decision', 'snaker:fork', 'snaker:join',
+                         'snaker:end', 'snaker:custom', 'snaker:start']) {
+      const h = g4Harness(chainContent({ id: 'known1', type: known,
+        properties: known === 'snaker:task' ? { assignee: 'boss' } : {} }))
+      const lines = await captureWarn(() => runInto(h))
+      assert.deepEqual(lines.filter(l => l.includes(G4_MARKER)), [],
+        `[${known}] 是类型表里的档，不该出现未知档日志（无条件打日志／default 兜底都该在这红）`)
+    }
+  })
+})

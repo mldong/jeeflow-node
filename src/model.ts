@@ -35,6 +35,22 @@ export const TypeFork     = 'snaker:fork'
 export const TypeJoin     = 'snaker:join'
 export const TypeCustom   = 'snaker:custom'
 
+/**
+ * 类型表全集（spec/02「类型键的三条义务」第 2 条 · issues/141 G4 立的判据本体）。
+ *
+ * 为什么要**具名成一个集合**，而不是让执行腿 `switch` 的 `default` 直接兜住：
+ * `snaker:start` 也是表里的一档，但它在执行链上是**入口**（引擎从 start 的出边起步，start 自身
+ * 正常不会被 `executeNode` 走到）。用"没人认领"当未知判据，会把"令牌真走到 start 上"这种拓扑病
+ * 误报成"类型不在表里"——两个病得分别可诊断。义务 2 要的是**串 ∉ 表**那一判。
+ *
+ * ⚠️ 表里**没有** `snaker:subProcess`／`snaker:subprocess`：owner 2026-10-01 二拍「子流程暂不进
+ * 契约面」（spec/02 义务 3 段），六栈不补这一档。设计器画出子流程节点时，本栈就靠 `executeNode`
+ * 那条未知档日志把它**显式暴露**出来——那条裁定唯一的可诊断面就是这条日志。
+ */
+export const KnownNodeTypes: ReadonlySet<string> = new Set<string>([
+  TypeStart, TypeEnd, TypeTask, TypeDecision, TypeFork, TypeJoin, TypeCustom,
+])
+
 // ─── Domain Types ─────────────────────────────────────────────────────────────
 
 // ⚠️ 引擎 id 全程 string（issue 38 E9）：Java 雪花 id（>2^53）在 JS number 下丢精度，
