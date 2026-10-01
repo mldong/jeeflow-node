@@ -2,7 +2,7 @@ import { TaskState } from './model.js'
 import type { CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDefine } from './model.js'
 import { cloneInstance, cloneTask, type ProcessInstance, type ProcessTask } from './model.js'
 import type { ProcessRepository, QueryCondition } from './spi.js'
-import { hasEffectiveCcOwnership, isBlankOwnership, defaultCreateCcInstanceIfAbsent, normalizeActorValue, normalizeActors } from './spi.js'
+import { hasEffectiveCcOwnership, isBlankOwnership, defaultCreateCcInstanceIfAbsent, normalizeActorValue, normalizeActors, actorDeleteForms } from './spi.js'
 
 // ═══ 条件匹配基建（issues/05-5，对齐 JDBC 白名单语义） ═══
 
@@ -275,7 +275,17 @@ export class MemoryRepository implements ProcessRepository {
     this.writeActors(taskId, actors, true)
   }
   async removeTaskActor(taskId: string, actors: string[]) {
-    const remove = new Set(actors)
+    // issues/137 §3-6（spec 06 §processTask/removeTaskActor 语义 6 · owner 2026-10-02 拍「两形并集」）：
+    // 删除值先过 spi.actorDeleteForms **那一枚**单点 —— ① 空值（null/undefined/''/纯空白）一律不喂删除
+    // （否则历史 actor_id='' 脏行被批量误删）；② 非空值同时以「原值」与「trim 值」两形匹配：内存仓这一支
+    // 是**列值精确比较**（`Set.has(row)`），只取 trim 形 ⇒ 门面按语义 6 交出的脏行原值 " 9101 " 被削成
+    // 9101，删不掉脏行而门面报成功（假成功）；只取原值 ⇒ 绕过门面直连仓储传 " 8601 " 删不掉写侧归一后的
+    // 规范行 8601（issues/142 §9.2）。③ 展开后为空 ⇒ 早退，绝不清空该任务全部参与者。
+    // ⚠️ 与 SQL 仓 JdbcRepository.removeTaskActor 同一枚判据（spi.actorDeleteForms），两仓同答案
+    // （issues/117 场景 27）；判据只在 spi 那一处，本方法不抄第二份 trim/判空。
+    const forms = actorDeleteForms(actors)
+    if (forms.length === 0) return
+    const remove = new Set(forms)
     this.actors.set(taskId, (this.actors.get(taskId) ?? []).filter(a => !remove.has(a)))
   }
   async createCcInstance(instanceId: string, _creator: string, ...actorIds: string[]) {

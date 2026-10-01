@@ -13,7 +13,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { ProcessInstance, ProcessTask, type ProcessDefine, type CcInstanceRow, type DefineRow, type InstanceRow, type TaskRow } from '../model.js'
 import { InstanceState, TaskState } from '../model.js'
 import type { IDGenerator, ProcessRepository, QueryCondition, InstanceStatsRow, TaskStatsRow } from '../spi.js'
-import { isBlankOwnership, isBlankValue, hasEffectiveCcOwnership, defaultCreateCcInstanceIfAbsent, normalizeActorValue, normalizeActors } from '../spi.js'
+import { isBlankOwnership, isBlankValue, hasEffectiveCcOwnership, defaultCreateCcInstanceIfAbsent, normalizeActorValue, normalizeActors, actorDeleteForms } from '../spi.js'
 
 // ═══ 列白名单（issues/05-5，与 mldong-boot2 别名一致） ═══
 
@@ -483,12 +483,21 @@ export class JdbcRepository implements ProcessRepository {
   }
 
   async removeTaskActor(taskId: string, actors: string[]): Promise<void> {
-    if (actors.length === 0) return
+    // issues/137 §3-6（spec 06 §processTask/removeTaskActor 语义 6 · owner 2026-10-02 拍「两形并集」）：
+    // 删除值先过 spi.actorDeleteForms **那一枚**单点 —— ① 空值（null/undefined/''/纯空白）一律不喂 DELETE
+    // （否则历史 actor_id='' 脏行被批量误删）；② 非空值同时以「原值」与「trim 值」两形进 IN：只取 trim 形
+    // ⇒ 门面按语义 6 交出的脏行原值 " 9101 " 被削成 9101，真库 NO PAD 排序规则下那一行删不掉而门面报成功
+    // （假成功）；只取原值 ⇒ 绕过门面直连仓储传 " 8601 " 删不掉写侧归一后的规范行（issues/142 §9.2）。
+    // ③ 展开后为空 ⇒ 早退，一条 DELETE 都不发（不得退化成"清空该任务全部参与者"）。
+    // 占位符数量按 forms 长度算（repeatPh 复用）；⚠️ 与内存仓 MemoryRepository.removeTaskActor 同一枚判据
+    // （spi.actorDeleteForms），两仓同答案（issues/117 场景 27）；判据只在 spi 那一处，本方法不抄第二份。
+    const forms = actorDeleteForms(actors)
+    if (forms.length === 0) return
     const conn = await this.c()
     try {
       await conn.execute(this.sql(
-        `DELETE FROM wf_process_task_actor WHERE process_task_id = ? AND actor_id IN (${repeatPh(actors.length)})`),
-        [taskId, ...actors])
+        `DELETE FROM wf_process_task_actor WHERE process_task_id = ? AND actor_id IN (${repeatPh(forms.length)})`),
+        [taskId, ...forms])
     } finally {
       await this.done(conn)
     }

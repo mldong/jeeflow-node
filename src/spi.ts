@@ -145,6 +145,52 @@ export const normalizeCcActorValue: (val: unknown) => string = normalizeActorVal
 /** 同 {@link normalizeCcActorValue}：{@link normalizeActors} 的旧名转发，不是第二份判据。 */
 export const normalizeCcActors: (raw: readonly unknown[] | null | undefined) => string[] = normalizeActors
 
+/**
+ * 归属值**删除腿**展开（issues/137 §3-6 · spec 06 §processTask/removeTaskActor 语义 6，
+ * owner 2026-10-02 拍「两形并集」）：把待删列表展开成 `DELETE ... IN (...)` 真正要绑的值——
+ * **空值一律丢弃，非空值同时保留「原值」与「trim 值」两形**（去重、保序）。
+ *
+ * <p>为什么必须两形、只取一头各有一种假成功（1.8.36 之前八栈正好分成这两派，没有一处两全）：</p>
+ * <ul>
+ *   <li>只取 **trim 值**（php/csharp/rust/moon 四栈八处的旧形状）⇒ 门面按语义 6 交出的历史脏行
+ *       原值 `" 9101 "` 被削成 `9101`，真库 NO PAD 排序规则（内存仓则是列值精确比较）下那一行
+ *       删不掉，门面却报成功——被摘的人待办还在；</li>
+ *   <li>只取 **原值**（go/node/python/java 四栈九处的旧形状）⇒ 第三方绕过门面直连仓储传
+ *       `" 8601 "` 时删不掉写侧归一后落库的规范行 `8601`（issues/142 §9.2 那一路）；且空值照喂
+ *       `DELETE`，会把历史 `actor_id=''` 脏行批量误删（那是替脏数据做掉唯一痕迹）。</li>
+ * </ul>
+ *
+ * <p>两形并集同时满足两侧：脏行按原值命中、规范行按 trim 形命中。按 §2.11 归一口径 `" 9101 "` 与
+ * `9101` 本就是**同一个人**，两行都删掉才是"摘掉这个人"的正确结果，不构成误删。</p>
+ *
+ * <p>⚠️ trim 与判空的判据本体**只有一枚**＝{@link normalizeActorValue}（本函数只加"原值也进集合"
+ * 这一层，**不抄第二份 trim/判空代码**，spec §2.11 尾注明令）：`normalizeActorValue` 把
+ * `null`/`undefined`/`''`/纯空白统统归一成 `''`，所以 `trimmed === ''` 这一档就同时丢掉了空值与
+ * `null`/`undefined`——**它们绝不会走到 `String(v)` 被串化成 `"null"`/`"undefined"`** 落进删除集合。
+ * 判空一律 `String(x).trim() === ''`（即"归一后为空串"），**严禁** `.filter(Boolean)`／`if (!x)`
+ * 这类 JS 假值判据：`"0"` 是合法 id 必须留下，且 `"0"` 与 `"00"` 是两个人。</p>
+ *
+ * <p>去重按**字面**做（`Array.includes`，不是"trim 后相同"折叠）：`" 9101 "` 与 `"  9101  "` 是两种
+ * 不同的原值形，都要保留；SQL 仓与内存仓共用这一枚 ⇒ 同一条判据、同一个答案（issues/117 场景 27）。</p>
+ *
+ * @param raw 待删归属值数组，元素可为 `null`/`undefined`（丢弃，**不得**串化成 `"null"`/`"undefined"`）
+ * @returns 展开后的删除值列表（保序、按字面去重、无空值）；入参为 `null`/非数组或全为空值时返回
+ *          **空数组**——调用方据此**早退，一条 `DELETE` 都不发**（空数组不得退化成"清空该任务全部参与者"）
+ */
+export function actorDeleteForms(raw: readonly unknown[] | null | undefined): string[] {
+  const out: string[] = []
+  if (!Array.isArray(raw)) return out
+  for (const v of raw) {
+    // trim 与判空复用 normalizeActorValue 那一枚（null/undefined/''/纯空白 ⇒ ''），不抄第二份判据
+    const trimmed = normalizeActorValue(v)
+    if (trimmed === '') continue                        // ① 空值（含 null/undefined）一律丢弃，不喂 DELETE
+    const original = String(v)                          // 此处 v 必非 null（否则 trimmed 已是 ''），绝不会得到 "null"
+    if (!out.includes(original)) out.push(original)     // ② 原值形：保住未 trim 的历史脏行
+    if (!out.includes(trimmed)) out.push(trimmed)       // ② trim 形：保住写侧归一后的规范行
+  }
+  return out
+}
+
 // ── 统计行类型（v1.8.25，issues/103）──
 
 export interface InstanceStatsRow {
@@ -204,6 +250,36 @@ export interface ProcessRepository {
    * 不得拿 `''`/`0` 当 id 落库；归属值档才允许"丢了就丢"。
    */
   addTaskActor(taskId: string, actors: string[]): Promise<void>
+
+  /**
+   * 移除任务参与者（摘人／`transfer` 摘原人／`processTask/removeTaskActor` 都落这一支）。
+   *
+   * <p>**归属值删除腿义务**（issues/137 §3-6 · spec 06 §processTask/removeTaskActor 语义 6，
+   * owner 2026-10-02 拍「两形并集」）——**与上面 {@link addTaskActor} 的写侧义务不同，别照抄**：
+   * 写侧只留 **trim 形**（落库归一、判重取 trim 后值），删除腿要「**原值 ∪ trim 值**」两形并集。</p>
+   *
+   * <p>三件事（八栈两仓逐处同实现）：</p>
+   * <ol>
+   *   <li>**空值一律丢弃、不喂 `DELETE`**：`null`／`''`／纯空白都不进 `IN`，否则历史 `actor_id=''`
+   *       脏行会被批量误删（那是替脏数据做掉唯一痕迹）；</li>
+   *   <li>**非空值同时以「原值」与「trim 值」两形进 `IN`**（去重、保序；两形相同则只一份）。只取
+   *       trim 形 ⇒ 门面按语义 6 交出的历史脏行原值 `" 9101 "` 被削成 `9101`，真库 NO PAD 排序规则
+   *       （内存仓则是列值精确比较）下那一行删不掉而门面报成功（**假成功**：被摘的人待办还在）；
+   *       只取原值 ⇒ 绕过门面直连仓储的调用方传 `" 8601 "` 时删不掉写侧归一后落库的规范行 `8601`
+   *       （issues/142 §9.2 那一路）。两形并集同时满足两侧，且按 §2.11 归一口径 `" 9101 "` 与 `9101`
+   *       本就是同一个人，两行都删才是"摘掉这个人"的正确结果，不构成误删；</li>
+   *   <li>**展开后为空 ⇒ 早退，一条 `DELETE` 都不发**——空列表不得退化成"清空该任务全部参与者"。</li>
+   * </ol>
+   *
+   * <p>判据本体只有一枚＝{@link actorDeleteForms}（各语言栈有同名对应件），trim 与判空规则仍复用
+   * {@link normalizeActorValue}／{@link normalizeActors} 那一枚，**不要在仓储里抄第二份**。判空一律
+   * `String(x).trim() === ''`：`"0"` 是合法 id 必须留下，`"0"` 与 `"00"` 是两个人，**严禁**
+   * `.filter(Boolean)`／`if (!x)` 这类 JS 假值判据。SQL 仓与内存仓在同一条判据上必须给同一个答案
+   * （issues/117 场景 27 那把尺子）。</p>
+   *
+   * <p>`taskId` 仍是**主键**不是归属值，同 {@link addTaskActor} 末段那一档（缺失/空串由门面 `toId()`
+   * 响亮报错，不得拿 `''`/`0` 当 id 落库）。</p>
+   */
   removeTaskActor(taskId: string, actors: string[]): Promise<void>
 
   /**
