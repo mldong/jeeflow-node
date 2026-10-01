@@ -273,6 +273,11 @@ describe('processTask/removeTaskActor（issues/115 门面第 47 个 action）', 
       [taskId, ['leader'], null, 'operator 必填'],
       [taskId, ['leader'], '   ', 'operator 必填'],
       ['', ['9001'], 'flow.admin', 'processTaskId/actorIds 缺失'],
+      ['   ', ['9001'], 'flow.admin', 'processTaskId/actorIds 缺失'],
+      // spec 语义 8：缺参数档收齐 缺键/空串/纯空白/0/负数（toId 对 '0' 与 '-1' 都报
+      // 'id 缺失或非法'，本 action 把它折进同一条跨栈文案；非数字串那一腿仍走精度护栏原文）
+      ['0', ['9001'], 'flow.admin', 'processTaskId/actorIds 缺失'],
+      [-1, ['9001'], 'flow.admin', 'processTaskId/actorIds 缺失'],
       [taskId, ['', '  ', null], 'flow.admin', 'processTaskId/actorIds 缺失'],
       [424242, ['9001'], 'flow.admin', '任务不存在'],
     ]
