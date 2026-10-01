@@ -156,6 +156,8 @@ export class JeeflowFacade {
         return this.taskAddActor(args)
       case 'processTask/transfer': // issues/115：转办（摘原人 + 换新人）
         return this.taskTransfer(args)
+      case 'processTask/removeTaskActor': // issues/115 残留：门面第 47 个 action（只摘不加、零留痕）
+        return this.taskRemoveActor(args)
       case 'processTask/latest':
         return this.taskLatest(args)
       case 'processInstance/stats/overview':
@@ -1086,6 +1088,85 @@ export class JeeflowFacade {
       type: EventType.TaskTransfer, instanceId: task.processInstanceId, taskId,
       operator, fromActor, toActor,
     })
+  }
+
+  /**
+   * 摘除参与人（issues/115 残留 · 门面第 <b>47</b> 个 action，spec 06 §processTask/removeTaskActor）。
+   * SPI 侧 `removeTaskActor` 早就是必选方法（两仓都实现），只是没上门面 ⇒ 摘人只能靠 `transfer`
+   * （摘 A **并**加 B），本 action 补的就是这一段（八栈同批）。
+   *
+   * <p>三个兄弟 action 的分工，免得后来人混用：
+   * ① `processTask/surrogate`/`addCandidate` ＝ <b>只加</b>；② `processTask/transfer` ＝ <b>换人</b>
+   * （摘 A 加 B，写 submitType=7 ＋ tf_transferHistory 留痕）；③ 本 action ＝ <b>只摘不加、零留痕</b>：
+   * 删掉 `actorIds` 在本任务的参与者行，不新建任务、不写任何任务变量、不覆写任务 `actorId`/`operator`
+   * 列、<b>不 fire 事件</b>（issues/132 §11.3 定稿的事件集没有"摘人"这一码，码 7 的语义是"参与者被替换"，
+   * 只摘不加却发码 7 等于把没发生的转办写进事件流）。
+   *
+   * <p>守卫次序逐栈一致（spec 同节钉死，门禁按此断言 msg）：operator 必填 → 缺参数 → 任务不存在 →
+   * 权限 → 非进行中 → 摘空下限 → 落库。
+   */
+  private async taskRemoveActor(args: Record<string, any>): Promise<void> {
+    // operator 先判必填（必填档在前）：参数全缺时若先报主键缺失，会把鉴权缺口藏进"缺参数"报错里。
+    // 硬必填、严禁回落 user1（与 transfer/withdraw 同口径，issues/114）；归一在入口就做，
+    // 判空一律 `=== ''`（`'0'` 是正常 id，严禁 JS 假值判据）。
+    const operator = normalizeActorValue(args.operator)
+    if (operator === '') throw new Error('operator 必填')
+    // 主键档与归属值档一起判"缺参数"（spec 语义 8：与 surrogate 同族同文案）。
+    // ⚠️ 本栈 surrogate/addCandidate 现有的两档文案是分开的（`'actorIds 缺失'` ＋ `toId()` 的
+    // `'id 缺失或非法'`），与本 action 的跨栈统一文案**不**同：新增 action 一律按 spec 出
+    // `'processTaskId/actorIds 缺失'`；既有两档不改（改它们的 msg 会破已有门禁格，属另一件事）。
+    // `toId()` 的超 2^53 那条（issues/82 精度护栏）是另一种事实，原样透出、不改写成"缺参数"，
+    // 否则会把"精度已丢"伪装成"参数没传"。
+    let taskId: string
+    try {
+      taskId = toId(args.processTaskId)
+    } catch (e: any) {
+      if (String(e?.message ?? '') === 'id 缺失或非法') throw new Error('processTaskId/actorIds 缺失')
+      throw e
+    }
+    // 逗号串与数组两形同判据：过本栈既有归一单点 `parseActorIds`（→ spi.normalizeActors）。
+    // 空串/纯空白/null 在这一步就被丢掉 ⇒ 它们永远不会成为 DELETE 的实参（历史 `actor_id=''` 脏行安全）。
+    const actors = parseActorIds(args.actorIds)
+    if (actors.length === 0) throw new Error('processTaskId/actorIds 缺失')
+    const task = await this.repo.findTaskById(taskId)
+    if (!task) throw new Error('任务不存在')
+    // 归属判据同 transfer（语义 3）：operator ∈ 被摘集合（两侧都取归一后的串，比较才咬得上），
+    // 或 flow.auto/flow.admin（大小写不敏感沿用 transfer 既有写法）。真实超管不命中这两个哨兵，
+    // 超管可操作性归集成层权限码。transfer 能"摘 A 加 B"是因为 A 就是操作人本人，
+    // 本 action 同理不得成为借道摘他人的口子。
+    const lower = operator.toLowerCase()
+    if (lower !== KeyAutoExecute && lower !== KeyAdminID && !actors.includes(operator)) {
+      throw new Error('无权限摘除该任务参与人')
+    }
+    // 前置态：仅进行中（DOING=10）任务可摘人（语义 4）。已办结/废弃/撤回的历史参与人行是
+    // approvalRecord 的取证依据（它读全状态任务行），摘它等于改写审批历史。
+    if (task.taskState !== TaskState.Doing) throw new Error('任务非进行中，不可摘除参与人')
+    // 以参与者表为判据（聚合副本可能滞后于加签/转办的增量写入，与 transfer 同源）。
+    // ⚠️ 内存仓 `findTaskActors` 返回的是内部**活列表引用** ⇒ 先取副本，否则后面的过滤会读到半路数据。
+    const current = [...(await this.repo.findTaskActors(taskId))]
+    const targets = new Set(actors)
+    // 语义 6「匹配取归一值、DELETE 取行上的原值」（§2.11 硬要求②的删除腿）：库里的行可能是修复前
+    // 落下的未 trim 原值 `" leader "`，入参 `leader` 必须**判成同一个人并真删掉它**。
+    // 反面形状＝拿归一值去 DELETE：本栈两仓的删除腿都是**列值精确比较**（内存仓 `Set.has(row)`、
+    // SQL 仓 `actor_id IN (?)`），归一值打不中未 trim 的原值 ⇒ "判成同一人却一条没删"，
+    // 门面报成功而被摘的人待办还在，是**假成功**（go 栈实测形状）。
+    const toDelete: string[] = []
+    let remaining = 0
+    for (const row of current) {
+      const normalized = normalizeActorValue(row)
+      // 归一后为空的历史脏行（`actor_id=''`/纯空白）既不匹配、也**不算"一个人"**（见下面下限那一句）
+      if (normalized === '') continue
+      if (targets.has(normalized)) toDelete.push(row)   // 删的是 row 原值，不是归一值
+      else remaining++
+    }
+    // 语义 5「不得摘空」按**能办单的人数**判：脏行谁也办不了，拿它撑住下限等于让"摘空"伪装成成功。
+    // 判据取集合差（上面的 remaining），不是"入参条数"——actorIds 里混非参与者 id 也绕不过这一条。
+    // 摘空会造出无人可办又无法撤回重派的死单，比"配错表达式落 NULL"更难恢复。
+    if (toDelete.length > 0 && remaining === 0) throw new Error('至少需保留一名参与人')
+    // 语义 7「幂等」：actorIds 里不属于本任务参与者的人静默忽略；一个都没命中 ⇒ 空操作、成功信封
+    // （前端双点/集成层重放第二次不再报错）。要"人不在任务里就报错"请用 transfer。
+    // 落库后就结束：**不 updateTask、不写变量、不置 submitType、不 fire 事件**（语义 2）。
+    if (toDelete.length > 0) await this.repo.removeTaskActor(taskId, toDelete)
   }
 
   private async taskLatest(args: Record<string, any>): Promise<any> {
