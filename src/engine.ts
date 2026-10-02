@@ -648,66 +648,6 @@ export class EngineImpl implements Engine {
     return map
   }
 
-  // 以显式参与者建任务（会签节点拆分为逐人任务，对齐 Java 会签创建语义）
-  private async createTaskWithActors(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>, actors: string[], processName = '',
-                                          parentId: string = '0', isFirst: boolean = false): Promise<void> {
-    if (!actors.length) return
-    // issues/116：与 createTask 同口径——代理人并入参与者集合后随任务落库
-    const agents = await this.surrogateAgents(actors, processName)
-    const ct = node.properties?.countersignType as string | undefined
-    const now = new Date()
-    const form = node.properties?.form ?? ''
-    // issues/126 案 A：与 createTask 同一把尺子。本函数当前**零调用者**（issues/121 P2 把回退改成血缘版后
-    // 就没人调它了），按 §1.9 第 1 条口径"接线但不为它造测试"——接线是为了将来复活时不再漏。
-    const expireExpr = node.properties?.expireTime
-    const expireArgs = inst.variables
-    if (isCountersign(node.properties?.performType) && ct) {
-      switch (ct) {
-        case 'PARALLEL':
-        case '':
-          for (const actor of actors) {
-            const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, parentId, isFirst, 1)
-            const eff = mergeAgents([actor], agents)
-            if (eff.length > 1) nt.actorIds = eff
-            applyNodeExpireTime(nt, expireExpr, expireArgs, now)
-            await this.repo.saveTask(nt)
-            await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
-          }
-          return
-        case 'SEQUENTIAL': {
-          const nt = inst.createTask(this.nextId(), node.id, node.text.value, actors[0], operator, form, now, parentId, isFirst, 1)
-          nt.variables = { isFirstTaskNode: nt.variables.isFirstTaskNode,
-            [`nrOfInstances_${node.id}`]: actors.length,
-            [`loopCounter_${node.id}`]: 0,
-            [`operatorList_${node.id}`]: actors,
-          }
-          const eff = mergeAgents([actors[0]], agents)
-          if (eff.length > 1) nt.actorIds = eff
-          applyNodeExpireTime(nt, expireExpr, expireArgs, now)
-          await this.repo.saveTask(nt)
-          await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
-          return
-        }
-        default:
-          for (const actor of actors) {
-            const nt = inst.createTask(this.nextId(), node.id, node.text.value, actor, operator, form, now, parentId, isFirst, 1)
-            const eff = mergeAgents([actor], agents)
-            if (eff.length > 1) nt.actorIds = eff
-            applyNodeExpireTime(nt, expireExpr, expireArgs, now)
-            await this.repo.saveTask(nt)
-            await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
-          }
-          return
-      }
-    }
-    const effActors = mergeAgents(actors, agents)
-    const nt = inst.createTask(this.nextId(), node.id, node.text.value, effActors[0], operator, form, now, parentId, isFirst)
-    if (effActors.length > 1) nt.actorIds = effActors
-    applyNodeExpireTime(nt, expireExpr, expireArgs, now)
-    await this.repo.saveTask(nt)
-    await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
-  }
-
   // ─── Helpers ───────────────────────────────────────────────────────────────
 
   private async loadAndCheck(taskId: string, operator: string) {
@@ -989,20 +929,6 @@ export class EngineImpl implements Engine {
   }
 
   private async resolveActors(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>): Promise<string[]> {
-    // 1a. Registry 按名称解析（推荐）
-    if (this.registry) {
-      const handlerName = (node.properties?.assignmentHandler as string) ?? ''
-      if (handlerName) {
-        const h = this.registry.resolveAssignment(handlerName)
-        if (h) return await h.assign(node, inst, operator)
-      }
-    }
-    // 1b. Extensions 兼容
-    if (this.ext?.assignmentHandler) {
-      const handlerName = (node.properties?.assignmentHandler as string) ?? ''
-      const result = await this.ext.assignmentHandler(handlerName, node, inst)
-      if (Array.isArray(result) && result.length > 0) return result
-    }
     // 2. 动态指定下一节点处理人优先（v1.0.1：对齐 boot3 tf_nextNodeOperator）
     //    issues/142 B 批（spec 06 §2.11 表第三行）：逗号串与数组**两形同判据**——都收敛到
     //    `parseActorIds` → `spi.normalizeActors` 那一枚单点（逐项 trim、空串/纯空白/null/undefined
@@ -1016,8 +942,8 @@ export class EngineImpl implements Engine {
     }
     // 3. 固定指派 assignee——token 即变量 key，能替换就换，换不了就是字面量（v1.0.1 对齐 boot3 args.get(token, token)）
     const assignee = node.properties?.assignee as string | undefined
+    const actors: string[] = []
     if (assignee) {
-      const actors: string[] = []
       for (const raw of assignee.split(',')) {
         let token = raw.trim()
         if (!token) continue
@@ -1031,7 +957,27 @@ export class EngineImpl implements Engine {
           actors.push(token)
         }
       }
-      return actors
+    }
+    // 解析出人才算命中；全空白 assignee（" , ,"）落空 ⇒ 继续往下兜底，对齐 java `if (actors.isEmpty())`
+    if (actors.length > 0) return actors
+    // 1a/1b. 动态指派处理器 assignmentHandler——**只在上面两档没解析出人时才生效**
+    //    （对齐 java CreateTaskHandler.java:120-141 的 `if (actors.isEmpty())`）
+    //    ⚠️ issues/100：改前本栈把 handler 排在最前且命中即无条件 return ⇒ 节点同时配
+    //    assignmentHandler 与 assignee／tf_nextNodeOperator 时后两档被整档吞掉，
+    //    与 java／php／python／rust／csharp／moon 六栈相反。现按 java 序重排。
+    // 1a. Registry 按名称解析（推荐）
+    if (this.registry) {
+      const handlerName = (node.properties?.assignmentHandler as string) ?? ''
+      if (handlerName) {
+        const h = this.registry.resolveAssignment(handlerName)
+        if (h) return await h.assign(node, inst, operator)
+      }
+    }
+    // 1b. Extensions 兼容
+    if (this.ext?.assignmentHandler) {
+      const handlerName = (node.properties?.assignmentHandler as string) ?? ''
+      const result = await this.ext.assignmentHandler(handlerName, node, inst)
+      if (Array.isArray(result) && result.length > 0) return result
     }
     return []
   }

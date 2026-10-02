@@ -3303,7 +3303,10 @@ describe('issues/116 委托代理自动生效（引擎内置·内存仓路径）
   // 挂点归属与"单路径失能"实测结论（本轮逐条注一遍跑全量，恢复后 git diff 核对逐字节回到改前）：
   //   · 串行会签推进 = engine.ts executeProcessTask 的 SEQUENTIAL 分支（:263 附近，**独占**挂点）
   //       → 只注它：全量恰好 1 红 = 「条款 1 路径 3/3」
-  //   · ROLLBACK     = engine.ts createTaskWithActors（**独占**挂点，仅被 ROLLBACK 调用）
+  //   · ROLLBACK     = engine.ts rollbackToParent 内的 `surrogateAgents` → `mergeAgents` 那两行
+  //       （**独占**挂点。⚠️ 10-02 更正：此处原写「createTaskWithActors，仅被 ROLLBACK 调用」是假的——
+  //        该私有方法自 issues/121 P2 把回退改成血缘版后就零调用者，回退建单一直在 rollbackToParent 里内联，
+  //        已随 issues/100 批次删除；照旧注释去注那个函数会得到"全量零红"，误判成本腿已被覆盖）
   //       → 只注它：全量恰好 1 红 = 「条款 1 路径 2/3」
   //   · JUMP         = executeNode → createTask，与「发起 / 办理推进 / 跳首节点」**共用同一挂点**，
   //       注掉整处挂点必连发起与条款 1.1 全家一起红，做不到"只红自己"——故用**路径内注入**取证：
