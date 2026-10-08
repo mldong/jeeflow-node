@@ -258,7 +258,8 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
     let countSql = 'SELECT COUNT(*) FROM wf_process_surrogate t WHERE 1=1'
     // issues/129 案 A 第二层：filters.operator 是归属谓词（"这条委托属于谁"），空值 ⇒ **空页**。
     // 与内存仓 memory-ext.ts pageSurrogates 同判据（否则同一个空 operator 两仓一个出 0 行、
-    // 一个把条件丢掉出全库）；门面已把空串归一化成缺键（surrogatePage），这一道防直连仓储的调用方。
+    // 一个把条件丢掉出全库）。issues/152 ② 起门面恒定下发归一后的归属值（surrogatePage 走
+    // operatorArg，缺键/空串/全空白 ⇒ user1），这一道专防绕过门面直连仓储的调用方。
     if ('operator' in (filters ?? {}) && isBlankValue(filters!.operator)) return [[], 0]
     const args: any[] = []
     const args2: any[] = []

@@ -4141,7 +4141,7 @@ describe('issues/129 operator 空档两层收口（门面归一化 + 仓储归�
       '反闸：非空 filters.operator 应照常下查询')
   })
 
-  it('委托分页 · {"operator":""} 与缺键同档；直连仓储空归属 ⇒ 空页（内存仓与 SQL 仓一个答案）', async () => {
+  it('委托分页 · 归属不变式：{"operator":""} ≡ 缺键 ≡ 全空白 ⇒ 只出归一缺省 user1 的行，绝不全库', async () => {
     const f = await fixture129()
     await f.extRepo.saveSurrogate({
       id: '1290001', operator: ME, surrogate: 'agent-a', processName: '', enabled: 1,
@@ -4151,11 +4151,20 @@ describe('issues/129 operator 空档两层收口（门面归一化 + 仓储归�
     } as any)
     const count = async (args: Record<string, any>) =>
       (await f.facade.flow('processSurrogate/page', { pageSize: 100, ...args })).data.rows.length
-    // 本 action 在 java 门面里不下发归属条件 ⇒ 同档 = 空串与缺键都"不过滤"（不是回落 user1）
-    assert.equal(await count({}), 2, '夹具：两条委托（两人各一条）')
-    assert.equal(await count({ operator: '' }), await count({}), 'processSurrogate/page：{"operator":""} 应与缺键同档')
-    assert.equal(await count({ operator: ' \t ' }), await count({}), 'processSurrogate/page：全空白同缺键')
-    assert.equal(await count({ operator: ME }), 1, '显式归属者档照常过滤（没顺手放宽）')
+    // ⚠️ 本用例的期望值在 issues/152 ② 选 A（引擎侧立法）时**逐字改过**：
+    //   改前断言「缺键 ⇒ 2 行（全库）」「{"operator":""} ≡ 缺键 ⇒ 也是 2 行」，理由是
+    //     "本 action 在 java 门面里不下发归属条件"；
+    //   改后断言「缺键/空串/全空白 ⇒ 1 行 = 归一缺省 user1 授出的那一条」，依据
+    //     spec 06 §2.5 口径表新增行「processSurrogate/page | t.operator EQ operator」
+    //     ＋ §4.5「归属不变式」——门面下发 §2.5 归一后的 operator，与 instancePage 同形。
+    //     旧期望把"归属归集成壳"写成了契约（vben5 前端不传 operator，换宿主即退化成全库台账）。
+    // 夹具自证：两条委托、两个授权人，ME 档非空且 ≠ 全库 ⇒ "1 行"不是恒真空
+    assert.equal(await count({ operator: OTHER }), 1, `夹具：${OTHER} 档 1 行`)
+    assert.equal(await count({ operator: ME }), 1, `夹具：${ME} 档 1 行（没顺手放宽）`)
+    assert.equal(await count({}), 1, '缺 operator ⇒ 归一到缺省 user1 那一档，不是全库 2 行')
+    assert.equal(await count({ operator: '' }), 1, 'processSurrogate/page：{"operator":""} 与缺键同档（§2.5）')
+    assert.equal(await count({ operator: ' \t ' }), 1, 'processSurrogate/page：全空白同缺键')
+    assert.notEqual(await count({}), 2, '空档不得等于全库行数（归属不变式失守即退化成台账公屏）')
     // 仓储档：直连空 operator ⇒ 空页（不是"条件丢掉"读全库）
     assert.equal((await f.extRepo.pageSurrogates(1, 10, { operator: '' }))[0].length, 0, '内存仓 filters.operator="" ⇒ 空页')
     assert.equal((await f.extRepo.pageSurrogates(1, 10, { operator: '   ' }))[0].length, 0, '内存仓 filters.operator 全空白 ⇒ 空页')
@@ -7290,5 +7299,174 @@ describe('issues/137 A 裁定 A 实例行到期时间：发起腿按定义顶层
         assert.notEqual(String(bound), '2h', `${who}：绑的是表达式原串，不是求值结果`)
       }
     }
+  })
+})
+
+// ═══ issues/152 ②③ · 委托门面归属不变式 + 授权人三档归一（node）═══════════════
+// 案卷：jeeflow-hub/issues/152-…md §2 / §3 / §7；条文：jeeflow-doc spec/06 §2.5 口径表
+// （processSurrogate/page | t.operator EQ operator）+ §4.5「归属不变式」+ §processSurrogate/save 注。
+// 唯一权威＝jeeflow-java 参考实现（JeeflowFacade.surrogatePage / applySurrogateFields /
+// JdbcProcessExtRepository.buildWhere / MemoryProcessExtRepository.pageSurrogates 四处）。
+describe('issues/152 委托：门面归属不变式（②案 A）＋ save 授权人三档归一（③）', () => {
+  const D4_FLOW = 'surr152-d4'
+  const D1_FLOW = 'surr152-d1'
+  const AGENT = 'surr152-agent'
+  const GLOBAL_AGENT = 'surr152-global'
+  const DAY = 86_400_000
+
+  /** 委托台账行（内存仓 camelCase 行 + 全键补齐，形状同本文件既有 putSur，本块自持一份） */
+  async function seed(ext: MemoryExtRepository, s: Record<string, any>) {
+    await ext.saveSurrogate({
+      id: '', processName: '', enabled: 1, startTime: null, endTime: null,
+      createTime: new Date(), createUser: 't', updateTime: new Date(), updateUser: 't', ...s,
+    } as any)
+  }
+
+  function facadeHarness(defineName: string, assignee: string) {
+    const { engine, repo, ext, def } = surrHarness(defineName, surrFlowJson(defineName, [{ id: 't1', assignee }]))
+    return { engine, repo, ext, def, facade: new JeeflowFacade(engine, repo, ext) }
+  }
+
+  /** 门面 save 的一条腿（operator 传 undefined = 不带这个键；传 '' = 显式空串） */
+  async function saveViaFacade(facade: JeeflowFacade, operator: string | undefined, extra: Record<string, any> = {}) {
+    const body: Record<string, any> = { processName: D4_FLOW, surrogate: AGENT, ...extra }
+    if (operator !== undefined) body.operator = operator
+    const r = await facade.flow('processSurrogate/save', body)
+    assert.equal(r.code, 0, JSON.stringify(r))
+    return String(r.data.id)
+  }
+
+  // ── 档 1（①，本轮语义不动，只把判据钉成用例）：同授权人并存「全流程」＋「精确」且都窗内 ⇒ 精确接管 ──
+  it('档1 全流程与精确两条都在窗内 ⇒ 精确那条接管，内置版"全局盖精确"不得复活', async () => {
+    const now = Date.now()
+    const { engine, repo, ext, def } = facadeHarness(D1_FLOW, 'op-scope')
+    await seed(ext, { id: '1521001', operator: 'op-scope', surrogate: GLOBAL_AGENT,
+      processName: '', startTime: new Date(now - DAY), endTime: new Date(now + DAY), enabled: 1 })
+    await seed(ext, { id: '1521002', operator: 'op-scope', surrogate: AGENT,
+      processName: D1_FLOW, startTime: new Date(now - DAY), endTime: new Date(now + DAY), enabled: 1 })
+    // 夹具自证：两条都真落库，且兜底那条 id 更大 ⇒ "跨作用域取 id 最新"那种写法会答成 GLOBAL_AGENT
+    assert.ok(await ext.findSurrogateById('1521001'), '夹具：全流程那条未落库')
+    assert.ok(await ext.findSurrogateById('1521002'), '夹具：精确那条未落库')
+    const inst = await engine.startProcessInstanceById(def.id, 'boss')
+    const actors = await doingActors(repo, inst.id, 't1')
+    assert.ok(actors.includes(AGENT), `精确作用域那条必须接管（实际=${JSON.stringify(actors)}）`)
+    assert.ok(!actors.includes(GLOBAL_AGENT),
+      `内置版是「全流程优先」盖住精确，引擎不得复活它（实际=${JSON.stringify(actors)}）`)
+  })
+
+  it('档1 另一腿（阳性对照）：精确那条判否 ⇒ 仍兜底全流程，不得判否即止', async () => {
+    const now = Date.now()
+    const name = D1_FLOW + '-fb'
+    const { engine, repo, ext, def } = facadeHarness(name, 'op-fallback')
+    await seed(ext, { id: '1521003', operator: 'op-fallback', surrogate: GLOBAL_AGENT,
+      processName: '', startTime: new Date(now - DAY), endTime: new Date(now + DAY), enabled: 1 })
+    await seed(ext, { id: '1521004', operator: 'op-fallback', surrogate: AGENT,
+      processName: name, startTime: new Date(now + DAY), endTime: new Date(now + 3 * DAY), enabled: 1 })
+    const inst = await engine.startProcessInstanceById(def.id, 'boss')
+    const actors = await doingActors(repo, inst.id, 't1')
+    assert.ok(actors.includes(GLOBAL_AGENT), `精确判否后应兜底全流程（实际=${JSON.stringify(actors)}）`)
+  })
+
+  // ── 档 4（③）：save 的 operator 三档一律归一，不落空串；update 缺省保留原授权人 ──
+  it('档4 save 缺键/空串/全空白 ⇒ operator 落归一缺省 user1，且真被 user1 的后续待办命中', async () => {
+    const now = Date.now()
+    const legs: Array<[string, string | undefined]> = [
+      ['缺键（不带 operator）', undefined],
+      ['显式空串', ''],
+      ['全空白', '   '],
+    ]
+    for (const [label, operator] of legs) {
+      const { engine, repo, ext, def, facade } = facadeHarness(D4_FLOW, 'user1')
+      const id = await saveViaFacade(facade, operator, {
+        startTime: fmtDt(new Date(now - DAY)), endTime: fmtDt(new Date(now + DAY)),
+      })
+      const detail = await facade.flow('processSurrogate/detail', { id })
+      assert.equal(detail.code, 0, JSON.stringify(detail))
+      // 死行判据：空串行在 getSurrogate 的 WHERE operator = ? 上永不命中 ⇒ 绝不允许落库
+      assert.equal(detail.data.operator, 'user1',
+        `${label}：不得落空串（空串＝死行，台账看得见、待办永远不并人），实得 ${JSON.stringify(detail.data.operator)}`)
+      // 正面判据：以归一后的授权人（user1）建单，代理人真并进参与者表
+      const inst = await engine.startProcessInstanceById(def.id, 'boss')
+      const actors = await doingActors(repo, inst.id, 't1')
+      assert.deepEqual(actors, ['user1', AGENT],
+        `${label}：该行必须能被归一缺省用户 user1 的后续待办命中（实际=${JSON.stringify(actors)}）`)
+      assert.ok(await ext.findSurrogateById(id), `${label}：行未落库，上面的并入是空转`)
+    }
+  })
+
+  it('档4 阳性对照：save/update 传真实 operator 仍以显式值为授权人（归一不是把三档焊死成 user1）', async () => {
+    const name = D4_FLOW + '-expl'
+    const { ext, facade } = facadeHarness(name, 'user1')
+    const id = await saveViaFacade(facade, 'op-explicit', { processName: name })
+    assert.equal((await facade.flow('processSurrogate/detail', { id })).data.operator, 'op-explicit')
+    // update 带空白 operator ⇒ 保留原授权人：既不清空也不改成 user1
+    const upd = await facade.flow('processSurrogate/update',
+      { id, operator: '  ', surrogate: AGENT, processName: name })
+    assert.equal(upd.code, 0, JSON.stringify(upd))
+    assert.equal((await facade.flow('processSurrogate/detail', { id })).data.operator, 'op-explicit',
+      'update 的空白档保留原授权人（spec 06 §processSurrogate/update）')
+    assert.equal((await ext.findSurrogateById(id))?.operator, 'op-explicit')
+  })
+
+  // ── 档 5（②案 A）：processSurrogate/page 归属不变式，两层 ──
+  it('档5 page 归属：带 operator 只见自己；不带 ⇒ 只出归一缺省 user1 的行，绝不全库', async () => {
+    const name = D4_FLOW + '-page'
+    const { ext, facade } = facadeHarness(name, 'user1')
+    await seed(ext, { id: '1521005', operator: 'user1', surrogate: AGENT, processName: name, enabled: 1 })
+    await seed(ext, { id: '1521006', operator: 'op-other', surrogate: AGENT, processName: name, enabled: 1 })
+    const rowsOf = async (args: Record<string, any>) => {
+      const r = await facade.flow('processSurrogate/page', { pageSize: 100, ...args })
+      assert.equal(r.code, 0, JSON.stringify(r))
+      return r.data.rows as Array<Record<string, any>>
+    }
+    const own = await rowsOf({ operator: 'user1' })
+    assert.equal(own.length, 1, `带 operator 只见自己授出的行（实际=${JSON.stringify(own)}）`)
+    assert.equal(own[0].operator, 'user1')
+    const blanks: Array<[string, Record<string, any>]> = [
+      ['缺键', {}], ['空串', { operator: '' }], ['全空白', { operator: ' \t ' }],
+    ]
+    for (const [label, args] of blanks) {
+      const rows = await rowsOf(args)
+      assert.equal(rows.length, 1, `${label} 档应只剩 user1 那一行（实际=${JSON.stringify(rows)}）`)
+      assert.equal(rows[0].operator, 'user1', `${label} 档归一到 user1`)
+      assert.ok(!rows.some(r => r.operator === 'op-other'), `${label} 档不得漏出他人的委托行（全库台账）`)
+    }
+    assert.equal((await rowsOf({ operator: 'op-other' })).length, 1, '对照：真实他人档照常只出他自己的行')
+    assert.equal((await rowsOf({ operator: 'op-nobody' })).length, 0, '对照：谁都没有 ⇒ 0 行（证明过滤真生效）')
+  })
+
+  it('档5 第二层：绕过门面直调仓储（内存仓 + SQL 仓零连接探针）传空 operator ⇒ 空页，两仓同答案', async () => {
+    const name = D4_FLOW + '-repo'
+    const { ext } = facadeHarness(name, 'user1')
+    await seed(ext, { id: '1521007', operator: 'user1', surrogate: AGENT, processName: name, enabled: 1 })
+    // 对照：真实归属值照常出行（否则下面的 0 是恒真空）
+    assert.equal((await ext.pageSurrogates(1, 10, { operator: 'user1' }))[1], 1, '对照：真实归属列必须出行')
+    for (const v of ['', '   ', null, undefined]) {
+      const [rows, total] = await ext.pageSurrogates(1, 10, { operator: v } as any)
+      assert.equal(rows.length, 0, `内存仓 filters.operator=${JSON.stringify(v)} ⇒ 空页，实得 ${rows.length} 行`)
+      assert.equal(total, 0, `内存仓空归属档 total 也要归 0（${JSON.stringify(v)}）`)
+    }
+    assert.equal((await ext.pageSurrogates(1, 10, undefined, [{ column: 't.operator', operator: 'EQ', value: '' }]))[0].length, 0,
+      '内存仓 conditions：t.operator EQ "" ⇒ 空页')
+    // SQL 仓（T0 不连库）：filters 那一路短路空页 + buildExtWhere 出 AND 1=0
+    const noConn: any = {
+      placeholder: '?',
+      acquire() { throw new Error('探针不该取连接（T0 无数据库）') },
+      release() { throw new Error('探针不该释放连接') },
+    }
+    const extProbe: any = new JdbcProcessExtRepository(noConn)
+    for (const v of ['', '   ', null]) {
+      assert.deepEqual(await extProbe.pageSurrogates(1, 10, { operator: v }), [[], 0],
+        `SQL 仓 pageSurrogates filters.operator=${JSON.stringify(v)} ⇒ 空页（与内存仓同答案，条款 6）`)
+    }
+    const extWhere = (conditions: any[], whitelist: string[]) =>
+      extProbe.buildExtWhere(conditions, new Set(whitelist)) as { sql: string; params: any[] }
+    assert.equal(extWhere([{ column: 't.operator', operator: 'EQ', value: '' }], ['t.operator']).sql, ' AND 1=0',
+      'SQL 仓：归属列 t.operator + 空值 ⇒ 空页谓词')
+    await assert.rejects(() => extProbe.pageSurrogates(1, 10, { operator: 'user1' }), /探针不该取连接/,
+      '反闸：非空归属值应照常下查询（否则上面那几格空页是空转）')
+    // 哨兵：非归属可选过滤的空值放行不动（只收归属列）
+    assert.equal(extWhere([{ column: 't.process_name', operator: 'EQ', value: '' }], ['t.operator', 't.process_name']).sql, '',
+      '哨兵：可选过滤 t.process_name 传空串仍按"没填"，没被一起收进空页')
   })
 })

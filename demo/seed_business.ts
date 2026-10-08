@@ -44,7 +44,10 @@ const FINISHED: Row[] = [
   { defineId: '12', operator: 'userB', extra: { deptLeader: 'user1' } },
 ]
 
-// 委托 8 条：processSurrogate/page 无 operator 过滤 → 8 用户委托菜单全非空
+// 委托 8 条（八栈同表同值）：issues/152 ② 起 processSurrogate/page 的归属列 t.operator 由**引擎门面**
+// 注入（§2.5 归一后的 operator：调用方不传 ⇒ 落到缺省 user1）。集成方义务不变——从登录上下文注入
+// 当前用户 id（spec 06 §2.5），注入谁就只看谁授出的委托；未注入的直调方只看 user1 那一档。
+// 种子数据不因此改动（八语言 demo 同表同值同序）。
 const SURROGATES: Array<[string, string]> = [
   ['user1', 'userA'], ['userA', 'userB'], ['userB', 'userC'], ['userC', 'leader'],
   ['leader', 'manager'], ['manager', 'director'], ['director', 'boss'], ['boss', 'user1'],

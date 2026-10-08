@@ -788,12 +788,15 @@ export class JeeflowFacade {
   // ── 委托代理（需扩展仓储） ───────────────────────────────────────────────
 
   private async surrogatePage(args: Record<string, any>): Promise<Record<string, any>> {
-    // issues/129 案 A 第一层（同档原则）：空串/全空白 operator ≡ 缺键 ⇒ **不带**归属过滤。
-    // 旧写法 `args.operator != null` 让 "" 变成"带了一个空值过滤"，两仓给两种答案
-    // （JDBC 侧 `t.operator = ''` 出 0 行、内存侧把条件整条丢掉出全库）。本 action 在 java
-    // 门面里不下发归属条件，故回落点不是 user1 而是"与缺键一样不过滤"——只把两档并成一档。
-    const opArg = toStr(args.operator).trim()
-    const filters = opArg !== '' ? { operator: toStr(args.operator) } : undefined
+    // issues/152 ②（案 A · 引擎侧立法，spec 06 §2.5 口径表 + §4.5「归属不变式」）：
+    // t.operator 是归属列，与 instancePage(`pageInstances(pageNum, pageSize, operatorArg(args))`) 同形注入
+    // —— 引擎自己保证「我的委托」只看自己授出的行。旧写法（issues/129 案 A 那一版）是
+    // "空串/缺键 ⇒ **不带**归属过滤"，理由是"本 action 在 java 门面里不下发归属条件"，
+    // 那句话随 issues/152 选 A 一起作废：当时"我的委托只看自己"全靠集成壳注入 operator
+    // （mldong-boot2-jeeflow WfFlowController），换宿主／直调门面就退化成全库台账
+    // （vben5 前端本来就不传 operator）。归属列一律走 §2.5 归一：缺键/空串/全空白 ⇒ user1。
+    // 仓储那一层的第二道兜底（空归属值 ⇒ 空页）保持不动，见 memory-ext.ts / jdbc/ext.ts。
+    const filters = { operator: operatorArg(args) }
     const pageNum = toInt(args.pageNum ?? 1)
     const pageSize = toInt(args.pageSize ?? 10)
     const [rows, total] = await this.ext().pageSurrogates(
@@ -853,11 +856,18 @@ export class JeeflowFacade {
     return {}
   }
 
-  /** 委托写入公共字段。授权人（operator）仅在显式传入时覆盖，避免 update
-   *  时清空原授权人（前端编辑表单不带 operator；集成层注入时 operator=授权人，覆盖无害） */
+  /** 委托写入公共字段。授权人（operator）仅在**显式且非空白**时覆盖：
+   *  - update 缺省（不带键 / 空串 / 全空白）⇒ 保留原授权人，不得清空（spec 06 §update）
+   *  - save 缺省档 ⇒ 保留调用点已归一的 operator（`operatorArg`，缺省 user1）
+   *  issues/152 ③：空串/全空白**绝不落进** operator——那种行是「死行」，getSurrogate 的
+   *  `WHERE operator = ?` 永不命中，台账看得见、待办永远不并人（比报错更难查）。
+   *  三档入参一律走 §2.5 归一，与 java `applySurrogateFields` 同形。 */
   private applySurrogateFields(s: ProcessSurrogate, args: Record<string, any>, operator: string): void {
     s.processName = String(args.processName ?? '')
-    if ('operator' in args) s.operator = String(args.operator)
+    if ('operator' in args) {
+      const explicit = toStr(args.operator)
+      if (explicit.trim() !== '') s.operator = explicit
+    }
     s.surrogate = String(args.surrogate ?? '')
     s.startTime = parseSurrogateTime(args.startTime)
     s.endTime = parseSurrogateTime(args.endTime)
