@@ -260,7 +260,12 @@ export class JdbcProcessExtRepository implements ProcessExtRepository {
     // 与内存仓 memory-ext.ts pageSurrogates 同判据（否则同一个空 operator 两仓一个出 0 行、
     // 一个把条件丢掉出全库）。issues/152 ② 起门面恒定下发归一后的归属值（surrogatePage 走
     // operatorArg，缺键/空串/全空白 ⇒ user1），这一道专防绕过门面直连仓储的调用方。
-    if ('operator' in (filters ?? {}) && isBlankValue(filters!.operator)) return [[], 0]
+    // issues/152 ②：归属列**缺失档与空值档同判**（spec 06 §2.5），与 memory-ext.ts 逐字同尺子。
+    const ownCond = (conditions ?? []).find(c => c.column === 't.operator'
+      && (c.operator == null || String(c.operator).toUpperCase() === 'EQ'))
+    if ('operator' in (filters ?? {})) {
+      if (isBlankValue(filters!.operator)) return [[], 0]
+    } else if (!ownCond || isBlankValue(ownCond.value)) return [[], 0]
     const args: any[] = []
     const args2: any[] = []
     for (const [col, val] of Object.entries(filters ?? {})) {

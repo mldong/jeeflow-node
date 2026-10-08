@@ -117,9 +117,13 @@ export class MemoryExtRepository implements ProcessExtRepository {
     // 原来靠下面那句 `val === '' continue` 把这条条件整条丢掉 ⇒ 空 operator 读出全库委托；
     // 只收归属列——surrogate / process_name / enabled 三个可选过滤仍走"空值当作没填"。
     // conditions 那一路（m_ 条件）由 matchConditions 的归属兜底覆盖（SURROGATE_FIELDS 带 t.operator）。
-    const blankOwnershipFilter = Object.entries(filters ?? {})
-      .some(([col, val]) => col === 'operator' && (val == null || String(val).trim() === ''))
-    if (blankOwnershipFilter) return [[], 0]
+    // issues/152 ②：归属列**缺失档与空值档同判**（spec 06 §2.5），与 jdbc/ext.ts 逐字同尺子。
+    const blankOwn = (v: any) => v == null || String(v).trim() === ''
+    const ownCond = (conditions ?? []).find(c => c.column === 't.operator'
+      && (c.operator == null || String(c.operator).toUpperCase() === 'EQ'))
+    if ('operator' in (filters ?? {})) {
+      if (blankOwn(filters!.operator)) return [[], 0]
+    } else if (!ownCond || blankOwn(ownCond.value)) return [[], 0]
     const rows = [...this.surrogates.values()].filter(s => {
       for (const [col, val] of Object.entries(filters ?? {})) {
         if (val == null || val === '') continue

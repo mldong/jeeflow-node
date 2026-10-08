@@ -4172,9 +4172,14 @@ describe('issues/129 operator 空档两层收口（门面归一化 + 仓储归�
     // m_ 条件那一路由 matchConditions 的归属兜底覆盖（SURROGATE_FIELDS 带 t.operator）
     assert.equal((await f.extRepo.pageSurrogates(1, 10, undefined, [{ column: 't.operator', operator: 'EQ', value: '' }]))[0].length, 0,
       '内存仓 conditions：t.operator EQ "" ⇒ 空页')
-    // 哨兵：非归属 filter 键的空值仍当作没填
-    assert.equal((await f.extRepo.pageSurrogates(1, 10, { surrogate: '' }))[0].length, 2,
-      '哨兵：surrogate（非归属）传空串仍被忽略 ⇒ 两条都在')
+    // 哨兵：非归属 filter 键的空值仍当作没填。归属不变式收到"缺失档也空页"之后，
+    // 这一格必须挂在**归属有效**的那条形上（否则先被缺失档拦掉，照不出可选过滤的行为）：
+    // ME 名下 1 条，surrogate 传空串仍按"没填"⇒ 仍是 1 条；若被误当谓词就是 0 条。
+    assert.equal((await f.extRepo.pageSurrogates(1, 10, { operator: ME, surrogate: '' }))[0].length, 1,
+      '哨兵：surrogate（非归属）传空串仍被忽略 ⇒ 归属命中的那条照出')
+    // 缺失档：既不因"没给归属"读全库，也不报错——判空页（spec 06 §2.5 与 §4.5 同一条尺子）
+    assert.equal((await f.extRepo.pageSurrogates(1, 10))[0].length, 0,
+      '直连仓储不带归属条件 ⇒ 空页，不是全库')
   })
 
   it('issues/114 硬必填未被本次改动污染：withdraw/transfer 的空串与缺键仍报「operator 必填」，绝不回落 user1', async () => {
