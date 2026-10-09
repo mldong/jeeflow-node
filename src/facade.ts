@@ -1012,6 +1012,10 @@ export class JeeflowFacade {
     const instanceId = toId(args.id)
     const his = await this.repo.findHistoryTasks(instanceId)
     return his.map(t => ({
+      // issues/154④：审批记录九键之首＝任务行主键。本栈 id 全程 string（仓储 rowId 出口），
+      // 仍显式 String() 一挡——"必须是字符串"这条契约不许押在仓储姿势上：19 位雪花 id
+      // 出 number 会被 JS 截精度（同 issues/75/92 那族坑），对齐 java String.valueOf(...)。
+      id: String(t.id ?? ''),
       taskName: t.taskName, displayName: t.displayName, taskType: t.taskType ?? null,
       performType: t.performType ?? null, taskState: t.taskState, operator: t.actorId ?? '',
       // issues/122：可空时间列空值出 '' 不出 null——mldong-nestjs 全局 SmartNullStripping

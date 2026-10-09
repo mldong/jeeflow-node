@@ -1019,6 +1019,23 @@ describe('jeeflow compliance tests', () => {
     assert.equal(r3.code, 0, JSON.stringify(r3))
     assert.equal(r3.data.length, 2, 'apply + task1')
 
+    // ── issues/154④：审批记录九键之首＝ id（任务行主键），且必须是**字符串**；
+    // ── issues/154①：行序按 id 单调升（口径① 的 ORDER BY id ASC 出口形状）──
+    const recRows = r3.data as Record<string, any>[]
+    for (const row of recRows) {
+      assert.ok('id' in row, `approvalRecord 行缺 id 键: ${JSON.stringify(row)}`)
+      assert.equal(typeof row.id, 'string', `approvalRecord id 必须是字符串: ${JSON.stringify(row)}`)
+      assert.ok(row.id !== '', `approvalRecord id 不得为空串: ${JSON.stringify(row)}`)
+    }
+    const recIds = recRows.map(row => row.id)
+    assert.equal(new Set(recIds).size, recIds.length, `approvalRecord 行主键重复: ${recIds}`)
+    const recNums = recIds.map(Number)
+    assert.deepEqual(recNums, [...recNums].sort((a, b) => a - b), `approvalRecord 行序非 id 升: ${recIds}`)
+    // id 与持久任务行逐一对号（同一条读路 findHistoryTasks）
+    const persisted = await repo.findHistoryTasks(instanceId)
+    assert.deepEqual(new Set(recIds), new Set(persisted.map(t => String(t.id))),
+      `approvalRecord id 与任务行不对号: ${recIds} vs ${persisted.map(t => t.id)}`)
+
     const r4 = await facade.flow('processInstance/highLight', { id: instanceId })
     assert.equal(r4.code, 0, JSON.stringify(r4))
     assert.ok(r4.data.activeNodeNames.includes('task1'), JSON.stringify(r4.data))
