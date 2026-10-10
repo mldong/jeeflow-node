@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { EngineImpl, KeyAutoGenTitle, KeyCustomReturnVal, KeyRealName, KeyUserID, parseActorIds, parseCcActors, processTime } from '../src/engine.js'
+import { EngineImpl, KeyAutoGenTitle, KeyCustomReturnVal, KeyRealName, KeyUserID, KeySubmitType, parseActorIds, parseCcActors, processTime } from '../src/engine.js'
 import { HandlerRegistry, registerBuiltinAssignments } from '../src/index.js'
 import { MemoryRepository } from '../src/memory.js'
 import { MemoryExtRepository } from '../src/memory-ext.js'
@@ -51,6 +51,22 @@ function setup() {
   const idGen = mkSeqIdGen()
   const exprEval: ExpressionEvaluator = {
     async eval(expr, vars) {
+      // issues/163：会签门控 `#nrOf...`——引擎以裸名并进求值原料，求值器剥 # 后查。
+      const gm = /^\s*#(\w+)\s*(>=|<=|!=|==|>|<)\s*(\d+(?:\.\d+)?)\s*$/.exec(expr)
+      if (gm) {
+        const used = vars[gm[1]]
+        if (used === undefined) return false
+        const u = Number(used), v = Number(gm[3])
+        switch (gm[2]) {
+          case '>': return u > v
+          case '>=': return u >= v
+          case '<': return u < v
+          case '<=': return u <= v
+          case '==': return u === v
+          case '!=': return u !== v
+        }
+        return false
+      }
       const amt = Number(vars.amount ?? 0)
       if (expr === 'amount > 1000') return amt > 1000
       if (expr === 'amount <= 1000') return amt <= 1000
@@ -355,13 +371,16 @@ describe('jeeflow compliance tests', () => {
     await assertDone(result, 'seq cs: expected done')
   })
 
+  // issues/163：07 的完成条件 `#nrOfCompletedInstances==2` 是设计器嵌套形（properties.field
+  // 子对象），引擎"顶层优先、嵌套兜底"读取后两人同意即放行、剩余两人废弃——与 java
+  // JeeflowFullTest.test07CountersignRatio 同形。
   it('07 countersign ratio', async () => {
     const { engine, repo } = setup()
     const def = loadFlow(repo, '07-countersign-ratio.json')
     const inst = await startAndExecute(engine, repo, def.id, 'applicant')
     let doing = await repo.findDoingTasks(inst.id)
     assert.equal(doing.length, 4, 'ratio cs: 4 tasks')
-    for (const actor of ['userA', 'userB', 'userC', 'userD']) {
+    for (const actor of ['userA', 'userB']) {
       doing = await repo.findDoingTasks(inst.id)
       const t = doing[0]
       await repo.addTaskActor(t.id, [actor])
@@ -370,6 +389,7 @@ describe('jeeflow compliance tests', () => {
     }
     const result = await repo.findInstanceById(inst.id)
     await assertDone(result, 'ratio cs: expected done')
+    assert.equal((await repo.findDoingTasks(inst.id)).length, 0, '放行后剩余两位应废弃')
   })
 
   it('08 reject', async () => {
@@ -7520,5 +7540,128 @@ describe('issues/152 委托：门面归属不变式（②案 A）＋ save 授权
     // 哨兵：非归属可选过滤的空值放行不动（只收归属列）
     assert.equal(extWhere([{ column: 't.process_name', operator: 'EQ', value: '' }], ['t.operator', 't.process_name']).sql, '',
       '哨兵：可选过滤 t.process_name 传空串仍按"没填"，没被一起收进空页')
+  })
+})
+
+// ─── issues/163 · 并行会签「放行表达式真求值」（对齐 java CountersignHandler ＋ rust gate_vars）────
+// 改前形状：countersignCompletionCondition 只被拿去比 ONE_VOTE_VETO 一档，非否决值从不交求值器
+// ⇒ `#nrOfCompletedInstances>=2` 被完全忽略，放行只由"是否还有 DOING"决定（三人会签要三人全办）。
+// 本案（owner 2026-10-10 拍"修"）＝cond 交给同一条求值通道，门控计数（total/activate/completed，
+// **裸名**）并进求值原料；ONE_VOTE_VETO 判定顺序保持原样。
+// 夹具＝内联三节点流程（start → apply → 三人并行会签 task1 → end），不新增共享 flows/ 夹具。
+describe('issues/163 countersign completion condition', () => {
+  function i163Setup() {
+    const repo = new MemoryRepository()
+    const userProv: UserProvider = {
+      async getUser(userId) { return { userId, realName: '用户' + userId, deptId: 'D01', deptName: '测试部门', postId: 'P01', postName: '测试岗位' } },
+    }
+    // 壳侧同款简易求值器（`#` 门控变量剥前缀裸名查；查不到判 false，与 java SpEL catch ⇒ false 同档）
+    const exprEval: ExpressionEvaluator = {
+      async eval(expr: string, vars: Record<string, any>) {
+        const m = /^\s*#?(\w+)\s*(>=|<=|!=|==|>|<)\s*(\d+(?:\.\d+)?)\s*$/.exec(expr)
+        if (!m) return false
+        const actual = Number(vars[m[1]])
+        if (isNaN(actual)) return false
+        const val = Number(m[3])
+        if (m[2] === '>') return actual > val
+        if (m[2] === '>=') return actual >= val
+        if (m[2] === '<') return actual < val
+        if (m[2] === '<=') return actual <= val
+        if (m[2] === '==') return actual === val
+        if (m[2] === '!=') return actual !== val
+        return false
+      },
+    }
+    return { engine: new EngineImpl(repo, userProv, mkSeqIdGen(), exprEval), repo }
+  }
+
+  function i163Flow(name: string, cond: string, nested = false): string {
+    const props: Record<string, any> = { assignee: 'userA,userB,userC', taskType: 0, performType: 1, countersignType: 'PARALLEL' }
+    if (cond) {
+      // nested=true：cond 藏到设计器实际落笔处 properties.field 子对象里（共享夹具 07 的形状）
+      if (nested) props.field = { countersignCompletionCondition: cond }
+      else props.countersignCompletionCondition = cond
+    }
+    return JSON.stringify({
+      name, displayName: 'i163会签条件', type: 'approval',
+      nodes: [
+        { id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } },
+        { id: 'apply', type: 'snaker:task', properties: { assignee: 'applicant', performType: 0 }, text: { value: '发起申请' } },
+        { id: 'task1', type: 'snaker:task', properties: props, text: { value: '会签审批' } },
+        { id: 'end', type: 'snaker:end', properties: {}, text: { value: '结束' } },
+      ],
+      edges: [
+        { id: 'e0', sourceNodeId: 'start', targetNodeId: 'apply', properties: {} },
+        { id: 'e1', sourceNodeId: 'apply', targetNodeId: 'task1', properties: {} },
+        { id: 'e2', sourceNodeId: 'task1', targetNodeId: 'end', properties: {} },
+      ],
+    })
+  }
+
+  async function i163Start(name: string, cond: string, nested = false) {
+    const { engine, repo } = i163Setup()
+    const def: ProcessDefine = { id: 0, name, displayName: name, type: 'approval', state: 1, content: i163Flow(name, cond, nested), version: 1, createTime: new Date(), updateTime: new Date(), createUser: '', updateUser: '' }
+    repo.addDefine(def)
+    const inst = await startAndExecute(engine, repo, def.id, 'user1')
+    const members = await repo.findDoingTasks(inst.id)
+    assert.equal(members.length, 3, `三人并行会签应有 3 条成员待办，实得 ${members.length}`)
+    return { engine, repo, inst }
+  }
+
+  async function i163Vote(engine: EngineImpl, repo: MemoryRepository, instanceId: string, who: string, args?: Record<string, any>) {
+    const doing = await repo.findDoingTasks(instanceId)
+    assert.ok(doing.length > 0, `${who} 应有待办可办`)
+    const t = doing[0]
+    await repo.addTaskActor(t.id, [who])
+    t.actorIds.push(who)
+    await engine.executeProcessTask(t.id, who, args)
+  }
+
+  it('163 ① 阈值 2/3：#nrOfCompletedInstances>=2 第二票即放行、第三位待办废弃', async () => {
+    const { engine, repo, inst } = await i163Start('i163-cond', '#nrOfCompletedInstances>=2')
+    await i163Vote(engine, repo, inst.id, 'userA')
+    let cur = await repo.findInstanceById(inst.id)
+    assert.equal(cur?.state, InstanceState.Doing, '第 1 票阈值未达，仍应停留')
+    assert.equal((await repo.findDoingTasks(inst.id)).length, 2, '第 1 票后应还剩 2 条待办')
+
+    await i163Vote(engine, repo, inst.id, 'userB')
+    cur = await repo.findInstanceById(inst.id)
+    assert.equal(cur?.state, InstanceState.Done, '第 2 票达到阈值应放行（改前此格红：仍停留）')
+    assert.equal((await repo.findDoingTasks(inst.id)).length, 0, '放行后剩余成员待办应废弃')
+    const rows = await repo.findHistoryTasks(inst.id)
+    const abandoned = rows.filter(r => r.taskName === 'task1' && r.taskState === TaskState.Abandoned)
+    assert.equal(abandoned.length, 1, `应恰有 1 条成员行被废弃（99），实得 ${abandoned.length}`)
+  })
+
+  it('163 ② 对照档：不带 cond ⇒ 两票仍停留、第三票（全完成）才放行', async () => {
+    const { engine, repo, inst } = await i163Start('i163-nocond', '')
+    await i163Vote(engine, repo, inst.id, 'userA')
+    await i163Vote(engine, repo, inst.id, 'userB')
+    let cur = await repo.findInstanceById(inst.id)
+    assert.equal(cur?.state, InstanceState.Doing, '无 cond 时两票后必须仍停留')
+    assert.equal((await repo.findDoingTasks(inst.id)).length, 1, '无 cond 时两票后应还剩 1 条')
+    await i163Vote(engine, repo, inst.id, 'userC')
+    cur = await repo.findInstanceById(inst.id)
+    assert.equal(cur?.state, InstanceState.Done, '第三票（全部完成）才放行')
+  })
+
+  it('163 ③ ONE_VOTE_VETO 原样：submitType=20 一票否决立即合并、其余废弃', async () => {
+    const { engine, repo, inst } = await i163Start('i163-veto', 'ONE_VOTE_VETO')
+    await i163Vote(engine, repo, inst.id, 'userA', { [KeySubmitType]: SubmitType.CountersignDisagree })
+    const cur = await repo.findInstanceById(inst.id)
+    assert.equal(cur?.state, InstanceState.Done, '一票否决应立即合并')
+    assert.equal((await repo.findDoingTasks(inst.id)).length, 0, '否决后 B/C 待办应废弃')
+  })
+
+  it('163 ④ 附带读形：cond 藏 properties.field 子对象 ⇒ 同 ① 判（第 2 票放行）', async () => {
+    const { engine, repo, inst } = await i163Start('i163-nested', '#nrOfCompletedInstances>=2', true)
+    await i163Vote(engine, repo, inst.id, 'userA')
+    let cur = await repo.findInstanceById(inst.id)
+    assert.equal(cur?.state, InstanceState.Doing, '第 1 票后应停留')
+
+    await i163Vote(engine, repo, inst.id, 'userB')
+    cur = await repo.findInstanceById(inst.id)
+    assert.equal(cur?.state, InstanceState.Done, '嵌套形 cond 也应被读到并在第 2 票放行（改前整条 cond 被忽略）')
+    assert.equal((await repo.findDoingTasks(inst.id)).length, 0, '放行后剩余成员待办应废弃')
   })
 })

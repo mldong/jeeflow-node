@@ -95,6 +95,24 @@ async function buildAll() {
   ext = new MemoryExtRepository()
   engine = new EngineImpl(repo, userProvider, undefined, {
     async eval(expr: string, vars: Record<string, any>) {
+      // issues/163：`#` 前缀门控变量（会签放行条件，如 `#nrOfCompletedInstances>=2`）——
+      // 引擎并行分支已把 nrOfInstances / nrOfActivateInstances / nrOfCompletedInstances
+      // 以裸名并进求值原料（rust gate_vars 同款），剥掉 `#` 按裸名查即可（查不到判 false，
+      // 与 java SpEL catch ⇒ false 同档）
+      if (expr.trim().startsWith('#')) {
+        const m = /^\s*#?(\w+)\s*(>=|<=|!=|==|>|<)\s*(\d+(?:\.\d+)?)\s*$/.exec(expr)
+        if (!m) return false
+        const actual = Number(vars?.[m[1]])
+        if (isNaN(actual)) return false
+        const val = Number(m[3])
+        if (m[2] === '>') return actual > val
+        if (m[2] === '>=') return actual >= val
+        if (m[2] === '<') return actual < val
+        if (m[2] === '<=') return actual <= val
+        if (m[2] === '==') return actual === val
+        if (m[2] === '!=') return actual !== val
+        return false
+      }
       const amt = Number(vars?.amount)
       if (isNaN(amt)) return false
       if (expr === 'amount > 1000') return amt > 1000

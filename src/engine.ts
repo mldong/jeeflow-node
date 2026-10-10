@@ -412,7 +412,17 @@ export class EngineImpl implements Engine {
       // createTask 不再触发（引擎语义修正），此处为完成任务节点的唯一触发点
       await this.firePost(curNode, inst)
       const ct = curNode.properties?.countersignType as string | undefined
-      const csCond = String(curNode.properties?.countersignCompletionCondition ?? '').trim()
+      let csCond = String(curNode.properties?.countersignCompletionCondition ?? '').trim()
+      // issues/163 附带读形对齐：设计器把条件写进 `properties.field` 子对象（共享夹具 07 就是
+      // 这个形状），java/php/csharp/rust/moon 五栈都读了嵌套形、只有本栈（及 python/go）只读
+      // 顶层 ⇒ 同一份 07 定义在 java 测试里 2/4 放行、本栈 4/4 才放行。顶层优先、嵌套兜底
+      // （rust/moon 同序；两处都写且打架属退化形状，不承诺与 java 的 "ext 优先" 同分叉）。
+      if (!csCond) {
+        const fld = curNode.properties?.field as Record<string, any> | undefined
+        if (fld && typeof fld === 'object') {
+          csCond = String(fld.countersignCompletionCondition ?? '').trim()
+        }
+      }
       // issues/91：会签一票否决仅当节点配置 ONE_VOTE_VETO（忽略大小写）时生效，
       // submitType=20 才跳过会签"未完成即停留"门控提前流转；否则为软拒绝——
       // 否决者任务正常完成、countersignDisagreeFlag=1 已记录为变量（供下游参考），
@@ -452,8 +462,33 @@ export class EngineImpl implements Engine {
         }
       }
       if ((ct === 'PARALLEL' || ct?.startsWith('RATIO')) && !csVeto) {
-        const doing = await this.repo.findDoingTasks(inst.id)
-        if (doing.length > 0) return finishExecute()
+        const csExpr = csCond !== '' && csCond.toUpperCase() !== 'ONE_VOTE_VETO'
+        if (csExpr && this.exprEval) {
+          // issues/163：并行/比例会签的放行表达式**真求值**——基准＝java CountersignHandler
+          // 并行分支（:86-106：cond 非空交求值器，catch ⇒ false）＋ rust gate_vars
+          // （engine.rs:1122-1124：门控计数以**裸名**并进原料）。计数口径对齐 java
+          // buildCountersignVars：total＝该节点全部成员行、activate＝DOING、completed＝已完成
+          // （读 inst.tasks：prepareExecuteTask 里 completeTask＋syncTaskToAggregate 已把
+          // 本单同步进聚合，计数是新鲜的）。
+          const members = inst.tasks.filter(t => t.taskName === curNode.id)
+          const evalVars = {
+            ...vars,
+            nrOfInstances: members.length,
+            nrOfActivateInstances: members.filter(t => t.isDoing()).length,
+            nrOfCompletedInstances: members.filter(t => t.isFinished()).length,
+          }
+          let merged = false
+          try {
+            merged = isTruthy(await this.exprEval.eval(csCond, evalVars))
+          } catch {
+            merged = false // 对齐 java `catch (Exception ignored) { merged = false; }`
+          }
+          if (!merged) return finishExecute()
+          // merged ⇒ 落穿到下面的 abandon＋跟进边（与"全部完成"走同一出口）
+        } else {
+          const doing = await this.repo.findDoingTasks(inst.id)
+          if (doing.length > 0) return finishExecute()
+        }
       }
       // issues/91：会签节点 merged 后（ONE_VOTE_VETO 否决 / 全部完成任一路径），
       // 废弃该节点剩余 DOING 任务（对齐内置引擎 abandonProcessTask）：
