@@ -113,14 +113,20 @@ async function buildAll() {
         if (m[2] === '!=') return actual !== val
         return false
       }
-      const amt = Number(vars?.amount)
-      if (isNaN(amt)) return false
-      if (expr === 'amount > 1000') return amt > 1000
-      if (expr === 'amount >= 1000') return amt >= 1000
-      if (expr === 'amount < 1000') return amt < 1000
-      if (expr === 'amount <= 1000') return amt <= 1000
-      if (expr === 'amount == 1000') return amt === 1000
-      if (expr === 'amount != 1000') return amt !== 1000
+      // 简单数值比较：<变量> <运算符> <数字>，任意变量名（issues/166：种子 mixed-mode 的
+      // 决策边是 finalAmount > 5000 / <= 5000——旧形状硬编码只认 amount，种子修好后
+      // F5/F8/F9 在这里双双求 false、撞上 164 的零命中报错；与 # 分支同一把尺子）
+      const m = /^\s*#?(\w+)\s*(>=|<=|!=|==|>|<)\s*(\d+(?:\.\d+)?)\s*$/.exec(expr)
+      if (!m) return false
+      const actual = Number(vars?.[m[1]])
+      if (isNaN(actual)) return false
+      const val = Number(m[3])
+      if (m[2] === '>') return actual > val
+      if (m[2] === '>=') return actual >= val
+      if (m[2] === '<') return actual < val
+      if (m[2] === '<=') return actual <= val
+      if (m[2] === '==') return actual === val
+      if (m[2] === '!=') return actual !== val
       return false
     }
   })

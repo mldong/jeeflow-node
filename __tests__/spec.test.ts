@@ -7665,3 +7665,110 @@ describe('issues/163 countersign completion condition', () => {
     assert.equal((await repo.findDoingTasks(inst.id)).length, 0, '放行后剩余成员待办应废弃')
   })
 })
+
+// ─── issues/164 · 决策节点「零命中 ⇒ 显式报错（NOT_FOUND_NEXT_NODE 同档）」——对齐 java ───
+// 改前形状：evaluateDecision 走完表达式臂全不命中后静默 return——令牌不前进也不报错，
+// 办理人看到 code=0"成功"、实例停在 state=10 且没有任何人的待办（僵尸实例）。
+// 本案 A（2026-10-11 拍，python issues/161 已走同一条路）＝零命中抛
+// `decision节点无法确定下一步执行路线`——文案逐字取 java WfErrEnum.NOT_FOUND_NEXT_NODE。
+// 夹具＝内联决策流程（start → apply → task1 → decision 两 expr 边 → task2/task3 → end，
+// 与共享夹具 03-decision-expr 同形），不新增共享 flows/ 夹具。
+describe('issues/164 decision no-match errors', () => {
+  const NOT_FOUND_NEXT_NODE_MSG = 'decision节点无法确定下一步执行路线'
+
+  function i164Setup() {
+    const repo = new MemoryRepository()
+    const userProv: UserProvider = {
+      async getUser(userId) { return { userId, realName: '用户' + userId, deptId: 'D01', deptName: '测试部门', postId: 'P01', postName: '测试岗位' } },
+    }
+    const exprEval: ExpressionEvaluator = {
+      async eval(expr: string, vars: Record<string, any>) {
+        const m = /^\s*#?(\w+)\s*(>=|<=|!=|==|>|<)\s*(-?\d+(?:\.\d+)?)\s*$/.exec(expr)
+        if (!m) return false
+        const actual = Number(vars[m[1]])
+        if (isNaN(actual)) return false
+        const val = Number(m[3])
+        if (m[2] === '>') return actual > val
+        if (m[2] === '>=') return actual >= val
+        if (m[2] === '<') return actual < val
+        if (m[2] === '<=') return actual <= val
+        if (m[2] === '==') return actual === val
+        if (m[2] === '!=') return actual !== val
+        return false
+      },
+    }
+    return { engine: new EngineImpl(repo, userProv, mkSeqIdGen(), exprEval), repo }
+  }
+
+  function i164Flow(name: string): string {
+    return JSON.stringify({
+      name, displayName: '决策无命中(164夹具)', type: 'approval',
+      nodes: [
+        { id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } },
+        { id: 'apply', type: 'snaker:task', properties: { assignee: 'applicant', performType: 0 }, text: { value: '发起申请' } },
+        { id: 'task1', type: 'snaker:task', properties: { assignee: 'leader', performType: 0 }, text: { value: '填写报销单' } },
+        { id: 'decision1', type: 'snaker:decision', properties: { expr: '', handleClass: '' }, text: { value: '金额判断' } },
+        { id: 'task2', type: 'snaker:task', properties: { assignee: 'manager', performType: 0 }, text: { value: '经理审批' } },
+        { id: 'task3', type: 'snaker:task', properties: { assignee: 'director', performType: 0 }, text: { value: '总监审批' } },
+        { id: 'end', type: 'snaker:end', properties: {}, text: { value: '结束' } },
+      ],
+      edges: [
+        { id: 'e0', sourceNodeId: 'start', targetNodeId: 'apply', properties: {} },
+        { id: 'e1', sourceNodeId: 'apply', targetNodeId: 'task1', properties: {} },
+        { id: 'e2', sourceNodeId: 'task1', targetNodeId: 'decision1', properties: {} },
+        { id: 'e3', sourceNodeId: 'decision1', targetNodeId: 'task2', properties: { expr: 'amount > 1000' } },
+        { id: 'e4', sourceNodeId: 'decision1', targetNodeId: 'task3', properties: { expr: 'amount < 0' } },
+        { id: 'e5', sourceNodeId: 'task2', targetNodeId: 'end', properties: {} },
+        { id: 'e6', sourceNodeId: 'task3', targetNodeId: 'end', properties: {} },
+      ],
+    })
+  }
+
+  async function i164Start(name: string) {
+    const { engine, repo } = i164Setup()
+    const def: ProcessDefine = { id: 0, name, displayName: name, type: 'approval', state: 1, content: i164Flow(name), version: 1, createTime: new Date(), updateTime: new Date(), createUser: '', updateUser: '' }
+    repo.addDefine(def)
+    const inst = await startAndExecute(engine, repo, def.id, 'user1')
+    const doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing.length, 1, `发起后应停在 task1，实得 ${doing.length}`)
+    return { engine, repo, inst }
+  }
+
+  async function i164SubmitTask1(engine: EngineImpl, repo: MemoryRepository, instanceId: string, args?: Record<string, any>) {
+    const doing = await repo.findDoingTasks(instanceId)
+    assert.equal(doing.length, 1, 'task1 应恰有 1 条待办')
+    const t = doing[0]
+    await repo.addTaskActor(t.id, ['leader'])
+    t.actorIds.push('leader')
+    return engine.executeProcessTask(t.id, 'leader', args)
+  }
+
+  it('164 ① 两 expr 边全 false ⇒ 显式报错且文案与 java 同文、零后续待办（改前此格红：静默停住）', async () => {
+    const { engine, repo, inst } = await i164Start('i164-nomatch')
+    await assert.rejects(
+      () => i164SubmitTask1(engine, repo, inst.id, { amount: 500 }),
+      (err: Error) => err.message.includes(NOT_FOUND_NEXT_NODE_MSG),
+      '两 expr 边全 false 必须报错（改前此格红：code=0 静默停住）',
+    )
+    const cur = await repo.findInstanceById(inst.id)
+    assert.equal(cur?.state, InstanceState.Doing, '任务已消耗，实例应仍停在 DOING')
+    assert.equal((await repo.findDoingTasks(inst.id)).length, 0, '零命中后不得再产生任何待办（僵尸实例判据）')
+  })
+
+  it('164 ② 对照档：amount=5000 ⇒ e3 为真照常走 task2', async () => {
+    const { engine, repo, inst } = await i164Start('i164-match')
+    await i164SubmitTask1(engine, repo, inst.id, { amount: 5000 })
+    const doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing.length, 1, '有命中档不得报错')
+    assert.equal(doing[0].taskName, 'task2', 'amount=5000 应走 task2')
+  })
+
+  it('164 ③ 缺 amount（变量没填）⇒ 同档报错', async () => {
+    const { engine, repo, inst } = await i164Start('i164-missing')
+    await assert.rejects(
+      () => i164SubmitTask1(engine, repo, inst.id),
+      (err: Error) => err.message.includes(NOT_FOUND_NEXT_NODE_MSG),
+      '缺判定变量也必须同档报错',
+    )
+  })
+})

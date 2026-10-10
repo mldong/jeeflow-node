@@ -818,6 +818,11 @@ export class EngineImpl implements Engine {
         }
       }
     }
+    // issues/164 A：零命中（两条 expr 边全 false / 变量缺失 / 零出边 / 自定义处理器未命中）
+    // ⇒ 显式报错，对齐 java `DecisionModel.exec` 尾部 `NOT_FOUND_NEXT_NODE`（20010001，
+    // 文案逐字；python issues/161 已走同一条路）。旧形状此处静默返回＝令牌不前进也不报错，
+    // 办理人看到 code=0"成功"、实例挂在 state=10 却没有任何人的待办（僵尸实例）。
+    throw new Error('decision节点无法确定下一步执行路线')
   }
 
   private async createTask(node: FlowNode, inst: ProcessInstance, operator: string, vars: Record<string, any>, processName = '',

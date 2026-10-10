@@ -31,17 +31,21 @@ const IN_PROGRESS: Row[] = [
   { defineId: '8', operator: 'user1' },
 ]
 
-// 已完成 9 条：advance 推到 state=20（分支无关）
+// 已完成 9 条：advance 推到 state=20（分支无关）。
+// issues/166 A（2026-10-11）：F5/F8/F9 补 finalAmount=8000——三行的 deptLeader 本是
+// 15 文件编号时代 11-assignee-vars 的判定变量，flows 目录插入 06-…-expire.json 后
+// define=12 已是 10-mixed-mode（八仓同序），决策边 finalAmount>5000/<=5000 没这把键
+// 无路可走；补键走 e8→boss→end（与旧蒙臂 edges[0] 同形），矩阵"9 行已完成"原意复原。
 const FINISHED: Row[] = [
   { defineId: '1', operator: 'userA', cc: ['user1', 'director'] },
   { defineId: '8', operator: 'userB', cc: ['boss', 'manager'] },
   { defineId: '2', operator: 'manager', cc: ['boss'] },
   { defineId: '10', operator: 'director' },
-  { defineId: '12', operator: 'userC', extra: { deptLeader: 'leader' } },
+  { defineId: '12', operator: 'userC', extra: { deptLeader: 'leader', finalAmount: 8000 } },
   { defineId: '1', operator: 'director' },
   { defineId: '5', operator: 'manager' },
-  { defineId: '12', operator: 'userA', extra: { deptLeader: 'director' } },
-  { defineId: '12', operator: 'userB', extra: { deptLeader: 'user1' } },
+  { defineId: '12', operator: 'userA', extra: { deptLeader: 'director', finalAmount: 8000 } },
+  { defineId: '12', operator: 'userB', extra: { deptLeader: 'user1', finalAmount: 8000 } },
 ]
 
 // 委托 8 条（八栈同表同值）：issues/152 ② 起 processSurrogate/page 的归属列 t.operator 由**引擎门面**
