@@ -903,7 +903,7 @@ export class JeeflowFacade {
       try {
         const flow = JSON.parse(toStr(def.content))
         nodeProgress = await this.buildNodeProgress(flow, his)
-        await this.collectPath(flow, 'start', '', active, history, edges, new Set(), inst.variables ?? {}, his)
+        await this.collectPath(flow, 'start', active, history, edges, new Set(), inst.variables ?? {}, his)
       } catch { /* ignore */ }
     }
     return { activeNodeNames: active, historyNodeNames: history, historyEdgeNames: edges, nodeProgress }
@@ -967,12 +967,14 @@ export class JeeflowFacade {
     return ids.map(id => ({ id, name: nameMap[id] ?? '' }))
   }
 
-  private async collectPath(flow: any, nodeId: string, edgeName: string, active: string[],
+  // issues/157：边名收录在**源节点循环内**、活跃判断之前（逐字同位于 java
+  // `JeeflowFacade.collectPath`）。此前是把边名当递归实参传的，
+  // ⇒ 目标节点当前活跃的那条边既不下钻也不收录，"进当前待办的那一跳"永远是灰的。
+  private async collectPath(flow: any, nodeId: string, active: string[],
     history: string[], edges: string[], visited: Set<string>,
     vars: Record<string, any>, historyTasks: any[]): Promise<void> {
     if (visited.has(nodeId)) return
     visited.add(nodeId)
-    if (edgeName && !edges.includes(edgeName)) edges.push(edgeName)
     const src = (flow.nodes ?? []).find((n: any) => n.id === nodeId)
     for (const e of flow.edges ?? []) {
       if (e.sourceNodeId !== nodeId) continue
@@ -981,12 +983,13 @@ export class JeeflowFacade {
         const expr = e.properties?.expr
         if (expr && !await this.evalDecisionExpr(flow, src, expr, vars, historyTasks)) continue
       }
+      if (e.id && !edges.includes(e.id)) edges.push(e.id)
       const target = (flow.nodes ?? []).find((n: any) => n.id === e.targetNodeId)
       if (!target) continue
       const tid = target.id
       if (!active.includes(tid) && !history.includes(tid)) history.push(tid)
-      if (active.includes(tid)) continue
-      await this.collectPath(flow, tid, e.id, active, history, edges, visited, vars, historyTasks)
+      if (active.includes(tid)) continue // 遇活跃节点停止深入（边名已在上面收录）
+      await this.collectPath(flow, tid, active, history, edges, visited, vars, historyTasks)
     }
   }
 

@@ -251,6 +251,36 @@ describe('jeeflow compliance tests', () => {
     assert.ok(hl.historyNodeNames.includes('task3'), JSON.stringify(hl))
   })
 
+  it('03.6 指向活跃节点的那一跳也要进高亮（issues/157）', async () => {
+    // 与 03.5 唯一区别＝停在分支上（task2 活跃）；边名收录绑在递归实参上时 e3 收不到
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, undefined)
+    const def = loadFlow(repo, '03-decision-expr.json')
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant', { amount: 5000 })
+    let doing = await repo.findDoingTasks(inst.id)
+    for (const t of doing) {
+      if (t.taskName === 'task1') {
+        await repo.addTaskActor(t.id, ['leader'])
+        t.actorIds.push('leader')
+        await engine.executeProcessTask(t.id, 'leader')
+      }
+    }
+    doing = await repo.findDoingTasks(inst.id)
+    assert.deepEqual(doing.map(t => t.taskName), ['task2'], JSON.stringify(doing))
+
+    const r = await facade.flow('processInstance/highLight', { id: inst.id })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    const hl = r.data
+    assert.ok(hl.activeNodeNames.includes('task2'), JSON.stringify(hl))
+    assert.ok(hl.historyEdgeNames.includes('e3'), '指向活跃节点 task2 的分支边 e3 没进高亮 ' + JSON.stringify(hl))
+    for (const e of ['e0', 'e_apply_1', 'e2']) {
+      assert.ok(hl.historyEdgeNames.includes(e), '线性腿边名缺失 ' + e + ' ' + JSON.stringify(hl))
+    }
+    assert.ok(!hl.historyEdgeNames.includes('e4'), '没走的分支边不应高亮 ' + JSON.stringify(hl))
+    assert.ok(!hl.historyEdgeNames.includes('e5'), '活跃节点的出边不应高亮 ' + JSON.stringify(hl))
+    assert.ok(!hl.historyNodeNames.includes('task3'), JSON.stringify(hl))
+  })
+
   it('05-1 三个 detail 返回 jsonObject', async () => {
     const { engine, repo } = setup()
     const facade = new JeeflowFacade(engine, repo, undefined)
