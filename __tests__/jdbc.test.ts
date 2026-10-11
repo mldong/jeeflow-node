@@ -364,6 +364,12 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
       const st = await repo.findDefineById(def.id)
       assert.equal(st?.state, 0, 'updateDefineState 生效')
 
+      // audit8 R5：停用态经 updateDefine 整对象回写后仍为 0（修复前 `|| 1` 兜底把 state==0 复活成 1）
+      st!.displayName = 'CRUD 流程 v3'
+      await repo.updateDefine(st!)
+      const st2 = await repo.findDefineById(def.id)
+      assert.equal(st2?.state, 0, `updateDefine 后停用态应保持 0, got ${st2?.state}`)
+
       await repo.removeDefine(def.id)
       assert.equal(await repo.findDefineById(def.id), null, 'removeDefine 删除')
     } finally {

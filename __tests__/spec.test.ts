@@ -1330,6 +1330,41 @@ describe('jeeflow compliance tests', () => {
     const r6 = await facade.flow('processDesign/redeploy', { id: designId, operator: 'zhangsan' })
     assert.equal(r6.code, 0, JSON.stringify(r6))
     assert.equal((await repo.findDefineById(defineId2))?.version, 5)
+
+    // audit8 R5：同替换语义，state 也必须保持——停用后再 redeploy 不得被复活
+    const r7 = await facade.flow('processDefine/upAndDown', { id: defineId2, state: 0 })
+    assert.equal(r7.code, 0, JSON.stringify(r7))
+    const r8 = await facade.flow('processDesign/redeploy', { id: designId, operator: 'zhangsan' })
+    assert.equal(r8.code, 0, JSON.stringify(r8))
+    const defAfter = await repo.findDefineById(defineId2)
+    assert.equal(defAfter?.state, 0, `designRedeploy 后 state 应保持停用 0, got ${defAfter?.state}`)
+    assert.equal(defAfter?.version, 5, `designRedeploy 后 version 仍应保持 5, got ${defAfter?.version}`)
+  })
+
+  it('21b processDefine/redeploy 原地替换保留 version/state（audit8 R5/spec 06）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+
+    // 二次部署造 version=1（首次 0）
+    const r1 = await facade.flow('processDefine/deploy', { content })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const r2 = await facade.flow('processDefine/deploy', { content })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    const defineId = String(r2.data.processDefineId)
+    assert.equal((await repo.findDefineById(defineId))?.version, 1)
+
+    // 停用后再 redeploy → version 保持 1、state 保持停用 0
+    // （修复前：门面硬编码 state:1/version:0，整对象覆盖把停用态复活、版本打回）
+    const r3 = await facade.flow('processDefine/upAndDown', { id: defineId, state: 0 })
+    assert.equal(r3.code, 0, JSON.stringify(r3))
+    const r4 = await facade.flow('processDefine/redeploy',
+      { processDefineId: defineId, content, operator: 'lisi' })
+    assert.equal(r4.code, 0, JSON.stringify(r4))
+    const d = await repo.findDefineById(defineId)
+    assert.equal(d?.version, 1, `redeploy 后 version 应保持 1, got ${d?.version}`)
+    assert.equal(d?.state, 0, `redeploy 后 state 应保持停用 0, got ${d?.state}`)
+    assert.equal(d?.updateUser, 'lisi')
   })
 
   it('22 表单数据契约 formData/taskFormData/审批记录 ext（issues/15）', async () => {

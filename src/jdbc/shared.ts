@@ -185,13 +185,15 @@ export class JdbcRepository implements ProcessRepository {
   }
 
   async updateDefine(define: ProcessDefine): Promise<void> {
+    // audit8 R5：update 路径零值不再兜底成 1——0 是合法取值（停用态/版本 0），
+    // `|| 1` 会把停用定义复活、把原版本号打回 1；缺省（null/undefined）才回落 1
     const conn = await this.c()
     try {
       await conn.execute(this.sql(
         'UPDATE wf_process_define SET name=?, display_name=?, type=?, state=?, content=?, ' +
         'version=?, update_time=?, update_user=? WHERE id=?'),
-        [define.name, define.displayName, define.type, define.state || 1,
-          define.content, define.version || 1, new Date(), define.updateUser, define.id])
+        [define.name, define.displayName, define.type, define.state ?? 1,
+          define.content, define.version ?? 1, new Date(), define.updateUser, define.id])
     } finally {
       await this.done(conn)
     }

@@ -447,10 +447,15 @@ export class JeeflowFacade {
       // （`String(err)`/`err.toString()` 都不含 cause，见 flow() 顶层 catch 的注释）。
       throw new Error('读取流程定义 JSON 失败', { cause: e })
     }
+    // audit8 R5/spec 06：redeploy 是原地替换内容——先读再写保留原 state/version
+    // （硬编码 state:1/version:0 会把停用定义复活、把原版本号打回 0）
+    const old = await this.repo.findDefineById(defineId)
     await this.repo.updateDefine({
       id: defineId, name: flow?.name ?? '', displayName: flow?.displayName ?? '',
-      type: flow?.type ?? 'approval', state: 1, content, version: 0,
-      createTime: new Date(), createUser: '', updateTime: new Date(),
+      type: flow?.type ?? 'approval', content,
+      state: old?.state ?? 1, version: old?.version ?? 1,
+      createTime: old?.createTime ?? new Date(), createUser: old?.createUser ?? '',
+      updateTime: new Date(),
       updateUser: String(args.operator ?? 'system'),
     })
   }
