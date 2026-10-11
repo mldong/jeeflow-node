@@ -7012,6 +7012,29 @@ describe('issues/142 B 批 归属值写侧归一（spec 06 §2.11）：两形同
     assert.equal(sql.ccUpdates().length, after, `空 operator 一条 UPDATE 都不许发，实多发 ${sql.ccUpdates().length - after} 条`)
   })
 
+  it('B11 updateCcStatus 门面腿 · operator 过归一单点后再交仓储（issues/172：spy 记到的必须是给仓储的那一个值）', async () => {
+    // 两仓第二层（memory.ts / jdbc/shared.ts 的 normalizeActorValue + no-op）会把门面漏掉的归一
+    // 掩住 ⇒ 上面那格钉的是仓储层，**门面腿缺没缺 HTTP 面照不出**（issues/172 §2.2）。这里用
+    // spy 钉第一层：门面交给仓储的 operator 本身就必须是归一值（java 同构
+    // `normalizeActor(operatorArg(args))`）。还原病灶（改回 `operatorArg(args)`）这三条断言会红。
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const seen: string[] = []
+    const orig = repo.updateCcStatus.bind(repo)
+    ;(repo as any).updateCcStatus = async (iid: string, actor: string) => { seen.push(String(actor)); return orig(iid, actor) }
+
+    // 三档：带前后空白 / 显式空串 / 缺键（后者走 operatorArg 的 user1 回落——issues/129 案 A 行为，不动）
+    const r1 = await facade.flow('processInstance/updateCCStatus', { processInstanceId: '900701', operator: ' 8601 ' })
+    const r2 = await facade.flow('processInstance/updateCCStatus', { processInstanceId: '900701', operator: '' })
+    const r3 = await facade.flow('processInstance/updateCCStatus', { processInstanceId: '900701' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    assert.equal(r3.code, 0, JSON.stringify(r3))
+    assert.deepEqual(seen, ['8601', 'user1', 'user1'],
+      '门面交给仓储的 operator 必须是归一值（trim；空白/缺键回落 user1）——原样交出＝"两层都挡"的第一层交白卷')
+  })
+
+
   it('B11 判据单点复用 · 任务腿与 cc 腿走同一枚函数（严禁第二份判据），旧导出名是别名不是转发实现', async () => {
     // 别名＝**同一个函数对象**（不是"再抄一份"）。§2.11 尾注点名本栈的归一单点是
     // `spi.normalizeCcActors` ⇒ 升通用名走"新增 normalizeActors ＋ 旧名转发"，导出面不破、判据只一枚。

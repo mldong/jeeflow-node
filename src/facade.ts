@@ -904,7 +904,15 @@ export class JeeflowFacade {
         const flow = JSON.parse(toStr(def.content))
         nodeProgress = await this.buildNodeProgress(flow, his)
         await this.collectPath(flow, 'start', active, history, edges, new Set(), inst.variables ?? {}, his)
-      } catch { /* ignore */ }
+      } catch (e) {
+        // issues/162（口径＝保留降级面＋落一条可诊断日志，形状照 jeeflow-go v1.8.43 那枚）：
+        // 坏定义只降级模型补全腿（边集/节点补全/nodeProgress 留空，实例与任务行不受影响、
+        // 对外仍 code=0），但不再一声不吭地吞掉——这条静默通道先后藏住过 156（php）与
+        // 160（python）两个真分叉。日志三件齐（实例号/定义号/原因），缺一件等于没落。
+        console.error(
+          `[jeeflow] WARN highLight 模型补全腿解码失败，边集/节点补全/nodeProgress 已降级（实例与任务行不受影响）: instanceId=${instanceId}, defineId=${inst.defineId}, err=${e}`
+        )
+      }
     }
     return { activeNodeNames: active, historyNodeNames: history, historyEdgeNames: edges, nodeProgress }
   }
@@ -1060,7 +1068,12 @@ export class JeeflowFacade {
 
   private async updateCCStatus(args: Record<string, any>): Promise<void> {
     const instanceId = toId(args.processInstanceId)
-    const operator = operatorArg(args)
+    // issues/142 B 批（spec 06 §2.11 写点表第四行「operator 入参归一后再比」漏收口）＋ issues/172：
+    // 逐字对齐 java `normalizeActor(operatorArg(args))`——`operatorArg` 只判空不落 trim
+    // （`s.trim() !== '' ? s : 'user1'` 交出的仍是原串，`" 8601 "` 原样过关），门面这一层
+    // 再补 `spi.normalizeActorValue`（trim；哨兵 `"0"` 是非空串照收），然后才交仓储做第二道兜底。
+    // 两仓第二层归一（memory.ts / jdbc/shared.ts）会把缺的这一层掩住，故门面腿单点 spy 钉它。
+    const operator = normalizeActorValue(operatorArg(args))
     await this.repo.updateCcStatus(instanceId, operator)
   }
 
