@@ -53,7 +53,7 @@ const repo = new JdbcRepository(new MysqlAdapter(pool))  // 关系表主键用�
 
 仓储方法自动映射 `wf_*` 5 张表（spec §2）。`content` 为流程定义 JSON，`variable` 为变量 JSON。
 
-**事务（spec §7.4）**：`withTx` 用 `AsyncLocalStorage` 把事务连接绑定到当前异步上下文，回调内所有仓储调用走同一连接；异常自动回滚：
+**事务（spec/12）**：`withTx` 用 `AsyncLocalStorage` 把事务连接绑定到当前异步上下文，回调内所有仓储调用（含扩展仓储）走同一连接；异常自动回滚；**嵌套 `withTx`／引擎 `inTx` 并入外层**（不双开、不提前提交，回滚归最外层）：
 
 ```ts
 await repo.withTx(async () => {
@@ -62,7 +62,11 @@ await repo.withTx(async () => {
 })
 ```
 
-> 约定：**业务层是事务 owner**——先 `withTx` 再调引擎方法，引擎核心不感知事务。
+> 事务归属（1.8.45 起，audit8 145-2）：**引擎入口与门面动作已自带事务包裹**——`JeeflowFacade.flow()`
+> 一次 action 内的主仓/扩展仓/persist 写处于同一笔事务，中途失败整体回滚；仓储无 `withTx`
+> （内存仓）时显式降级裸跑。业务层仍可自行 `withTx` 外包（并入同一笔；宿主外包时按
+> spec/12 §12.2 把非成功出口转成抛出）。集成方自研 `DynamicTableWriter` 用
+> `transactionAwarePool(pool)` 包池即并入引擎事务（无事务时原样回落本池）。
 
 ## UserProvider（可选）
 
