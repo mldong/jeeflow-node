@@ -94,6 +94,9 @@ export interface Engine {
   executeAndJumpToEnd(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
   executeAndJumpTask(taskId: string, operator: string, args: Record<string, any>, targetTaskName?: string): Promise<ProcessInstance>
   executeAndJumpToFirstTaskNode(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
+  /** 事务包裹（audit8 145-2 / spec/12 §12.2）：仓储有事务载体则并入（嵌套经 withTx 的 join 支），
+   *  无（内存仓）则裸跑＝显式降级（§12.1 原则 4）。门面动作级包裹也走这一枚。 */
+  inTx<T>(fn: () => Promise<T>): Promise<T>
 }
 
 /**
@@ -352,9 +355,23 @@ export class EngineImpl implements Engine {
     }
   }
 
+  // ─── 事务（audit8 145-2 / spec/12 §12.2）───────────────────────────────────
+
+  /** 事务包裹：有事务载体（JDBC `withTx`）则整段并入外层/自开一段；无（内存仓）裸跑。
+   *  引擎入口包裹与门面动作级包裹都走这一枚 —— 嵌套调用由 withTx 的 join 支并入最外层。 */
+  async inTx<T>(fn: () => Promise<T>): Promise<T> {
+    return this.repo.withTx ? this.repo.withTx(fn) : fn()
+  }
+
   // ─── Start ─────────────────────────────────────────────────────────────────
 
   async startProcessInstanceById(defineId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
+    // audit8 145-2①：入口级包裹——直连引擎的调用方也拿到"一次动作一笔原子"（spec/12 §12.2）。
+    // 门面动作级包裹在流内再调本入口时，经 withTx join 支并入同一段事务（不双开）。
+    return this.inTx(() => this.startProcessInstanceByIdInner(defineId, operator, args))
+  }
+
+  private async startProcessInstanceByIdInner(defineId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
     const def = await this.repo.findDefineById(defineId)
     if (!def) throw new Error(`define not found: ${defineId}`)
     const content = typeof def.content === 'string' ? def.content : new TextDecoder().decode(def.content as Uint8Array)
@@ -395,6 +412,11 @@ export class EngineImpl implements Engine {
   // ─── Execute ───────────────────────────────────────────────────────────────
 
   async executeProcessTask(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
+    // audit8 145-2①：入口级包裹（同 startProcessInstanceById 注释）
+    return this.inTx(() => this.executeProcessTaskInner(taskId, operator, args))
+  }
+
+  private async executeProcessTaskInner(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
     const { task, inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
     // issues/127 / 规范 11 §11.7「办理时抄送」腿的统一出口：任务更新已在 prepareExecuteTask
     // 落库，此处建 cc 行并逐人 fire CC_CREATE(4)，再回读实例。
@@ -514,6 +536,11 @@ export class EngineImpl implements Engine {
   // ─── Reject ────────────────────────────────────────────────────────────────
 
   async executeAndJumpToEnd(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
+    // audit8 145-2①：入口级包裹（同 startProcessInstanceById 注释）
+    return this.inTx(() => this.executeAndJumpToEndInner(taskId, operator, args))
+  }
+
+  private async executeAndJumpToEndInner(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
     const { inst } = await this.prepareExecuteTask(taskId, operator, args)
     // 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
     inst.reject(new Date())
@@ -527,6 +554,11 @@ export class EngineImpl implements Engine {
   // ─── Jump（ROLLBACK 空 target / JUMP 命名 target，boot2 executeAndJumpTask）────
 
   async executeAndJumpTask(taskId: string, operator: string, args: Record<string, any> = {}, targetTaskName?: string): Promise<ProcessInstance> {
+    // audit8 145-2①：入口级包裹（同 startProcessInstanceById 注释）
+    return this.inTx(() => this.executeAndJumpTaskInner(taskId, operator, args, targetTaskName))
+  }
+
+  private async executeAndJumpTaskInner(taskId: string, operator: string, args: Record<string, any> = {}, targetTaskName?: string): Promise<ProcessInstance> {
     const { task, inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
     if (!targetTaskName) {
       // issues/121 P2：ROLLBACK 走血缘版——复活 task.parentTaskId 指的那条历史行，
@@ -550,6 +582,11 @@ export class EngineImpl implements Engine {
   // ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）────────────
 
   async executeAndJumpToFirstTaskNode(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
+    // audit8 145-2①：入口级包裹（同 startProcessInstanceById 注释）
+    return this.inTx(() => this.executeAndJumpToFirstTaskNodeInner(taskId, operator, args))
+  }
+
+  private async executeAndJumpToFirstTaskNodeInner(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
     const { inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
     // 找到第一个任务节点，强制参与者为发起人，重新执行
     const startNode = findNodeByType(flow, TypeStart)

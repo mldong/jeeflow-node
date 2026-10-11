@@ -44,8 +44,38 @@ const DEFINE_WHITELIST = new Set([
   't.create_time', 't.update_time',
 ])
 
-// 当前异步上下文绑定的事务连接
-const txStore = new AsyncLocalStorage<SqlConnection>()
+// 当前异步上下文绑定的事务连接。
+// audit8 145-2：**导出**——ext.ts 必须共用这一枚（此前它自带第二枚且从不 run，扩展写腿
+// 永远逃逸出引擎事务）。集成方写腿也可经 currentTxConnection/transactionAwarePool 并入。
+export const txStore = new AsyncLocalStorage<SqlConnection>()
+
+/** 当前事务连接（无事务 ⇒ null）。集成方自研写腿（如 DynamicTableWriter 的 MySQL 实现）
+ *  用它并入引擎事务——spec/12 §12.2 覆盖面：一次动作内所有写腿取同一条连接。 */
+export function currentTxConnection(): SqlConnection | null {
+  return txStore.getStore() ?? null
+}
+
+/**
+ * 事务感知池包装（145-2 / C99 ⑥ 集成侧写腿的并入通道）：
+ * 有活动事务时把 execute/query 路由到**事务连接**（适配器 raw 驱动的同名方法，返回形状不变）；
+ * 无事务时原样回落被包的池。与 java `TransactionAwareDataSources.transactionAware` 同一动机，
+ * 包在装配点、调用方零改动。约定 SqlConnection 实现的 `raw` 暴露底层驱动对象（两适配器均满足）。
+ */
+export function transactionAwarePool<P extends { execute: (...a: any[]) => any; query: (...a: any[]) => any }>(pool: P): P {
+  return new Proxy(pool, {
+    get(target: P, prop: string | symbol, receiver: unknown): unknown {
+      if (prop === 'execute' || prop === 'query') {
+        return (...a: any[]) => {
+          const tx = txStore.getStore() as { raw?: Record<string, (...args: any[]) => any> } | undefined
+          const raw = tx?.raw
+          if (raw && typeof raw[prop] === 'function') return raw[prop](...a)
+          return (target as any)[prop](...a)
+        }
+      }
+      return Reflect.get(target, prop, receiver)
+    },
+  })
+}
 
 /** 默认 ID 生成器：时间戳毫秒 + 同毫秒递增序号（对齐 Java nextId 默认实现）——
  *  issue 38 E9：返回 string（数字值在 2^53 内精确，转字符串统一承载） */
@@ -115,6 +145,9 @@ export class JdbcRepository implements ProcessRepository {
   // ── 事务（spec §7.4：AsyncLocalStorage 绑定连接）─────────────────────────
 
   async withTx<T>(fn: () => Promise<T>): Promise<T> {
+    // audit8 145-2③（spec/12 §12.2 归属面）：已有活动事务 ⇒ **并入**（不再开第二段事务、
+    // 不提前提交；提交/回滚归最外层）——引擎入口包裹与门面动作级包裹嵌套时落这一支。
+    if (txStore.getStore()) return fn()
     const conn = await this.adapter.acquire()
     try {
       await conn.begin()

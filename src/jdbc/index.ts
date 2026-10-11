@@ -8,6 +8,9 @@ export {
   TsIDGenerator,
   convertPlaceholder,
   repeatPh,
+  // audit8 145-2：集成侧写腿并入引擎事务的两个公开入口（C99 ⑥ node 腿）
+  currentTxConnection,
+  transactionAwarePool,
   type SqlAdapter,
   type SqlConnection,
 } from './shared.js'

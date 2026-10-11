@@ -210,6 +210,9 @@ export interface TaskStatsRow {
 }
 
 export interface ProcessRepository {
+  /** 事务载体（audit8 145-2，spec/12 §12.2）——JDBC 仓储天然实现（AsyncLocalStorage）；
+   *  内存仓没有此方法 ⇒ 引擎 inTx 显式降级裸跑（§12.1 原则 4）。 */
+  withTx?<T>(fn: () => Promise<T>): Promise<T>
   findDefineById(id: string): Promise<ProcessDefine | null>
   // findDefineByName 按流程编码查最新一条定义（v1.1.0，Facade deploy 版本管理用）
   findDefineByName(name: string): Promise<ProcessDefine | null>

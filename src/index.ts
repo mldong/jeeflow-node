@@ -32,6 +32,9 @@ export {
 
 // issues/35：包导出面补齐——门面/扩展类型/扩展仓储（集成方组装完整引擎链）
 export { JeeflowFacade } from './facade.js'
+// audit8 145-2：集成侧写腿并入引擎事务的两个公开入口——集成方自研 DynamicTableWriter
+// （如 nestjs 壳的 MysqlDynamicTableWriter）用 transactionAwarePool 包池即可并入同一条连接。
+export { currentTxConnection, transactionAwarePool } from './jdbc/shared.js'
 // issues/132 §11.3：码表重排后 EventType 必须能从包门面 value-import——
 // `./extensions` 子路径不在 exports map 里（集成层此前只能在自己仓镜像一份数字码，
 // nestjs 壳 wf-message.listener.spec.ts 就是这么写的），拿规范名分派的契约要求

@@ -2,16 +2,16 @@
 //
 // 与 shared.ts 同一套 SqlAdapter / 占位符约定；分页为单表简单过滤（filters 字段名 EQ）。
 
-import { AsyncLocalStorage } from 'node:async_hooks'
 import {
   ProcessDesign, ProcessDesignHis, ProcessSurrogate,
 } from '../model.js'
 import type { IDGenerator, ProcessExtRepository, QueryCondition } from '../spi.js'
 import { isBlankOwnership, isBlankValue } from '../spi.js'
-import { TsIDGenerator, rowId, type SqlAdapter, type SqlConnection } from './shared.js'
+import { TsIDGenerator, rowId, txStore, type SqlAdapter, type SqlConnection } from './shared.js'
 import { surrogateIsEffective, surrogateTimeMs, surrogateHydrateEnabled } from '../surrogate-rule.js'
 
-const txStore = new AsyncLocalStorage<SqlConnection>()
+// audit8 145-2②：与主仓共用同一枚 AsyncLocalStorage（此前这里自带第二枚且从不 run ⇒
+// 扩展写腿即使外面开着事务也永远逃逸）。共一枚后 `c()` 在事务内取到引擎事务连接。
 
 export class JdbcProcessExtRepository implements ProcessExtRepository {
   constructor(

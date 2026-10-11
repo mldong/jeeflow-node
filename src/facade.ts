@@ -241,7 +241,11 @@ export class JeeflowFacade {
 
   async flow(action: string, args: Record<string, any> = {}): Promise<Record<string, any>> {
     try {
-      const data = await this.dispatch(action, args)
+      // audit8 145-2（spec/12 §12.2）：事务边界＝一次动作——门面自组复合写（startAndExecute 的
+      // start＋参与者写＋execute、deploy 的 define＋design 两拍等）与引擎入口写同处一事务；
+      // 入口内包裹嵌套并入（withTx join 支）。信封在事务之外生成：中途异常先整体回滚，
+      // 再由下面的 catch 组装失败信封（宿门外包硬义务形状）。
+      const data = await this.inTx(() => this.dispatch(action, args))
       return { code: 0, msg: '成功', data: data ?? null }
     } catch (e: any) {
       // issues/137 §3-1（spec 06 §2.12）：判别规则与理由见 isForeignDetail——引擎写的中文契约文案
@@ -256,6 +260,11 @@ export class JeeflowFacade {
       }
       return { code: 99999999, msg: e?.message ?? String(e) }
     }
+  }
+
+  /** 事务包裹（audit8 145-2）：engine 缺省（纯统计门面用法）时裸跑＝显式降级。 */
+  private async inTx<T>(fn: () => Promise<T>): Promise<T> {
+    return this.engine ? this.engine.inTx(fn) : fn()
   }
 
   private async dispatch(action: string, args: Record<string, any>): Promise<any> {
