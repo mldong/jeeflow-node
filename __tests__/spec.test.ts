@@ -3990,7 +3990,9 @@ describe('issues/129 operator 空档两层收口（门面归一化 + 仓储归�
   const NOBODY = 'n129-nobody'  // 对照档：谁都没有 ⇒ 必须 0 行（证明过滤真的生效，不是恒定放行）
 
   // 夹具行数刻意做成 ME ≠ OTHER ≠ 全库，且 ME 档非空——否则"0 == 0"是自等假绿
-  const N = { meInst: 3, otherInst: 5, meTodo: 2, otherTodo: 3, meCc: 2, otherCc: 3 }
+  // meDone/otherDone：R10（issues/176）起 apply 行 operator=flow.auto、不再进发起人已办 ⇒
+  // 已办行必须由 ME/OTHER 真办结 task1 现造；取值保证四出口 me≠other 且 two 档都非 0
+  const N = { meInst: 3, otherInst: 5, meTodo: 3, meDone: 2, otherTodo: 3, otherDone: 1, meCc: 2, otherCc: 3 }
 
   /**
    * 本组专用装配：idGen 换成**严格递增**的发号器。
@@ -4020,7 +4022,8 @@ describe('issues/129 operator 空档两层收口（门面归一化 + 仓储归�
     assert.equal(dep.code, 0, JSON.stringify(dep))
     const defineId = dep.data.processDefineId
 
-    // 实例：startAndExecute 会自动办结 apply（t.operator=发起人）⇒ 顺带造出「我已办」行
+    // 实例：startAndExecute 自动办结 apply。R10（issues/176）起 apply 行 t.operator=flow.auto
+    // ⇒ 不再顺带产出「我已办」行；已办行改由下面真办结 task1 现造（operator=真人）
     const mine: string[] = []
     const theirs: string[] = []
     for (let i = 0; i < N.meInst; i++) {
@@ -4049,6 +4052,15 @@ describe('issues/129 operator 空档两层收口（门面归一化 + 仓储归�
     // 抄送：各占不同实例 ⇒ cc 全库行数 = meCc + otherCc
     for (const id of mine.slice(0, N.meCc)) await repo.createCcInstance(id, ME, ME)
     for (const id of theirs.slice(0, N.otherCc)) await repo.createCcInstance(id, OTHER, OTHER)
+    // 已办：ME/OTHER 各真办结 N.meDone/N.otherDone 个自己的 task1（operator=真人 ⇒ 进各自已办）
+    for (const taskId of mineTodoTasks.slice(0, N.meDone)) {
+      const r = await facade.flow('processTask/execute', { processTaskId: taskId, operator: ME })
+      assert.equal(r.code, 0, JSON.stringify(r))
+    }
+    for (const taskId of theirsTodoTasks.slice(0, N.otherDone)) {
+      const r = await facade.flow('processTask/execute', { processTaskId: taskId, operator: OTHER })
+      assert.equal(r.code, 0, JSON.stringify(r))
+    }
 
     const all = repo.allTasks()
     return {
@@ -4073,13 +4085,13 @@ describe('issues/129 operator 空档两层收口（门面归一化 + 仓储归�
       },
       {
         action: 'processTask/todoList', col: 'pta.actor_id',
-        me: N.meTodo, other: N.otherTodo, library: f.libDoing,
+        me: N.meTodo - N.meDone, other: N.otherTodo - N.otherDone, library: f.libDoing,
         rows: async (args: Record<string, any>) => (await f.facade.flow('processTask/todoList', { pageSize: 100, ...args })).data.rows,
         isMine: (r: any) => f.mineTodoTasks.includes(String(r.id)),
       },
       {
         action: 'processTask/doneList', col: 't.operator',
-        me: N.meInst, other: N.otherInst, library: f.libDone,
+        me: N.meDone, other: N.otherDone, library: f.libDone,
         rows: async (args: Record<string, any>) => (await f.facade.flow('processTask/doneList', { pageSize: 100, ...args })).data.rows,
         isMine: (r: any) => String(r.operator) === ME,
       },
@@ -4145,8 +4157,8 @@ describe('issues/129 operator 空档两层收口（门面归一化 + 仓储归�
     }
     // 对照：非空归属值照常（证明"空页"没把四个分页一起做废）
     assert.equal((await f.repo.pageInstances(1, 100, ME)).rows.length, N.meInst)
-    assert.equal((await f.repo.pageTodoTasks(1, 100, ME)).rows.length, N.meTodo)
-    assert.equal((await f.repo.pageDoneTasks(1, 100, ME)).rows.length, N.meInst)
+    assert.equal((await f.repo.pageTodoTasks(1, 100, ME)).rows.length, N.meTodo - N.meDone)
+    assert.equal((await f.repo.pageDoneTasks(1, 100, ME)).rows.length, N.meDone)
     assert.equal((await f.repo.pageCcInstances(1, 100, ME)).rows.length, N.meCc)
   })
 
