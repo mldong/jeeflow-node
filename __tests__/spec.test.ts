@@ -7905,3 +7905,87 @@ describe('issues/177 candidate field fallback', () => {
       `顶层 candidateUsers 应压过 field 内版本、groups 仍兜底: ${got}`)
   })
 })
+
+// ─── issues/178 R12 · 门面 candidatePage 候选映射链（findById→getUser→兜底）＋行键 id 三级回落 ─────
+// 形状照 java JeeflowFacade.java:945-1012；三档对齐 issues/178 §4.1：
+//   档① 仅 findById（命中）：行 id/realName/userId/deptName 取 findById 值，且压过 getUser；
+//      档①b findById 无 id 键（有 userId）：id 走 src.userId 回落；异步 fn 形态同判；
+//   档② 无 findById 有 getUser：realName/deptName 取 getUser，id 走 src.userId 回落；
+//   档③ 双无：兜底 id==actor、realName==id（回归档，改前行为）。
+describe('issues/178 candidate chain + row key', () => {
+  function i178Flow(): string {
+    return JSON.stringify({
+      name: 'i178-cand-chain', displayName: 'i178候选链', type: 'approval',
+      nodes: [
+        { id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } },
+        { id: 'apply', type: 'snaker:task', properties: { assignee: 'applicant', performType: 0 }, text: { value: '发起' } },
+        { id: 'review', type: 'snaker:task', properties: { assignee: 'leader', candidateUsers: 'u100', performType: 0 }, text: { value: '审核' } },
+        { id: 'end', type: 'snaker:end', properties: {}, text: { value: '结束' } },
+      ],
+      edges: [
+        { id: 'e0', sourceNodeId: 'start', targetNodeId: 'apply', properties: {} },
+        { id: 'e1', sourceNodeId: 'apply', targetNodeId: 'review', properties: {} },
+        { id: 'e2', sourceNodeId: 'review', targetNodeId: 'end', properties: {} },
+      ],
+    })
+  }
+
+  async function i178Setup(userProv?: UserProvider): Promise<{ facade: JeeflowFacade; taskId: string }> {
+    const repo = new MemoryRepository()
+    const idGen = mkSeqIdGen()
+    const exprEval: ExpressionEvaluator = { async eval() { return false } }
+    const engine = new EngineImpl(repo, userProv, idGen, exprEval)
+    const facade = new JeeflowFacade(engine, repo, undefined)
+    const r0 = await facade.flow('processDefine/deploy', { content: i178Flow() })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const def = await repo.findDefineByName('i178-cand-chain')
+    assert.ok(def, 'define should exist')
+    const inst = await engine.startProcessInstanceById(def!.id, 'user1')
+    const doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing[0].taskName, 'apply')
+    return { facade, taskId: String(doing[0].id) }
+  }
+
+  async function i178Row(facade: JeeflowFacade, taskId: string): Promise<Record<string, any>> {
+    const r = await facade.flow('processTask/candidatePage', { processTaskId: taskId })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    const rows = r.data.rows as Array<Record<string, any>>
+    assert.equal(rows.length, 1, JSON.stringify(rows))
+    return rows[0]
+  }
+
+  const i178UserProv: UserProvider = {
+    async getUser(userId) { return { userId, realName: '用户' + userId, deptName: '测试部门' } },
+  }
+  const i178MissProv: UserProvider = { async getUser() { return null } }
+
+  it('178 档① findById 命中压过 getUser（spec 06:728 优先级链）', async () => {
+    const { facade, taskId } = await i178Setup(i178UserProv)
+    facade.setUserSearchById(() => ({ id: 'U100', userId: 'U100', realName: '张三', deptName: '研发部' }))
+    const row = await i178Row(facade, taskId)
+    assert.deepEqual(row, { id: 'U100', realName: '张三', userId: 'U100', deptName: '研发部' },
+      `档①行应取 findById 真值（第二级真名「用户u100」不得出现）: ${JSON.stringify(row)}`)
+  })
+
+  it('178 档①b findById 无 id 键：id 走 src.userId 回落（异步 fn 形态）', async () => {
+    const { facade, taskId } = await i178Setup(i178UserProv)
+    facade.setUserSearchById(async () => ({ userId: 'U200', realName: '李四' }))
+    const row = await i178Row(facade, taskId)
+    assert.deepEqual(row, { id: 'U200', realName: '李四', userId: 'U200' },
+      `档①b 行 id 应回落 src.userId: ${JSON.stringify(row)}`)
+  })
+
+  it('178 档② 无 findById 有 getUser：realName/deptName 取 getUser', async () => {
+    const { facade, taskId } = await i178Setup(i178UserProv)
+    const row = await i178Row(facade, taskId)
+    assert.deepEqual(row, { id: 'u100', realName: '用户u100', userId: 'u100', deptName: '测试部门' },
+      `档②行应取 getUser: ${JSON.stringify(row)}`)
+  })
+
+  it('178 档③ 双无：兜底 id==actor、realName==id（回归档）', async () => {
+    const { facade, taskId } = await i178Setup(i178MissProv)
+    const row = await i178Row(facade, taskId)
+    assert.deepEqual(row, { id: 'u100', realName: 'u100', userId: 'u100' },
+      `档③行应兜底 actor: ${JSON.stringify(row)}`)
+  })
+})

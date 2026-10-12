@@ -30,6 +30,10 @@ const SUBMIT_COUNTERSIGN_DISAGREE = 20
 
 export type UserSearch = (query: Record<string, any>) => Promise<[Record<string, any>[], number]> | [Record<string, any>[], number]
 
+// 候选映射第一级钩子（issues/178 R12，可选）——candidatePage 模型候选映射第一级
+// （spec/06 §2.4 优先级：findById → getUser → 兜底）；未注入或未命中时回落 getUserProvider。
+export type UserSearchById = (userId: string) => Promise<Record<string, any> | null> | Record<string, any> | null
+
 // ═══ issues/137 §3-1（spec 06 §2.12）· 门面内部异常出口：固定文案 ＋「谁写的这段文案」判别式 ═══
 //
 // 门面顶层 catch 捕获到的异常**不是都能把 message 原样放进 msg**。判据是「这段文案是谁写的」：
@@ -205,6 +209,7 @@ export function isForeignDetail(
 
 export class JeeflowFacade {
   private userSearch?: UserSearch
+  private userSearchById?: UserSearchById
   private orgProv?: OrgUserProvider
 
   private metaReader?: { readByProcessInstance(tableName: string, processInstanceId: unknown): unknown }
@@ -230,6 +235,12 @@ export class JeeflowFacade {
   // 注入用户搜索钩子（candidatePage 无模型候选时的用户分页搜索）
   setUserSearch(fn: UserSearch): this {
     this.userSearch = fn
+    return this
+  }
+
+  // 注入候选映射第一级钩子（issues/178 R12；可选，未注入回落 getUserProvider）
+  setUserSearchById(fn: UserSearchById): this {
+    this.userSearchById = fn
     return this
   }
 
@@ -1186,14 +1197,51 @@ export class JeeflowFacade {
       } catch { /* ignore */ }
     }
     if (candidates.length > 0) {
-      // issues/80：行键对齐前端 UserSelect（valueField='id'）——补 id 键，保留 userId 兼容旧消费方
-      const rows = candidates.map(c => ({ id: c, userId: c, realName: c }))
+      // issues/178 R12（spec 06:728 优先级链，形状照 java JeeflowFacade.java:945-1012）：
+      // 第一级 userSearchById（findById）→ 第二级 engine.getUserProvider().getUser → 兜底；
+      // 修前恒兜底 {c,c,c}（provider 真名被丢，C99 ⑩ 派 3）。
+      const up = this.engine ? this.engine.getUserProvider() : undefined
+      const rows: Array<Record<string, any>> = []
+      for (const c of candidates) {
+        let src: Record<string, any> | null = null
+        if (this.userSearchById) {
+          try {
+            src = await this.userSearchById(c)
+          } catch { src = null }
+        }
+        if (!src && up) {
+          try {
+            const u = await up.getUser(c)
+            if (u) {
+              src = { userId: u.userId, realName: u.realName }
+              if (u.deptName) src.deptName = u.deptName
+            }
+          } catch { /* 单用户失败回落兜底 */ }
+        }
+        rows.push(this.candidateRow(c, src))
+      }
       return pageData(pageNum, pageSize, rows.length, rows)
     }
     // 无模型候选 → 用户分页搜索（依赖 userSearch 钩子）
     if (!this.userSearch) throw new Error('未配置 userSearch（用户搜索钩子）')
     const [rows, total] = await this.userSearch(args)
     return pageData(pageNum, pageSize, total, rows)
+  }
+
+  // candidatePage 候选行键归一（issues/178 R12；形状照 java :992-1012）：
+  // id=src.id→src.userId→actorId（一律字符串化）；realName=src.realName→id；
+  // userId/userName/deptName 仅在 src 给出时透传。src 为空＝两级都未命中 ⇒ 兜底 {actor, actor}。
+  private candidateRow(actorId: string, srcIn: Record<string, any> | null): Record<string, any> {
+    const src = srcIn ?? { userId: actorId, realName: actorId }
+    let id = actorId
+    if (src.id !== undefined && src.id !== null) id = String(src.id)
+    else if (src.userId !== undefined && src.userId !== null) id = String(src.userId)
+    const row: Record<string, any> = { id }
+    row.realName = src.realName !== undefined && src.realName !== null ? src.realName : id
+    if (src.userId !== undefined && src.userId !== null) row.userId = src.userId
+    if (src.userName !== undefined && src.userName !== null) row.userName = src.userName
+    if (src.deptName !== undefined && src.deptName !== null) row.deptName = src.deptName
+    return row
   }
 
   private async nextTaskCandidates(flow: any, taskName: string): Promise<string[]> {
