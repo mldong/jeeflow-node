@@ -1200,7 +1200,15 @@ export class JeeflowFacade {
     const result: string[] = []
     const visited = new Set<string>()
     const collect = async (node: any) => {
-      const v = node.properties?.candidateUsers
+      // issues/177 R11：顶层优先、`field` 子对象兜底（形状对齐 163 会签条件腿）
+      const props = node.properties ?? {}
+      const fld = props.field ?? {}
+      const propStr = (key: string): any => {
+        const top = props[key]
+        if (top) return top
+        return fld[key]
+      }
+      const v = propStr('candidateUsers')
       if (v) {
         for (const s of String(v).split(',')) {
           const t = s.trim()
@@ -1208,7 +1216,7 @@ export class JeeflowFacade {
         }
       }
       // candidateGroups：按角色取人（v1.6.0，对齐 boot4 GlobalCandidateHandler）
-      const g = node.properties?.candidateGroups
+      const g = propStr('candidateGroups')
       if (g && this.orgProv) {
         for (const rc of String(g).split(',')) {
           const role = rc.trim()

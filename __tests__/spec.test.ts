@@ -7842,3 +7842,66 @@ describe('issues/164 decision no-match errors', () => {
     )
   })
 })
+
+// ─── issues/177 R11 · 门面 candidatePage「field 子对象」候选兜底（对齐 issues/163 附带读形）────
+// 旧设计器把 candidateUsers / candidateGroups 写进 properties.field；门面 nextTaskCandidates
+// 只认顶层 ⇒ 候选恒空、回落 userSearch（未配置直接报错）。修后顶层优先、field 兜底。
+describe('issues/177 candidate field fallback', () => {
+  function i177Flow(topLevelUsers?: string): string {
+    const props: Record<string, any> = {
+      form: 'review-form', assignee: 'leader',
+      field: { candidateUsers: 'userA,userB', candidateGroups: 'finance' },
+    }
+    if (topLevelUsers) props.candidateUsers = topLevelUsers
+    return JSON.stringify({
+      name: 'i177-candidate-field', displayName: 'i177候选字段', type: 'approval',
+      nodes: [
+        { id: 'start', type: 'snaker:start', properties: {}, text: { value: '开始' } },
+        { id: 'apply', type: 'snaker:task', properties: { assignee: 'applicant', performType: 0 }, text: { value: '发起' } },
+        { id: 'review', type: 'snaker:task', properties: props, text: { value: '审核' } },
+        { id: 'end', type: 'snaker:end', properties: {}, text: { value: '结束' } },
+      ],
+      edges: [
+        { id: 'e0', sourceNodeId: 'start', targetNodeId: 'apply', properties: {} },
+        { id: 'e1', sourceNodeId: 'apply', targetNodeId: 'review', properties: {} },
+        { id: 'e2', sourceNodeId: 'review', targetNodeId: 'end', properties: {} },
+      ],
+    })
+  }
+
+  async function i177Candidates(topLevelUsers?: string): Promise<string[]> {
+    const repo = new MemoryRepository()
+    const idGen = mkSeqIdGen()
+    const exprEval: ExpressionEvaluator = { async eval() { return false } }
+    const engine = new EngineImpl(repo, undefined, idGen, exprEval)
+    const facade = new JeeflowFacade(engine, repo, undefined)
+    facade.setOrgProvider({
+      async findDeptLeaders() { return [] },
+      async findDeptMainLeaders() { return [] },
+      async findByRole(roleCode: string) { return roleCode === 'finance' ? ['finA', 'finB'] : [] },
+    })
+    const r0 = await facade.flow('processDefine/deploy', { content: i177Flow(topLevelUsers) })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const def = await repo.findDefineByName('i177-candidate-field')
+    assert.ok(def, 'define should exist')
+    // 直接启动（不自动完成 apply）→ apply 任务 → candidatePage 查 review 候选
+    const inst = await engine.startProcessInstanceById(def!.id, 'user1')
+    const doing = await repo.findDoingTasks(inst.id)
+    assert.equal(doing[0].taskName, 'apply')
+    const r = await facade.flow('processTask/candidatePage', { processTaskId: doing[0].id })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    return (r.data.rows as Array<{ userId?: string }>).map(x => x.userId!).sort()
+  }
+
+  it('177 ① field 内两键：candidateUsers/Groups 只写在 properties.field ⇒ 照读 4 候选', async () => {
+    const got = await i177Candidates()
+    assert.deepEqual(got, ['finA', 'finB', 'userA', 'userB'],
+      `field 内两键应读出 4 候选（改前恒 0 ⇒ 未配钩子直接报错）: ${got}`)
+  })
+
+  it('177 ② 顶层优先：顶层 candidateUsers 压过 field 内版本', async () => {
+    const got = await i177Candidates('userX')
+    assert.deepEqual(got, ['finA', 'finB', 'userX'],
+      `顶层 candidateUsers 应压过 field 内版本、groups 仍兜底: ${got}`)
+  })
+})
