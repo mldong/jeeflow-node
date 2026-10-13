@@ -65,4 +65,20 @@ describe('HandlerRegistry 清单（v1.4.0）', () => {
     assert.equal(r.listHandlers('AssignmentHandler').length, 7)
     assert.deepEqual(r.listHandlerNames(), [])
   })
+
+  it('类型清单 listHandlerTypes（issues/186 · audit8 R20 第四能力补齐）：去重、与 listHandlers 同口径', () => {
+    const r = new HandlerRegistry()
+    assert.deepEqual(r.listHandlerTypes(), ['AssignmentHandler'], '内置 7 条同型 ⇒ 去重后单类型（首次出现序）')
+
+    r.registerMeta('CandidateHandler', { name: 'com.example.CandidateProvider', displayName: '候选人提供者', order: 1 })
+    assert.deepEqual(r.listHandlerTypes(), ['AssignmentHandler', 'CandidateHandler'], '显式元数据类型入场（对齐 Java 参考口径）')
+
+    r.registerDecision('com.example.Decider', { decide: () => 'e1' })
+    assert.deepEqual(r.listHandlerTypes(), ['AssignmentHandler', 'CandidateHandler', 'DecisionHandler'],
+      '无元数据运行时注册的类型同样在场（与 listHandlers 的 name 兜底同口径）')
+
+    r.registerMeta('AssignmentHandler', { name: 'com.example.ExtraAssign', displayName: '额外参与者', order: 9 })
+    assert.deepEqual(r.listHandlerTypes(), ['AssignmentHandler', 'CandidateHandler', 'DecisionHandler'],
+      '同类型多枚 ⇒ 去重不重复')
+  })
 })

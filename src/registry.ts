@@ -141,4 +141,16 @@ export class HandlerRegistry {
   listHandlerNames(): string[] {
     return [...this.assignments.keys(), ...this.decisions.keys(), ...this.customs.keys()]
   }
+
+  /** 已注册的处理器类型清单（去重，首次出现序；issues/186 R20 第四能力补齐）——
+   *  类型在场 ⟺ 该类型下至少有一件清单项（对齐 Java `listHandlerTypes` 的注册表 keySet 口径：
+   *  显式元数据类型 ∪ 运行时注册所在类型；老数据无 type 按 AssignmentHandler 归类，与 listHandlers 一致） */
+  listHandlerTypes(): HandlerType[] {
+    const types = new Set<HandlerType>()
+    for (const m of this.metas.values()) types.add(m.type ?? 'AssignmentHandler')
+    if (this.assignments.size > 0) types.add('AssignmentHandler')
+    if (this.decisions.size > 0) types.add('DecisionHandler')
+    if (this.customs.size > 0) types.add('CustomHandler')
+    return [...types]
+  }
 }
