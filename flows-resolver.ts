@@ -12,7 +12,7 @@
 //
 // 放仓根（package.json files 只打包 dist，不进 npm 包）：demo 与 __tests__ 共用。
 
-import { readdirSync, readFileSync, writeFileSync, existsSync, statSync, rmSync } from 'node:fs'
+import { readdirSync, readFileSync, writeFileSync, existsSync, statSync, rmSync, renameSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 
 // java 源目录相对本仓根的位置（jeeflow-java 与本仓是 jeeflow-hub 下的兄弟目录）
@@ -50,7 +50,8 @@ function hasFlows(d: string): boolean {
   }
 }
 
-function mirror(root: string): void {
+/** 若 Java 源存在则精确镜像到本仓 flows/（拷所有 + 删孤儿），不存在则原样返回。导出仅供 issues/187 的工装用例铺临时树。 */
+export function mirror(root: string): void {
   const src = join(root, JAVA_FLOWS_REL)
   const dst = join(root, 'flows')
   if (!existsSync(src) || !statSync(src).isDirectory()) return // 用户单仓 / 容器：无 Java 源，跳过镜像
@@ -58,10 +59,41 @@ function mirror(root: string): void {
   for (const f of readdirSync(src)) {
     if (!f.endsWith('.json')) continue
     srcNames.add(f)
-    writeFileSync(join(dst, f), readFileSync(join(src, f)))
+    writeAtomic(join(dst, f), readFileSync(join(src, f)))
   }
-  // 孤儿清理：本仓有、Java 源已无的 .json（防 id 错位）
+  // 孤儿清理：本仓有、Java 源已无的 .json（防 id 错位）。临时件名不以 .json 结尾，不在此面。
   for (const f of readdirSync(dst)) {
     if (f.endsWith('.json') && !srcNames.has(f)) rmSync(join(dst, f))
   }
+}
+
+const RENAME_RETRY = 100
+const RENAME_RETRY_MS = 10
+
+function writeAtomic(target: string, data: Buffer): void {
+  // 稳态零写：内容逐字节相同就不动盘 ⇒ 绝大多数测试轮里镜像整腿零写入，读者无从撞窗口。
+  try {
+    if (readFileSync(target).equals(data)) return
+  } catch {
+    /* 目标还不存在（或正被别的进程持有）：走写入腿 */
+  }
+  const tmp = `${target}.tmp.${process.pid}` // 名带 pid ⇒ 并发进程互不覆写同一条临时件
+  for (let attempt = 0; ; attempt++) {
+    writeFileSync(tmp, data)
+    try {
+      renameSync(tmp, target) // 同目录 rename 对读者是原子的：只会看到旧件或新件，看不到半截
+      return
+    } catch (e) {
+      // Windows：libuv 开文件不带 FILE_SHARE_DELETE，读者正持句柄时 rename 报 EPERM，重试即可。
+      if (attempt >= RENAME_RETRY) {
+        rmSync(tmp, { force: true })
+        throw new Error(`flows-resolver: 镜像 ${target} 失败（重试 ${RENAME_RETRY} 次）: ${String(e)}`)
+      }
+      sleepMs(RENAME_RETRY_MS)
+    }
+  }
+}
+
+function sleepMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 }
