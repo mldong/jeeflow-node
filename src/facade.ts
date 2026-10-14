@@ -930,7 +930,7 @@ export class JeeflowFacade {
       try {
         const flow = JSON.parse(toStr(def.content))
         nodeProgress = await this.buildNodeProgress(flow, his)
-        await this.collectPath(flow, 'start', active, history, edges, new Set(), inst.variables ?? {}, his)
+        await this.collectPath(flow, 'start', active, history, edges, new Set(), inst.variables ?? {}, his, instanceId, String(inst.defineId ?? ''))
       } catch (e) {
         // issues/162（口径＝保留降级面＋落一条可诊断日志，形状照 jeeflow-go v1.8.43 那枚）：
         // 坏定义只降级模型补全腿（边集/节点补全/nodeProgress 留空，实例与任务行不受影响、
@@ -1007,7 +1007,8 @@ export class JeeflowFacade {
   // ⇒ 目标节点当前活跃的那条边既不下钻也不收录，"进当前待办的那一跳"永远是灰的。
   private async collectPath(flow: any, nodeId: string, active: string[],
     history: string[], edges: string[], visited: Set<string>,
-    vars: Record<string, any>, historyTasks: any[]): Promise<void> {
+    vars: Record<string, any>, historyTasks: any[],
+    instanceId: string, defineId: string): Promise<void> {
     if (visited.has(nodeId)) return
     visited.add(nodeId)
     const src = (flow.nodes ?? []).find((n: any) => n.id === nodeId)
@@ -1016,7 +1017,7 @@ export class JeeflowFacade {
       // 决策节点：输出边表达式求值过滤（对齐 boot3 recursionModel，issues/06）
       if (src?.type === 'snaker:decision') {
         const expr = e.properties?.expr
-        if (expr && !await this.evalDecisionExpr(flow, src, expr, vars, historyTasks)) continue
+        if (expr && !await this.evalDecisionExpr(flow, src, expr, vars, historyTasks, instanceId, defineId)) continue
       }
       if (e.id && !edges.includes(e.id)) edges.push(e.id)
       const target = (flow.nodes ?? []).find((n: any) => n.id === e.targetNodeId)
@@ -1024,13 +1025,16 @@ export class JeeflowFacade {
       const tid = target.id
       if (!active.includes(tid) && !history.includes(tid)) history.push(tid)
       if (active.includes(tid)) continue // 遇活跃节点停止深入（边名已在上面收录）
-      await this.collectPath(flow, tid, active, history, edges, visited, vars, historyTasks)
+      await this.collectPath(flow, tid, active, history, edges, visited, vars, historyTasks, instanceId, defineId)
     }
   }
 
-  /** 决策输出边表达式求值（args = 实例变量 + 决策节点前置任务变量） */
+  /** 决策输出边表达式求值（args = 实例变量 + 决策节点前置任务变量）
+   *
+   * instanceId/defineId 只作日志归因用（issues/201）——求值失败那条腿不许再一声不吭。 */
   private async evalDecisionExpr(flow: any, decision: any, expr: string,
-    vars: Record<string, any>, historyTasks: any[]): Promise<boolean> {
+    vars: Record<string, any>, historyTasks: any[],
+    instanceId: string, defineId: string): Promise<boolean> {
     const args: Record<string, any> = { ...(vars ?? {}) }
     for (const e of flow.edges ?? []) {
       if (e.targetNodeId === decision.id) {
@@ -1041,7 +1045,14 @@ export class JeeflowFacade {
     }
     try {
       return Boolean(await this.engine.evalExpr(expr, args))
-    } catch {
+    } catch (e) {
+      // issues/201（audit8 R79 拍 C＝只统一「求值器自身抛异常必须落可诊断日志」，遍历宽度不钉；
+      // 口径与本栈 162 腿同源，日志三件齐）：旧形状 `catch { return false }` 把求值失败折成
+      // 「这条分支求值为假」⇒ 对外读数与合法判假完全同形、零线索。本栈宽度维持折 false
+      // （该边不收、其余边继续遍历），只补可归因的一句。
+      console.error(
+        `[jeeflow] WARN highLight 决策边表达式求值失败，该边按 false 处理（分支不收、其余边继续遍历）: instanceId=${instanceId}, defineId=${defineId}, nodeId=${decision?.id ?? ''}, expr=${expr}, err=${e}`
+      )
       return false
     }
   }
