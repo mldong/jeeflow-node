@@ -1084,12 +1084,12 @@ export class EngineImpl implements Engine {
     if (u.postName) vars[KeyPostName] = u.postName
   }
 
-  /** issue 29：自动生成标题（对齐 boot3 FlowUtil.addAutoGenTitle） */
+  /** issue 29：自动生成标题；issues/232 R64 拍 A 钉秒 yyyy-MM-dd HH:mm:ss（标题专用格式化点，勿并 expire_time 腿） */
   private addAutoGenTitle(displayName: string, vars: Record<string, any>) {
     const realName = vars[KeyRealName] || ''
     const now = new Date()
     const pad = (n: number) => n.toString().padStart(2, '0')
-    const timeStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`
+    const timeStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`
     vars[KeyAutoGenTitle] = `${realName}的${displayName}-${timeStr}`
   }
 

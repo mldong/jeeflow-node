@@ -118,6 +118,19 @@ describe('jeeflow compliance tests', () => {
     await assertDone(result, 'simple: expected done')
   })
 
+  // issues/232 R64 拍 A：autoGenTitle 钉秒 `yyyy-MM-dd HH:mm:ss`（Node 半边）。
+  // 变异＝timeStr 回退到分钟粒度（删 :ss 段）时两条判据复红；
+  // 回归腿＝expire_time 解析格见 expire 相关既有用例（本判据不动该腿）。
+  it('232 autogen title seconds', async () => {
+    const { engine, repo } = setup()
+    const def = loadFlow(repo, '01-simple.json')
+    const inst = await startAndExecute(engine, repo, def.id, 'applicant')
+    const title = String(inst.variables[KeyAutoGenTitle])
+    assert.match(title, /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, `标题应以秒级时间戳结尾（钉秒）: ${title}`)
+    assert.doesNotMatch(title, /\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/, `标题不得停在分钟粒度（改前形状）: ${title}`)
+    assert.ok(title.startsWith('用户applicant的01-simple.json-'), `标题前缀形状应保持: ${title}`)
+  })
+
   it('02 multi-task', async () => {
     const { engine, repo } = setup()
     const def = loadFlow(repo, '02-multi-task.json')
