@@ -159,7 +159,9 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
       assert.deepEqual(doing[0].actorIds, ['zhangsan'], 'apply 参与者为发起人（applicant→发起人）')
 
       // ② 完成 apply（startAndExecute 语义）→ task1（leader）
-      let inst2 = await engine.executeProcessTask(doing[0].id, 'zhangsan')
+      // R92：执行族公开方法现回传「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+      await engine.executeProcessTask(doing[0].id, 'zhangsan')
+      let inst2 = (await repo.findInstanceById(inst.id))!
       let done = await repo.findDoneTasks(inst2.id)
       assert.equal(done.length, 1, 'apply 已完成')
       assert.equal(done[0].taskName, 'apply')
@@ -186,7 +188,8 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
       assert.equal(ccEmpty.total, 0, '非抄送人空')
 
       // ③ 完成 task1 → end → 实例完成
-      inst2 = await engine.executeProcessTask(doing[0].id, 'leader', { comment: 'ok' })
+      await engine.executeProcessTask(doing[0].id, 'leader', { comment: 'ok' })
+      inst2 = (await repo.findInstanceById(inst.id))!
       assert.equal(inst2.state, InstanceState.Done, '流程实例完成')
 
       // ④ 重新连接验证持久化

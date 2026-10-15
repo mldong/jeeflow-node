@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import {
   type FlowModel, type FlowNode,
   TypeStart, TypeEnd, TypeTask, TypeDecision, TypeFork, TypeJoin, TypeCustom,
@@ -90,10 +91,10 @@ function isRejectSubmitType(submitType: number): boolean {
 
 export interface Engine {
   startProcessInstanceById(defineId: string, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
-  executeProcessTask(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
-  executeAndJumpToEnd(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
-  executeAndJumpTask(taskId: string, operator: string, args: Record<string, any>, targetTaskName?: string): Promise<ProcessInstance>
-  executeAndJumpToFirstTaskNode(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
+  executeProcessTask(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessTask[]>
+  executeAndJumpToEnd(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessTask[]>
+  executeAndJumpTask(taskId: string, operator: string, args: Record<string, any>, targetTaskName?: string): Promise<ProcessTask[]>
+  executeAndJumpToFirstTaskNode(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessTask[]>
   /** 事务包裹（audit8 145-2 / spec/12 §12.2）：仓储有事务载体则并入（嵌套经 withTx 的 join 支），
    *  无（内存仓）则裸跑＝显式降级（§12.1 原则 4）。门面动作级包裹也走这一枚。 */
   inTx<T>(fn: () => Promise<T>): Promise<T>
@@ -146,6 +147,8 @@ function lineageVars(src: Record<string, any> | undefined): Record<string, any> 
 }
 
 export class EngineImpl implements Engine {
+  /** R92：执行族产出列表的每次调用作用域（AsyncLocalStorage，并发安全）。 */
+  private readonly createdScope = new AsyncLocalStorage<ProcessTask[]>()
   private ext?: EngineExtensions
   private registry?: HandlerRegistry
   // issues/116：委托代理自动生效——内置能力，注入查询源后默认开启
@@ -411,9 +414,14 @@ export class EngineImpl implements Engine {
 
   // ─── Execute ───────────────────────────────────────────────────────────────
 
-  async executeProcessTask(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
+  async executeProcessTask(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessTask[]> {
     // audit8 145-2①：入口级包裹（同 startProcessInstanceById 注释）
-    return this.inTx(() => this.executeProcessTaskInner(taskId, operator, args))
+    const created: ProcessTask[] = []
+    // spec04 §完成任务：公开方法回传「本次动作产出的任务行」（基准＝java exec.getProcessTaskList()）。
+    // 作用域用 AsyncLocalStorage：一个 EngineImpl 实例并发处理多个请求，class 字段会互踩；
+    // 而 node 没有 go 那样的 ctx 可挂，ALS 是等价的每次调用作用域（见 R92 notes）。
+    await this.createdScope.run(created, () => this.inTx(() => this.executeProcessTaskInner(taskId, operator, args)))
+    return created
   }
 
   private async executeProcessTaskInner(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
@@ -475,6 +483,7 @@ export class EngineImpl implements Engine {
             // 变量源＝实例变量（与建单同档），取时基准＝本行 createTime 用的同一个 now。
             applyNodeExpireTime(nt, curNode.properties?.expireTime, inst.variables, now)
             await this.repo.saveTask(nt)
+            this.createdScope.getStore()?.push(nt)
             // PROCESS_TASK_START：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler / Rust）
             await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: curNode.id, operator, actors: [...nt.actorIds] })
             return finishExecute()
@@ -535,9 +544,14 @@ export class EngineImpl implements Engine {
 
   // ─── Reject ────────────────────────────────────────────────────────────────
 
-  async executeAndJumpToEnd(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
+  async executeAndJumpToEnd(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessTask[]> {
     // audit8 145-2①：入口级包裹（同 startProcessInstanceById 注释）
-    return this.inTx(() => this.executeAndJumpToEndInner(taskId, operator, args))
+    const created: ProcessTask[] = []
+    // spec04 §完成任务：公开方法回传「本次动作产出的任务行」（基准＝java exec.getProcessTaskList()）。
+    // 作用域用 AsyncLocalStorage：一个 EngineImpl 实例并发处理多个请求，class 字段会互踩；
+    // 而 node 没有 go 那样的 ctx 可挂，ALS 是等价的每次调用作用域（见 R92 notes）。
+    await this.createdScope.run(created, () => this.inTx(() => this.executeAndJumpToEndInner(taskId, operator, args)))
+    return created
   }
 
   private async executeAndJumpToEndInner(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
@@ -553,9 +567,14 @@ export class EngineImpl implements Engine {
 
   // ─── Jump（ROLLBACK 空 target / JUMP 命名 target，boot2 executeAndJumpTask）────
 
-  async executeAndJumpTask(taskId: string, operator: string, args: Record<string, any> = {}, targetTaskName?: string): Promise<ProcessInstance> {
+  async executeAndJumpTask(taskId: string, operator: string, args: Record<string, any> = {}, targetTaskName?: string): Promise<ProcessTask[]> {
     // audit8 145-2①：入口级包裹（同 startProcessInstanceById 注释）
-    return this.inTx(() => this.executeAndJumpTaskInner(taskId, operator, args, targetTaskName))
+    const created: ProcessTask[] = []
+    // spec04 §完成任务：公开方法回传「本次动作产出的任务行」（基准＝java exec.getProcessTaskList()）。
+    // 作用域用 AsyncLocalStorage：一个 EngineImpl 实例并发处理多个请求，class 字段会互踩；
+    // 而 node 没有 go 那样的 ctx 可挂，ALS 是等价的每次调用作用域（见 R92 notes）。
+    await this.createdScope.run(created, () => this.inTx(() => this.executeAndJumpTaskInner(taskId, operator, args, targetTaskName)))
+    return created
   }
 
   private async executeAndJumpTaskInner(taskId: string, operator: string, args: Record<string, any> = {}, targetTaskName?: string): Promise<ProcessInstance> {
@@ -581,9 +600,14 @@ export class EngineImpl implements Engine {
 
   // ─── Jump To First Task（退回发起人，boot2 ROLLBACK_TO_OPERATOR=6）────────────
 
-  async executeAndJumpToFirstTaskNode(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
+  async executeAndJumpToFirstTaskNode(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessTask[]> {
     // audit8 145-2①：入口级包裹（同 startProcessInstanceById 注释）
-    return this.inTx(() => this.executeAndJumpToFirstTaskNodeInner(taskId, operator, args))
+    const created: ProcessTask[] = []
+    // spec04 §完成任务：公开方法回传「本次动作产出的任务行」（基准＝java exec.getProcessTaskList()）。
+    // 作用域用 AsyncLocalStorage：一个 EngineImpl 实例并发处理多个请求，class 字段会互踩；
+    // 而 node 没有 go 那样的 ctx 可挂，ALS 是等价的每次调用作用域（见 R92 notes）。
+    await this.createdScope.run(created, () => this.inTx(() => this.executeAndJumpToFirstTaskNodeInner(taskId, operator, args)))
+    return created
   }
 
   private async executeAndJumpToFirstTaskNodeInner(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
@@ -693,6 +717,7 @@ export class EngineImpl implements Engine {
     const eff = mergeAgents([actor], agents)
     if (eff.length > 1) nt.actorIds = eff
     await this.repo.saveTask(nt)
+    this.createdScope.getStore()?.push(nt)
     await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id,
       taskId: nt.id, nodeId: prev.id, operator, actors: [...nt.actorIds] })
   }
@@ -896,6 +921,7 @@ export class EngineImpl implements Engine {
             if (eff.length > 1) nt.actorIds = eff
             applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 并行会签全员
             await this.repo.saveTask(nt)
+            this.createdScope.getStore()?.push(nt)
             // PROCESS_TASK_START：任务落库后逐个 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
             await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
           }
@@ -913,6 +939,7 @@ export class EngineImpl implements Engine {
           if (eff.length > 1) nt.actorIds = eff
           applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 串行会签首位成员
           await this.repo.saveTask(nt)
+          this.createdScope.getStore()?.push(nt)
           await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
           return
         }
@@ -923,6 +950,7 @@ export class EngineImpl implements Engine {
             if (eff.length > 1) nt.actorIds = eff
             applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 未配会签类型＝全员预创建，与并行同档
             await this.repo.saveTask(nt)
+            this.createdScope.getStore()?.push(nt)
             await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
           }
           return
@@ -938,6 +966,7 @@ export class EngineImpl implements Engine {
     nt.actorIds = effActors
     applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 普通建单
     await this.repo.saveTask(nt)
+    this.createdScope.getStore()?.push(nt)
     await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
   }
 

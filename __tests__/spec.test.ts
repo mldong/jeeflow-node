@@ -114,7 +114,9 @@ describe('jeeflow compliance tests', () => {
     assert.equal(doing[0].taskName, 'task1')
     await repo.addTaskActor(doing[0].id, ['applicant'])
     doing[0].actorIds.push('applicant')
-    const result = await engine.executeProcessTask(doing[0].id, 'applicant')
+    await engine.executeProcessTask(doing[0].id, 'applicant')
+    // R92：执行族公开方法现返回「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    const result = (await repo.findInstanceById(doing[0].processInstanceId))!
     await assertDone(result, 'simple: expected done')
   })
 
@@ -155,7 +157,9 @@ describe('jeeflow compliance tests', () => {
     assert.equal(doing[0].taskName, 'task3')
     await repo.addTaskActor(doing[0].id, ['userC'])
     doing[0].actorIds.push('userC')
-    const result = await engine.executeProcessTask(doing[0].id, 'userC')
+    await engine.executeProcessTask(doing[0].id, 'userC')
+    // R92：执行族公开方法现返回「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    const result = (await repo.findInstanceById(doing[0].processInstanceId))!
     await assertDone(result, 'multi: expected done')
   })
 
@@ -217,7 +221,9 @@ describe('jeeflow compliance tests', () => {
     await repo.addTaskActor(doing[0].id, ['bob'])
     doing[0].actorIds.push('bob')
     const doneTaskId = doing[0].id
-    const instAfter = await engine.executeProcessTask(doneTaskId, 'bob')
+    await engine.executeProcessTask(doneTaskId, 'bob')
+    // R92：执行族公开方法现返回「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    const instAfter = (await repo.findInstanceById(inst.id))!
 
     // 核心：实例 u_realName 不被操作人 bob 覆盖，恒为发起人 alice
     assert.equal(instAfter.variables[KeyRealName], '用户alice', `issues/97: 实例 u_realName 漂移为 ${instAfter.variables[KeyRealName]}`)
@@ -233,7 +239,9 @@ describe('jeeflow compliance tests', () => {
     assert.equal(doing[0].taskName, 'task2')
     await repo.addTaskActor(doing[0].id, ['userB'])
     doing[0].actorIds.push('userB')
-    const instDeep = await engine.executeProcessTask(doing[0].id, 'userB')
+    await engine.executeProcessTask(doing[0].id, 'userB')
+    // R92：执行族公开方法现返回「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    const instDeep = (await repo.findInstanceById(doing[0].processInstanceId))!
     assert.equal(instDeep.variables[KeyRealName], '用户alice', `issues/97: 深层节点后实例 u_realName 应仍为 alice, got ${instDeep.variables[KeyRealName]}`)
   })
 
@@ -344,7 +352,9 @@ describe('jeeflow compliance tests', () => {
     assert.equal(inst2?.state, InstanceState.Doing, 'still doing')
     await repo.addTaskActor(tB.id, ['userB'])
     tB.actorIds.push('userB')
-    const result = await engine.executeProcessTask(tB.id, 'userB')
+    await engine.executeProcessTask(tB.id, 'userB')
+    // R92：执行族公开方法现返回「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    const result = (await repo.findInstanceById(tB.processInstanceId))!
     await assertDone(result, 'fork-join: expected done')
   })
 
@@ -380,7 +390,9 @@ describe('jeeflow compliance tests', () => {
     t = doing[0]
     await repo.addTaskActor(t.id, ['userB'])
     t.actorIds.push('userB')
-    const result = await engine.executeProcessTask(t.id, 'userB')
+    await engine.executeProcessTask(t.id, 'userB')
+    // R92：执行族公开方法现返回「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    const result = (await repo.findInstanceById(t.processInstanceId))!
     await assertDone(result, 'seq cs: expected done')
   })
 
@@ -412,7 +424,9 @@ describe('jeeflow compliance tests', () => {
     const doing = await repo.findDoingTasks(inst.id)
     await repo.addTaskActor(doing[0].id, ['applicant'])
     doing[0].actorIds.push('applicant')
-    const result = await engine.executeAndJumpToEnd(doing[0].id, 'applicant')
+    await engine.executeAndJumpToEnd(doing[0].id, 'applicant')
+    // R92：执行族公开方法现返回「本次动作产出的任务行」；用例要的是动作后的实例 ⇒ 回查（断言数值不改）
+    const result = (await repo.findInstanceById(doing[0].processInstanceId))!
     assert.equal(result.state, InstanceState.Reject, 'reject: expected 45')
   })
 
@@ -1429,7 +1443,9 @@ describe('jeeflow compliance tests', () => {
     let doing = await repo.findDoingTasks(inst.id)
 
     // ① flow.auto 非参与者身份放行（startAndExecute 契约）
-    inst = await engine.executeProcessTask(doing[0].id, 'flow.auto')
+    await engine.executeProcessTask(doing[0].id, 'flow.auto')
+    // R92：执行族返回产出行 ⇒ 回查实例（断言数值不改）
+    inst = (await repo.findInstanceById(doing[0].processInstanceId))!
     doing = await repo.findDoingTasks(inst.id)
     assert.equal(doing[0].taskName, 'task1', 'flow.auto 应放行执行')
 
@@ -1438,7 +1454,9 @@ describe('jeeflow compliance tests', () => {
     assert.equal(reloaded?.variables.u_userId, 'applicant', 'flow.auto 应跳过用户注入')
 
     // ③ flow.admin 放行
-    inst = await engine.executeProcessTask(doing[0].id, 'flow.admin')
+    await engine.executeProcessTask(doing[0].id, 'flow.admin')
+    // R92：执行族返回产出行 ⇒ 回查实例（断言数值不改）
+    inst = (await repo.findInstanceById(doing[0].processInstanceId))!
     doing = await repo.findDoingTasks(inst.id)
     assert.equal(doing[0].taskName, 'task2', 'flow.admin 应放行执行')
   })
@@ -1495,7 +1513,9 @@ describe('jeeflow compliance tests', () => {
     assert.equal(doing[0].taskName, 'task4')
     assert.deepEqual([...doing[0].actorIds].sort(), ['roleA', 'roleB'], `④ taskRole actors: ${doing[0].actorIds}`)
     await repo.addTaskActor(doing[0].id, doing[0].actorIds)
-    inst = await engine.executeProcessTask(doing[0].id, 'roleA')
+    await engine.executeProcessTask(doing[0].id, 'roleA')
+    // R92：执行族返回产出行 ⇒ 回查实例（断言数值不改）
+    inst = (await repo.findInstanceById(doing[0].processInstanceId))!
 
     // ⑤ 流程结束
     assert.equal(inst?.state, InstanceState.Done, `⑤ state: ${inst?.state}`)
