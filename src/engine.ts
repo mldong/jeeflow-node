@@ -390,6 +390,16 @@ export class EngineImpl implements Engine {
     return this.repo.withTx ? this.repo.withTx(fn) : fn()
   }
 
+  /** 提交后腿通道（audit8 R77 读法一，issues/234 §4.3／spec12 §12.3.1；java 形状＝监听器侧自取
+   *  afterCommit，php 侧 R25 已收口同形）：监听器/集成层把"必须看到已提交世界"的那一腿（反查、
+   *  外发通知、二次写）交到这里声明 ⇒ COMMIT 之后执行、回滚整批丢弃。
+   *  没有活动事务（或仓储没这条通道）⇒ 立即执行，行为与上一版逐字一致。
+   *  ⚠ 引擎自身的 fire 不经过这里：派发点与「监听器随事件拿到动作事务连接」由 145-3 钉住。 */
+  async runAfterCommit(fn: () => any | Promise<any>): Promise<void> {
+    if (this.repo.afterCommit?.call(this.repo, fn)) return
+    await fn()
+  }
+
   // ─── Start ─────────────────────────────────────────────────────────────────
 
   async startProcessInstanceById(defineId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {

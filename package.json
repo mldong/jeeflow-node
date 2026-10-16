@@ -20,7 +20,7 @@
     "build": "tsc",
     "typecheck": "tsc -p tsconfig.check.json",
     "test": "node --import tsx __tests__/spec.test.ts",
-    "test-mysql": "node --import tsx --test __tests__/jdbc.test.ts __tests__/tx-tier-145.test.ts",
+    "test-mysql": "node --import tsx --test __tests__/jdbc.test.ts __tests__/tx-tier-145.test.ts __tests__/after_commit_r77.test.ts",
     "demo": "node --import tsx demo/main.ts",
     "prepublishOnly": "npm run build"
   },

@@ -213,6 +213,10 @@ export interface ProcessRepository {
   /** 事务载体（audit8 145-2，spec/12 §12.2）——JDBC 仓储天然实现（AsyncLocalStorage）；
    *  内存仓没有此方法 ⇒ 引擎 inTx 显式降级裸跑（§12.1 原则 4）。 */
   withTx?<T>(fn: () => Promise<T>): Promise<T>
+  /** 提交后腿通道（audit8 R77 读法一，spec/12 §12.3.1）：有活动事务时登记回调并返回 true
+   *  （Commit 后执行、回滚丢弃）；无活动事务返回 false ⇒ 调用方须自行立即执行。
+   *  内存仓没有此方法 ⇒ 一律立即执行（与"落库后"等价）。 */
+  afterCommit?(fn: () => any | Promise<any>): boolean
   findDefineById(id: string): Promise<ProcessDefine | null>
   // findDefineByName 按流程编码查最新一条定义（v1.1.0，Facade deploy 版本管理用）
   findDefineByName(name: string): Promise<ProcessDefine | null>

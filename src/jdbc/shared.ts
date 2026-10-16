@@ -49,6 +49,11 @@ const DEFINE_WHITELIST = new Set([
 // 永远逃逸出引擎事务）。集成方写腿也可经 currentTxConnection/transactionAwarePool 并入。
 export const txStore = new AsyncLocalStorage<SqlConnection>()
 
+// audit8 R77 读法一：提交后腿登记表（与 txStore 分离，不动既有连接绑定语义）。
+// 最外层 withTx 建 scope，嵌套调用经 ALS 归到同一 scope；Commit 后整批执行、回滚整批丢弃。
+export interface AfterCommitScope { cbs: Array<() => any | Promise<any>>; done: boolean }
+export const afterCommitStore = new AsyncLocalStorage<AfterCommitScope>()
+
 /** 当前事务连接（无事务 ⇒ null）。集成方自研写腿（如 DynamicTableWriter 的 MySQL 实现）
  *  用它并入引擎事务——spec/12 §12.2 覆盖面：一次动作内所有写腿取同一条连接。 */
 export function currentTxConnection(): SqlConnection | null {
@@ -138,6 +143,16 @@ export class JdbcRepository implements ProcessRepository {
     private readonly idGen: IDGenerator = new TsIDGenerator(),
   ) {}
 
+  /** 登记「本次事务提交之后」执行的回调（audit8 R77 读法一；java 形状＝监听器侧自取 afterCommit，
+   *  php 侧 R25 已收口同形）。返回 false＝当前无活动事务 ⇒ 调用方须自行立即执行
+   *  （门面级没外包事务模板的栈，「落库后」与「提交后」等价）。 */
+  afterCommit(fn: () => any | Promise<any>): boolean {
+    const sc = afterCommitStore.getStore()
+    if (!sc || sc.done) return false
+    sc.cbs.push(fn)
+    return true
+  }
+
   private sql(s: string): string {
     return convertPlaceholder(s, this.adapter.placeholder)
   }
@@ -149,14 +164,22 @@ export class JdbcRepository implements ProcessRepository {
     // 不提前提交；提交/回滚归最外层）——引擎入口包裹与门面动作级包裹嵌套时落这一支。
     if (txStore.getStore()) return fn()
     const conn = await this.adapter.acquire()
+    const scope: AfterCommitScope = { cbs: [], done: false }
     try {
       await conn.begin()
       try {
-        const result = await txStore.run(conn, fn)
+        const result = await txStore.run(conn, () => afterCommitStore.run(scope, fn))
         await conn.commit()
+        scope.done = true
+        // R77 提交后腿：逐条吞掉自家异常，不打断主流程（登记方自己承担失败语义）
+        for (const cb of scope.cbs) {
+          try { await cb() } catch (err) { console.warn('[jeeflow] afterCommit 回调失败: ' + String(err)) }
+        }
         return result
       } catch (err) {
         await conn.rollback()
+        scope.done = true
+        scope.cbs = [] // R77：回滚 ⇒ 提交后腿整批丢弃（监听器不得看到未提交的世界）
         throw err
       }
     } finally {
