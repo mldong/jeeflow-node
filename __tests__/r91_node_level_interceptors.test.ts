@@ -137,4 +137,26 @@ describe('R91 节点级拦截器优先序（issues/234 §4.2／spec02 §3）', (
     assert.ok(calls.some(c => c.phase === 'post:A' && c.node === 'apply'), `第一节点未走 a：${JSON.stringify(calls)}`)
     assert.ok(calls.some(c => c.phase === 'post:B' && c.node === 'apply2'), `第二节点未走 b（缓存按 defineId 串档）：${JSON.stringify(calls)}`)
   })
+
+  it('⑦ 根声明每定义只回查一行（拆节点档后不得把"读一次"放大成逐节点读）', async () => {
+    // 直接量拦截器解析这一条腿（数 findDefineById 次数）：走整条流程量会被既有委托名缓存
+    // （engine.ts 的 defineNameCache 按任务节点回查定义）混进来——那是 R91 之前就在的形状，
+    // 拿它当判据会永红（实测 3 节点 5 次、摘掉根声明缓存也 5 次＝测不到自己要钉的东西）。
+    const { repo, engine } = mk({ interceptors: [], interceptorRegistry: {} } as any)
+    const d = defineWith('r91-reads', '', '', '', '')
+    repo.addDefine(d)
+    const inst = await engine.startProcessInstanceById(d.id, 'user1', { f_title: '读放大' })
+    const nodeIds = (JSON.parse(d.content).nodes as any[]).map(n => n.id)
+    assert.ok(nodeIds.length >= 3, `前置：节点数 ${nodeIds.length} 不足以照出放大`)
+    let reads = 0
+    const orig = repo.findDefineById.bind(repo)
+    repo.findDefineById = async (id: any) => { reads++; return orig(id) }
+    for (const nid of nodeIds) {
+      for (const phase of ['pre', 'post'] as const) {
+        await (engine as any).resolveInterceptors({ id: nid, properties: {} }, inst, phase)
+      }
+    }
+    assert.ok(reads <= 1,
+      `定义行被逐节点回查：${nodeIds.length} 节点 × 2 档 ⇒ ${reads} 次（根声明须每定义缓存一行）`)
+  })
 })

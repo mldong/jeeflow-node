@@ -227,10 +227,14 @@ export class EngineImpl implements Engine {
   setExtensions(ext: EngineExtensions) {
     this.ext = ext
     this.interceptorCache = new Map()
+    this.rootDeclCache = new Map()
   }
   setRegistry(reg: HandlerRegistry) { this.registry = reg }
 
   private interceptorCache = new Map<string, FlowInterceptor[]>()
+  /** 流程根 pre/post 声明缓存（每 defineId 只回查一行定义）：节点档拆开后若逐节点读定义行，
+   *  就把 issue 34 的"读一次"放大成逐任务读——spec.test 的 defineReads 次数不变量钉的就是它。 */
+  private rootDeclCache = new Map<string, { pre: string; post: string }>()
 
   /** 定义级／节点级拦截器解析（issue 34 ＋ audit8 R91，对齐 java `NodeModel.java:49-59`）：
    *  档位＝`pre`／`post` 两档各自独立取串——节点 properties 声明优先，串空才回落流程根同名键，
@@ -251,15 +255,8 @@ export class EngineImpl implements Engine {
     const prop = `${phase}Interceptors`
     let declared = String(node.properties?.[prop] ?? '').trim()
     if (!declared) {
-      let list = this.ext.interceptors ?? []
-      try {
-        const def = await this.repo.findDefineById(defineId)
-        if (def) {
-          const content = typeof def.content === 'string' ? def.content : new TextDecoder().decode(def.content as Uint8Array)
-          const meta = JSON.parse(content)
-          declared = String(meta[prop] ?? '').trim()
-        }
-      } catch { /* 定义读取/JSON 解析失败回落引擎级 */ }
+      const list = this.ext.interceptors ?? []
+      declared = (await this.resolveRootDecls(defineId))[phase]
       if (!declared) {
         this.interceptorCache.set(key, list)
         return list
@@ -274,6 +271,23 @@ export class EngineImpl implements Engine {
     }
     this.interceptorCache.set(key, list)
     return list
+  }
+
+  /** 流程根 pre/post 声明：每一定义只回查一行（读取/JSON 解析失败按 issues/60 现状语义视作"根级未声明"，同样缓存）。 */
+  private async resolveRootDecls(defineId: string): Promise<{ pre: string; post: string }> {
+    const cached = this.rootDeclCache.get(defineId)
+    if (cached) return cached
+    let decl = { pre: '', post: '' }
+    try {
+      const def = await this.repo.findDefineById(defineId)
+      if (def) {
+        const content = typeof def.content === 'string' ? def.content : new TextDecoder().decode(def.content as Uint8Array)
+        const meta = JSON.parse(content)
+        decl = { pre: String(meta.preInterceptors ?? '').trim(), post: String(meta.postInterceptors ?? '').trim() }
+      }
+    } catch { /* 定义读取/JSON 解析失败回落引擎级 */ }
+    this.rootDeclCache.set(defineId, decl)
+    return decl
   }
 
   private async firePre(node: FlowNode, inst: ProcessInstance): Promise<boolean> {
