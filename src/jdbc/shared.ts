@@ -4,7 +4,7 @@
 // - 本文件是**唯一维护点**：15 个仓储方法的 SQL 逻辑、行映射、ID 生成
 // - SQL 占位符统一使用 `?`，由各数据库适配器（SqlAdapter）转换为自家风格
 //   （MySQL `?` 原生 / PostgreSQL `$n`）
-// - 事务（spec §7.4）：withTx 用 AsyncLocalStorage 绑定当前异步上下文的事务连接
+// - 事务（规范 05「事务约定」节）：withTx 用 AsyncLocalStorage 绑定当前异步上下文的事务连接
 //
 // 新增数据库 = 写一个适配器（约 80 行）：实现 SqlAdapter + 连接包装
 // （execute/fetchOne/fetchAll/begin/commit/rollback）。参考 mysql.ts / postgres.ts。
@@ -157,7 +157,7 @@ export class JdbcRepository implements ProcessRepository {
     return convertPlaceholder(s, this.adapter.placeholder)
   }
 
-  // ── 事务（spec §7.4：AsyncLocalStorage 绑定连接）─────────────────────────
+  // ── 事务（规范 05「事务约定」节：AsyncLocalStorage 绑定连接）─────────────────────────
 
   async withTx<T>(fn: () => Promise<T>): Promise<T> {
     // audit8 145-2③（spec/12 §12.2 归属面）：已有活动事务 ⇒ **并入**（不再开第二段事务、
@@ -353,7 +353,7 @@ export class JdbcRepository implements ProcessRepository {
         [inst.state, inst.parentNodeName ?? '', inst.businessNo ?? '', inst.operator,
           inst.expireTime ?? null, JSON.stringify(inst.variables ?? {}),
           inst.updateTime, inst.updateUser, inst.id])
-      // v1.0.1：级联持久化聚合根内任务状态变更（同连接，spec §7.4）
+      // v1.0.1：级联持久化聚合根内任务状态变更（同连接，规范 05「事务约定」节）
       for (const task of inst.tasks) {
         if (task.id) await this.updateTaskWithConn(conn, task)
       }

@@ -234,7 +234,7 @@ describe(`JdbcRepository (${dbType} @ 192.168.1.160)`, () => {
     }
   })
 
-  it('事务（spec §7.4）：提交 / 回滚 / 事务内绑定读', async () => {
+  it('事务（规范 05「事务约定」节）：提交 / 回滚 / 事务内绑定读', async () => {
     await cleanup()
     try {
       await applySchema()
