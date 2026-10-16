@@ -232,43 +232,53 @@ export class EngineImpl implements Engine {
 
   private interceptorCache = new Map<string, FlowInterceptor[]>()
 
-  /** 定义级拦截器解析（issue 34，对齐 Java 模型级 postInterceptors）：
-   *  流程定义顶层 postInterceptors 声明 → 按名从 interceptorRegistry 取（未声明该流程不触发）；
-   *  未声明 → 回落引擎级列表（向后兼容）。结果按 defineId 缓存。
+  /** 定义级／节点级拦截器解析（issue 34 ＋ audit8 R91，对齐 java `NodeModel.java:49-59`）：
+   *  档位＝`pre`／`post` 两档各自独立取串——节点 properties 声明优先，串空才回落流程根同名键，
+   *  **两档不叠加**（spec02 §3「节点级拦截器的优先序、回落与键形」）；两档都没声明才回落引擎级列表
+   *  （向后兼容）。解析键＝注册名（键形按丙＝各家注册表沿用 java 全类名串，本栈不另发明短名）。
+   *  结果缓存键含 defineId＋节点＋档位（issues/234 §4.2：按 defineId 单键会把两个节点的声明串档）。
    *  issues/60：解析与校验分离——定义读取/JSON 解析失败回落引擎级（现状语义），
-   *  声明中存在未注册名时抛错（不静默跳过），且错误不写缓存保证持续报错。 */
-  private async resolveInterceptors(inst: ProcessInstance): Promise<FlowInterceptor[]> {
+   *  声明中存在未注册名时抛错（不静默跳过，带节点 id 与档位），且错误不写缓存保证持续报错。 */
+  private async resolveInterceptors(
+    node: FlowNode, inst: ProcessInstance, phase: 'pre' | 'post'
+  ): Promise<FlowInterceptor[]> {
     if (!this.ext) return []
     const defineId = inst.defineId
+    const key = `${defineId}|${node.id}|${phase}`
     if (defineId == null) return this.ext.interceptors ?? []
-    const cached = this.interceptorCache.get(defineId)
+    const cached = this.interceptorCache.get(key)
     if (cached) return cached
-    let list = this.ext.interceptors ?? []
-    let declared = ''
-    try {
-      const def = await this.repo.findDefineById(defineId)
-      if (def) {
-        const content = typeof def.content === 'string' ? def.content : new TextDecoder().decode(def.content as Uint8Array)
-        const meta = JSON.parse(content)
-        declared = String(meta.postInterceptors ?? '').trim()
-      }
-    } catch { /* 定义读取/JSON 解析失败回落引擎级 */ }
-    if (declared) {
-      list = []
-      for (const name of declared.split(',').map(n => n.trim())) {
-        if (!name) continue
-        const ic = this.ext.interceptorRegistry?.[name]
-        if (!ic) throw new Error(`postInterceptors 声明的拦截器未注册: ${name}`)
-        list.push(ic)
+    const prop = `${phase}Interceptors`
+    let declared = String(node.properties?.[prop] ?? '').trim()
+    if (!declared) {
+      let list = this.ext.interceptors ?? []
+      try {
+        const def = await this.repo.findDefineById(defineId)
+        if (def) {
+          const content = typeof def.content === 'string' ? def.content : new TextDecoder().decode(def.content as Uint8Array)
+          const meta = JSON.parse(content)
+          declared = String(meta[prop] ?? '').trim()
+        }
+      } catch { /* 定义读取/JSON 解析失败回落引擎级 */ }
+      if (!declared) {
+        this.interceptorCache.set(key, list)
+        return list
       }
     }
-    this.interceptorCache.set(defineId, list)
+    const list: FlowInterceptor[] = []
+    for (const name of declared.split(',').map(n => n.trim())) {
+      if (!name) continue
+      const ic = this.ext.interceptorRegistry?.[name]
+      if (!ic) throw new Error(`${prop} 声明的拦截器未注册: ${name}（nodeId=${node.id}）`)
+      list.push(ic)
+    }
+    this.interceptorCache.set(key, list)
     return list
   }
 
   private async firePre(node: FlowNode, inst: ProcessInstance): Promise<boolean> {
     if (!this.ext?.interceptors && !this.ext?.interceptorRegistry) return true
-    const list = await this.resolveInterceptors(inst)
+    const list = await this.resolveInterceptors(node, inst, 'pre')
     for (const ic of [...list].sort((a, b) => a.order - b.order))
       if (!(await ic.preHandle(node, inst))) return false
     return true
@@ -281,7 +291,7 @@ export class EngineImpl implements Engine {
 
   private async firePost(node: FlowNode, inst: ProcessInstance) {
     if (!this.ext?.interceptors && !this.ext?.interceptorRegistry) return
-    for (const ic of await this.resolveInterceptors(inst)) await ic.postHandle(node, inst)
+    for (const ic of await this.resolveInterceptors(node, inst, 'post')) await ic.postHandle(node, inst)
   }
   async fireEvent(evt: ProcessEvent) {
     // 公开事件发布入口（issues/102 CC_CREATE，issues/127/132 全码表）：引擎内部与各条 fire 腿共用；
