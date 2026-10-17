@@ -153,6 +153,13 @@ export class MemoryRepository implements ProcessRepository {
     this.defines.delete(defineId)
   }
 
+  async hasInstancesByDefineId(defineId: string): Promise<boolean> {
+    for (const inst of this.instances.values()) {
+      if (String(inst.defineId) === String(defineId)) return true
+    }
+    return false
+  }
+
   async saveInstance(inst: ProcessInstance) {
     if (!inst.id) inst.id = String(this.seq++)
     const cp = cloneInstance(inst)

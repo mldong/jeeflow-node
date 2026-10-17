@@ -8,7 +8,7 @@ import { dirname as pathDirname, join as pathJoin, sep as pathSep } from 'node:p
 import { fileURLToPath } from 'node:url'
 import {
   CcInstanceRow, DefineRow, InstanceRow, InstanceState, ProcessDefine, ProcessDesign,
-  ProcessDesignHis, ProcessSurrogate, ProcessTask, TaskRow, TaskState,
+  ProcessDesignHis, ProcessSurrogate, ProcessTask, TaskRow, TaskState, EXIST_UN_FINISH_INSTANCE,
 } from './model.js'
 import type { OrgUserProvider, ProcessExtRepository, ProcessRepository, QueryCondition } from './spi.js'
 // issues/142 B 批（spec 06 §2.11）：transfer 的 fromActor/toActor 用 cc 侧已落地的那一枚单值判据归一
@@ -641,7 +641,12 @@ export class JeeflowFacade {
 
   /** 删除定义（issues/28：兼容 {ids} 批量与单 {id}） */
   private async defineRemove(args: Record<string, any>): Promise<Record<string, any>> {
-    for (const id of idListArgs(args)) await this.repo.removeDefine(id)
+    const ids = idListArgs(args)
+    // audit8 R110：先对整批做存在性校验再删，避免"前面的删了、后面的被拒"的半删。
+    for (const id of ids) {
+      if (await this.repo.hasInstancesByDefineId(id)) throw new Error(EXIST_UN_FINISH_INSTANCE)
+    }
+    for (const id of ids) await this.repo.removeDefine(id)
     return {}
   }
 

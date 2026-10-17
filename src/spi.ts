@@ -225,6 +225,7 @@ export interface ProcessRepository {
   updateDefine(define: ProcessDefine): Promise<void>
   updateDefineState(defineId: string, state: number): Promise<void>
   removeDefine(defineId: string): Promise<void>
+  hasInstancesByDefineId(defineId: string): Promise<boolean>
   findInstanceById(id: string): Promise<ProcessInstance | null>
   saveInstance(inst: ProcessInstance): Promise<void>
   updateInstance(inst: ProcessInstance): Promise<void>

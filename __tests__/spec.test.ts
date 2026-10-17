@@ -897,6 +897,30 @@ describe('jeeflow compliance tests', () => {
     assert.ok(await extRepo.findDesignById(d), '负向请求不应删除设计稿')
   })
 
+  it('R110 processDefine/remove 任何实例即拒且整批不半删', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const def = loadFlow(repo, '01-simple.json')
+    await startAndExecute(engine, repo, def.id, 'applicant')
+    const msg = '存在正在未完成的流程实例，不允许删除！'
+
+    let r = await facade.flow('processDefine/remove', { id: String(def.id) })
+    assert.equal(r.code, 99999999)
+    assert.equal(r.msg, msg)
+    assert.ok(await repo.findDefineById(String(def.id)), '被拒时定义不得被删')
+
+    const clean = loadFlow(repo, '01-simple.json')
+    r = await facade.flow('processDefine/remove', { ids: [String(clean.id), String(def.id)] })
+    assert.equal(r.code, 99999999)
+    assert.equal(r.msg, msg)
+    assert.ok(await repo.findDefineById(String(clean.id)), '批量校验应先于写入：clean 不得半删')
+    assert.ok(await repo.findDefineById(String(def.id)), 'dirty 不得被删')
+
+    r = await facade.flow('processDefine/remove', { id: String(clean.id) })
+    assert.equal(r.code, 0)
+    assert.equal(await repo.findDefineById(String(clean.id)), null, '无实例的定义应可删')
+  })
+
   it('入口形态矩阵 processDefine/remove（issues/96 §4B）：ids 批量 / 单 id / 空数组 / 含空值', async () => {
     const { engine, repo } = setup()
     const extRepo = new MemoryExtRepository()
@@ -5235,12 +5259,14 @@ describe('issues/127/132 事件腿：A 套码表 · 办理抄送 · 5/6 互斥 �
     const facade = facadeOf(engine, repo)
     const defineId = await deploy(facade, '01-simple.json')
     const instanceId = await start(facade, defineId, 'zhangsan')
+    // audit8 R110：被删定义不能带实例，另起一条无实例定义专测删除生命周期零 fire
+    const cleanDefineId = await deploy(facade, '01-simple.json')
     fired.length = 0
     const ops: Array<[string, Record<string, any>]> = [
       ['processDefine/deploy', { content: readFileSync(flowDir + '01-simple.json', 'utf-8') }],
       ['processDefine/upAndDown', { id: defineId, state: 0 }],
       ['processInstance/updateCCStatus', { processInstanceId: instanceId, operator: 'zhangsan' }],
-      ['processDefine/remove', { id: defineId }],
+      ['processDefine/remove', { id: cleanDefineId }],
     ]
     for (const [action, args] of ops) {
       const r = await facade.flow(action, args)

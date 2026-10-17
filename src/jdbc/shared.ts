@@ -275,6 +275,17 @@ export class JdbcRepository implements ProcessRepository {
     }
   }
 
+  async hasInstancesByDefineId(defineId: string): Promise<boolean> {
+    const conn = await this.c()
+    try {
+      const row = await conn.fetchOne(
+        this.sql('SELECT COUNT(*) FROM wf_process_instance WHERE process_define_id=?'), [defineId])
+      return Number(Object.values(row as Record<string, unknown>)[0] ?? 0) > 0
+    } finally {
+      await this.done(conn)
+    }
+  }
+
   // findDefineByName 按流程编码查最新一条定义（v1.1.0，deploy 版本管理用）
   async findDefineByName(name: string): Promise<ProcessDefine | null> {
     const conn = await this.c()

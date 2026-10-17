@@ -37,6 +37,9 @@ export interface FlowEdge {
 
 // ─── Node Type Constants ──────────────────────────────────────────────────────
 
+// 删除定义的实例守卫文案（内部码 20010005，逐字沿用 boot2）
+export const EXIST_UN_FINISH_INSTANCE = '存在正在未完成的流程实例，不允许删除！'
+
 export const TypeStart    = 'snaker:start'
 export const TypeEnd      = 'snaker:end'
 export const TypeTask     = 'snaker:task'
