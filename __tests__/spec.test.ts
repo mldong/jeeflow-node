@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import * as assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { EngineImpl, KeyAutoGenTitle, KeyCustomReturnVal, KeyRealName, KeyUserID, KeySubmitType, parseActorIds, parseCcActors, processTime } from '../src/engine.js'
+import { EngineImpl, KeyAutoGenTitle, KeyCustomReturnVal, KeyRealName, KeyUserID, KeySubmitType, parseActorIds, parseCcActors, processTime, unknownEdgeWarning } from '../src/engine.js'
 import { HandlerRegistry, registerBuiltinAssignments } from '../src/index.js'
 import { MemoryRepository } from '../src/memory.js'
 import { MemoryExtRepository } from '../src/memory-ext.js'
@@ -101,6 +101,11 @@ async function assertDone(inst: ProcessInstance | null, msg: string) {
 }
 
 describe('jeeflow compliance tests', () => {
+
+  it('R112 unknownEdgeWarning carries from/to', () => {
+    const s = unknownEdgeWarning('node-a', 'node-b')
+    assert.ok(s.includes('from=node-a') && s.includes('to=node-b') && s.includes('WARNING'))
+  })
 
   it('01 simple flow', async () => {
     const { engine, repo } = setup()

@@ -1189,11 +1189,22 @@ function findNodeByType(flow: FlowModel, type: string): FlowNode | undefined {
   return flow.nodes.find(n => n.type === type)
 }
 
+export function unknownEdgeWarning(from: string, to: string): string {
+  return `[jeeflow] WARNING 转移出边的目标节点不在模型里（该节点类型未建档，解析期已跳过），本次流转停在这条边: from=${from}, to=${to}`
+}
+
 function followEdges(flow: FlowModel, sourceId: string): FlowNode[] {
-  return flow.edges
-    .filter(e => e.sourceNodeId === sourceId)
-    .map(e => findNode(flow, e.targetNodeId))
-    .filter(Boolean) as FlowNode[]
+  const out: FlowNode[] = []
+  for (const e of flow.edges) {
+    if (e.sourceNodeId !== sourceId) continue
+    const n = findNode(flow, e.targetNodeId)
+    if (!n) {
+      console.warn(unknownEdgeWarning(sourceId, e.targetNodeId))
+      continue
+    }
+    out.push(n)
+  }
+  return out
 }
 
 function getCsState(vars: Record<string, any>, nodeId: string): [string[] | null, number] {
