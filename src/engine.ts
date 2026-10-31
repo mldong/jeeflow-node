@@ -9,6 +9,7 @@ import {
 import {
   attachCreated, createTaskAt, executeReapply, mergeReady, newContext,
   parseMode, reapplyOf, RETURN_TO_SOURCE, scopesOf, stripReserved, withInstanceLock,
+  VAR_BRANCH_CTX, VAR_REAPPLY_CTX,
 } from './reapply.js'
 import type { ProcessRepository, ProcessExtRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
 // issues/141 G2：cc 写侧判重的 java `default` 方法在 TS 里的对应物（第三方仓储未实现判重 SPI 时兜旧行为）
@@ -1284,6 +1285,11 @@ function mergeExecIntoInstance(base: Record<string, any>, execVars: Record<strin
   const out: Record<string, any> = { ...base }
   for (const [k, v] of Object.entries(execVars)) {
     if (k.startsWith('u_')) continue
+    // 「退回修改、重提直返」的两枚保留键（spec 04）是**行级**引擎内部状态：_branchCtx 是分支
+    // 归属栈、_reapplyContext 只出现在申请待办上，实例层没有对应语义。若不挡，任务办结时它们
+    // 会随执行上下文写进实例变量并落库 ⇒ 每个出口（任务行 instanceExt／实例行 ext）都透出内部
+    // 键，且 issues/82-3 的回退目标本身被污染（go mergeExecIntoInstance 同款挡法）。
+    if (k === VAR_BRANCH_CTX || k === VAR_REAPPLY_CTX) continue
     out[k] = v
   }
   return out

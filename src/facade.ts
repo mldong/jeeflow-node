@@ -17,6 +17,7 @@ import { normalizeActorValue } from './spi.js'
 import type { EngineImpl } from './engine.js'
 import { KeyAutoExecute, KeyAdminID, KeyCcActorsStart, KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign, parseActorIds } from './engine.js'
 import { EventType } from './extensions.js'
+import { VAR_BRANCH_CTX, VAR_REAPPLY_CTX } from './reapply.js'
 
 // submitType 枚举（对齐 boot3）
 const SUBMIT_APPLY = 0
@@ -1948,8 +1949,19 @@ function taskRowToMap(r: TaskRow): Record<string, any> {
   const instanceExt = parseVarMap(r.instanceVariable)
   // issues/121 P1：引擎建单必写的控制键不算「任务变量非空」，否则新建任务的 ext
   // 永远不再回退实例变量（issues/82-3 既有契约）。
-  const userKeys = Object.keys(r.variables ?? {}).filter(k => k !== 'isFirstTaskNode')
-  const ext = userKeys.length > 0 ? r.variables : instanceExt
+  // 「退回修改、重提直返」又添了两枚引擎内部键（spec 04 保留键 _branchCtx／_reapplyContext，
+  // 建单时无条件写入、空分支也写 []）：同样不算用户变量——否则每条任务行从此都不再回退，
+  // 且内部键从公开出口透出。但 _reapplyContext 是前端「重新提交后返回：X」的唯一取数口
+  // （jeeflow-ui helpers.ts 读 ext._reapplyContext）⇒ 回退后原样合回。
+  // 合回必须落在**副本**上：instanceExt 是同一响应里的另一个出口，不能被任务侧的键污染。
+  const vars = r.variables ?? {}
+  const hasUserKey = Object.keys(vars).some(
+    k => k !== 'isFirstTaskNode' && k !== VAR_BRANCH_CTX && k !== VAR_REAPPLY_CTX)
+  let ext: Record<string, any> = vars
+  if (!hasUserKey) {
+    ext = { ...instanceExt }
+    if (vars[VAR_REAPPLY_CTX] != null) ext[VAR_REAPPLY_CTX] = vars[VAR_REAPPLY_CTX]
+  }
   return {
     id: r.id, processInstanceId: r.processInstanceId, taskName: r.taskName,
     displayName: r.displayName, taskType: r.taskType, performType: r.performType,
