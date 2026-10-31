@@ -6,6 +6,10 @@ import {
   ProcessInstance, type ProcessTask, type ProcessDefine,
   InstanceState, TaskState, SubmitType,
 } from './model.js'
+import {
+  attachCreated, createTaskAt, executeReapply, mergeReady, newContext,
+  parseMode, reapplyOf, RETURN_TO_SOURCE, scopesOf, stripReserved, withInstanceLock,
+} from './reapply.js'
 import type { ProcessRepository, ProcessExtRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
 // issues/141 G2：cc 写侧判重的 java `default` 方法在 TS 里的对应物（第三方仓储未实现判重 SPI 时兜旧行为）
 // issues/141 G10：归属值单值/集合归一的**那一份**判据（漏斗层与写侧层共用；issues/142 B 批
@@ -454,11 +458,17 @@ export class EngineImpl implements Engine {
     // spec04 §完成任务：公开方法回传「本次动作产出的任务行」（基准＝java exec.getProcessTaskList()）。
     // 作用域用 AsyncLocalStorage：一个 EngineImpl 实例并发处理多个请求，class 字段会互踩；
     // 而 node 没有 go 那样的 ctx 可挂，ALS 是等价的每次调用作用域（见 R92 notes）。
-    await this.createdScope.run(created, () => this.inTx(() => this.executeProcessTaskInner(taskId, operator, args)))
+    const pre = await this.repo.findTaskById(taskId)
+    await withInstanceLock(this, pre?.processInstanceId, () =>
+      this.createdScope.run(created, () => this.inTx(() => this.executeProcessTaskInner(taskId, operator, args))))
     return created
   }
 
   private async executeProcessTaskInner(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
+    args = stripReserved(args)
+    const pre = await this.repo.findTaskById(taskId)
+    if (pre && pre.taskState === TaskState.Doing && reapplyOf(pre.variables))
+      return await executeReapply(this, pre, operator, args)
     const { task, inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
     // issues/127 / 规范 11 §11.7「办理时抄送」腿的统一出口：任务更新已在 prepareExecuteTask
     // 落库，此处建 cc 行并逐人 fire CC_CREATE(4)，再回读实例。
@@ -589,6 +599,10 @@ export class EngineImpl implements Engine {
   }
 
   private async executeAndJumpToEndInner(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
+    const pre = await this.repo.findTaskById(taskId)
+    if (pre && pre.taskState === TaskState.Doing && reapplyOf(pre.variables)) {
+      throw new Error("带重提直返标记的申请待办不允许拒绝，只接受重新提交(submitType=5)")
+    }
     const { inst } = await this.prepareExecuteTask(taskId, operator, args)
     // 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
     inst.reject(new Date())
@@ -612,6 +626,11 @@ export class EngineImpl implements Engine {
   }
 
   private async executeAndJumpTaskInner(taskId: string, operator: string, args: Record<string, any> = {}, targetTaskName?: string): Promise<ProcessInstance> {
+    // 带直返上下文的进行中申请待办只接受重新提交(5)：命名跳转/退回上一步都在改状态前拒绝
+    const pre = await this.repo.findTaskById(taskId)
+    if (pre && pre.taskState === TaskState.Doing && reapplyOf(pre.variables)) {
+      throw new Error("带重提直返标记的申请待办不允许跳转，只接受重新提交(submitType=5)")
+    }
     const { task, inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
     if (!targetTaskName) {
       // issues/121 P2：ROLLBACK 走血缘版——复活 task.parentTaskId 指的那条历史行，
@@ -640,12 +659,43 @@ export class EngineImpl implements Engine {
     // spec04 §完成任务：公开方法回传「本次动作产出的任务行」（基准＝java exec.getProcessTaskList()）。
     // 作用域用 AsyncLocalStorage：一个 EngineImpl 实例并发处理多个请求，class 字段会互踩；
     // 而 node 没有 go 那样的 ctx 可挂，ALS 是等价的每次调用作用域（见 R92 notes）。
-    await this.createdScope.run(created, () => this.inTx(() => this.executeAndJumpToFirstTaskNodeInner(taskId, operator, args)))
+    const pre = await this.repo.findTaskById(taskId)
+    await withInstanceLock(this, pre?.processInstanceId, () =>
+      this.createdScope.run(created, () => this.inTx(() => this.executeAndJumpToFirstTaskNodeInner(taskId, operator, args))))
     return created
   }
 
   private async executeAndJumpToFirstTaskNodeInner(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
-    const { inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
+    args = stripReserved(args)
+    // 校验放在任何状态变更之前：带直返上下文的申请待办不得再次退回
+    const pre = await this.repo.findTaskById(taskId)
+    if (pre && pre.taskState === TaskState.Doing && reapplyOf(pre.variables)) {
+      throw new Error("带重提直返标记的申请待办不允许再次退回，只接受重新提交(submitType=5)")
+    }
+    let sourceNode: FlowNode | undefined
+    let direct = false
+    if (pre && pre.taskState === TaskState.Doing) {
+      const inst0 = await this.repo.findInstanceById(pre.processInstanceId)
+      const def0 = await this.repo.findDefineById(inst0!.defineId)
+      const flow0: FlowModel = JSON.parse(typeof def0!.content === 'string' ? def0!.content : new TextDecoder().decode(def0!.content as Uint8Array))
+      sourceNode = findNode(flow0, pre.taskName)
+      if (sourceNode && parseMode(sourceNode) === RETURN_TO_SOURCE) direct = true
+    }
+    const { task, inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
+    if (direct) {
+      if (sourceNode!.type !== TypeTask) throw new Error(`节点[${sourceNode!.id}]不是普通审批任务，不支持重提直返`)
+      const pt = String(sourceNode!.properties?.performType ?? '0').trim().toUpperCase()
+      if (pt === '1' || pt === 'ALL' || pt === 'COUNTERSIGN') throw new Error(`会签节点[${sourceNode!.id}]不支持退回修改直返`)
+      if (this.isFirstTaskNode(flow, sourceNode!)) throw new Error(`申请节点[${sourceNode!.id}]不能配置重提直返`)
+      const start0 = findNodeByType(flow, TypeStart)
+      const applyNode = start0 ? followEdges(flow, start0.id).find(n => n.type === TypeTask) : undefined
+      if (!applyNode) throw new Error('流程定义缺少申请节点，无法退回发起人')
+      applyNode.properties = applyNode.properties ?? {}
+      applyNode.properties.assignee = inst.operator
+      await createTaskAt(this, flow, applyNode, inst, inst.operator, vars, task.id,
+        [], newContext(task.id, sourceNode!.id, scopesOf(task.variables)))
+      return (await this.repo.findInstanceById(inst.id))!
+    }
     // 找到第一个任务节点，强制参与者为发起人，重新执行
     const startNode = findNodeByType(flow, TypeStart)
     if (startNode) {
@@ -796,8 +846,11 @@ export class EngineImpl implements Engine {
     // 任务创建（对齐 Java CreateTaskHandler：不触发节点拦截器——创建任务 ≠ 节点执行完成；
     // 任务完成的拦截器由 executeProcessTask 显式触发，1.8.0 SYNC 同步演进）
     if (node.type === TypeTask) {
+      const sink = this.createdScope.getStore()
+      const before = sink ? sink.length : 0
       await this.createTask(node, inst, operator, vars, await this.surrogateProcessName(flow, inst),
         parentId, this.isFirstTaskNode(flow, node))
+      if (sink) await attachCreated(this, flow, inst, sink.slice(before), node.id, parentId)
       return
     }
     // issues/142 A 批（spec 02-flow-definition.md §6.1 表第二行 · owner 2026-09-29/09-30 两次拍）：
@@ -817,8 +870,7 @@ export class EngineImpl implements Engine {
         for (const n of followEdges(flow, node.id)) await this.executeNode(flow, inst, n, operator, vars, parentId)
         return
       case TypeJoin: {
-        const doing = await this.repo.findDoingTasks(inst.id)
-        if (doing.length === 0)
+        if (await mergeReady(this, flow, inst, node.id, parentId))
           for (const n of followEdges(flow, node.id)) await this.executeNode(flow, inst, n, operator, vars, parentId)
         return
       }
