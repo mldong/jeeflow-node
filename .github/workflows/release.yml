@@ -8,20 +8,29 @@ jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
+    # npm Trusted Publishing（OIDC）：id-token 让 Actions 领一次性身份令牌，npm 按包页面登记的
+    # 可信发布者（本仓＋本文件）当场铸短期发布凭证 ⇒ 仓里/组织里都不需要长期 NPM_TOKEN
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
+      # 刻意不给 setup-node 传 registry-url：传了它会自动把组织里那枚 NPM_TOKEN 注成
+      # NODE_AUTH_TOKEN（YAML 不引用也会来），npm 见 token 就用 token ⇒ OIDC 永远验不出来
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          registry-url: 'https://registry.npmjs.org'
+      # Trusted Publishing 要求 npm CLI ≥ 11.5.1；node 22 自带 10.9.x
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@11
+      - name: Show toolchain
+        run: node --version && npm --version
       - name: Install dependencies
         run: npm ci
       - name: Build package
         run: npm run build
       - name: Publish to npm
         run: npm publish --access=public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # 单一事实源：同 verify.yml 复用一份脚本（脚本内含"URL 已 200 但 npm i 仍 ETARGET"的秒级重试）
       - name: Verify pullable from npm
