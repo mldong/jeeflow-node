@@ -21,9 +21,10 @@ function setup() {
   const idGen = { nextId() { n += 1; return String(base + n) } }
   const exprEval: ExpressionEvaluator = {
     async eval(expr: string, vars: Record<string, any>) {
-      const amt = Number(vars.amount ?? 0)
-      if (expr === 'amount > 1000') return amt > 1000
-      if (expr === 'amount <= 1000') return amt <= 1000
+      // 共享夹具用裸名 amount，issues/241 夹具用表单字段 f_amount
+      const amt = Number(vars.f_amount ?? vars.amount ?? 0)
+      if (expr === 'amount > 1000' || expr === 'f_amount > 1000') return amt > 1000
+      if (expr === 'amount <= 1000' || expr === 'f_amount <= 1000') return amt <= 1000
       return false
     },
   }
@@ -363,5 +364,67 @@ describe('任务行 ext 回退（issues/82-3 / 121 P1）× 直返保留键', () 
       `行级标记 isFirstTaskNode 不得进实例变量：${JSON.stringify(iExt)}`)
     assert.notEqual(iExt[KeySubmitType], undefined,
       `submitType 属实例级流转数据（java 同形），不该挡：${JSON.stringify(iExt)}`)
+  })
+
+  // issues/241：highLight 重放腿不得按重提后的实例变量选边。
+  // 决策节点的入边来源刻意放成 join（网关不产任务行）——任务行快照实例变量的栈
+  // 在「任务行前置」夹具上会被旧的最老行合并偶然救活，join 入边让那条通道失效。
+  it('直返重提后 highLight 不得点亮未走分支（issues/241）', async () => {
+    const flow = {
+      name: 'i241-return-highlight-join', displayName: '直返重提高亮（汇合后分支）', type: 'approval',
+      nodes: [
+        { id: 'start', type: 'snaker:start', text: { value: '开始' } },
+        { id: 'apply', type: 'snaker:task', text: { value: '发起申请' }, properties: { assignee: 'applicant', taskType: 0, performType: 0 } },
+        { id: 'fork1', type: 'snaker:fork', text: { value: '分叉' }, properties: {} },
+        { id: 'taskA', type: 'snaker:task', text: { value: '分支A' }, properties: { assignee: 'userA', taskType: 0, performType: 0 } },
+        { id: 'taskB', type: 'snaker:task', text: { value: '分支B' }, properties: { assignee: 'userB', taskType: 0, performType: 0 } },
+        { id: 'join1', type: 'snaker:join', text: { value: '汇合' }, properties: {} },
+        { id: 'decision1', type: 'snaker:decision', text: { value: '金额分支' }, properties: { expr: 'f_amount > 1000' } },
+        { id: 'taskHigh', type: 'snaker:task', text: { value: '高额审批' }, properties: { assignee: 'director', taskType: 0, performType: 0, reapplyMode: 'RETURN_TO_SOURCE' } },
+        { id: 'taskLow', type: 'snaker:task', text: { value: '普通审批' }, properties: { assignee: 'manager', taskType: 0, performType: 0 } },
+        { id: 'end', type: 'snaker:end', text: { value: '结束' } },
+      ],
+      edges: [
+        { id: 'e0', sourceNodeId: 'start', targetNodeId: 'apply', properties: {} },
+        { id: 'e1', sourceNodeId: 'apply', targetNodeId: 'fork1', properties: {} },
+        { id: 'e2', sourceNodeId: 'fork1', targetNodeId: 'taskA', properties: {} },
+        { id: 'e3', sourceNodeId: 'fork1', targetNodeId: 'taskB', properties: {} },
+        { id: 'e4', sourceNodeId: 'taskA', targetNodeId: 'join1', properties: {} },
+        { id: 'e5', sourceNodeId: 'taskB', targetNodeId: 'join1', properties: {} },
+        { id: 'e6', sourceNodeId: 'join1', targetNodeId: 'decision1', properties: {} },
+        { id: 'e7', sourceNodeId: 'decision1', targetNodeId: 'taskHigh', properties: { expr: 'f_amount > 1000' } },
+        { id: 'e8', sourceNodeId: 'decision1', targetNodeId: 'taskLow', properties: { expr: 'f_amount <= 1000' } },
+        { id: 'e9', sourceNodeId: 'taskHigh', targetNodeId: 'end', properties: {} },
+        { id: 'e10', sourceNodeId: 'taskLow', targetNodeId: 'end', properties: {} },
+      ],
+    }
+    const { engine, repo } = setup()
+    const def = { id: '', name: flow.name, displayName: flow.displayName, type: flow.type, state: 1, content: JSON.stringify(flow), version: 1 } as ProcessDefine
+    repo.addDefine(def)
+    const inst = await start(engine, repo, def.id, 'zhangsan', { f_amount: 6666 })
+    for (const [name, actor] of [['taskA', 'userA'], ['taskB', 'userB']] as const) {
+      const t = await doing(repo, inst.id, name)
+      assert.ok(t, `夹具自证：并行分支 ${name} 应就绪`)
+      await execute(engine, repo, t!, actor, SubmitType.Agree)
+    }
+    const high = await doing(repo, inst.id, 'taskHigh')
+    assert.ok(high, '夹具自证：汇合后 6666 应走 taskHigh')
+    await ret(engine, repo, high!, 'director')
+    const app = await doing(repo, inst.id, 'apply')
+    assert.ok(app, '退回后应有申请待办')
+    await act(repo, app!, 'zhangsan')
+    await engine.executeProcessTask(app!.id, 'zhangsan', { [KeySubmitType]: SubmitType.ReApply, f_amount: 666 })
+    assert.ok(await doing(repo, inst.id, 'taskHigh'), '重提必须回原来源节点')
+
+    const facade = new JeeflowFacade(engine, repo)
+    const r: any = await facade.flow('processInstance/highLight', { id: inst.id })
+    assert.equal(r.code, 0, JSON.stringify(r))
+    const edges: string[] = r.data.historyEdgeNames ?? []
+    const nodes: string[] = r.data.historyNodeNames ?? []
+    assert.ok(edges.includes('e7'), `汇合后的实际分支 e7 必须点亮（实际 ${edges}）`)
+    assert.ok(!edges.includes('e8'), `未走分支 e8 不得点亮（实际 ${edges}）`)
+    assert.ok(!edges.includes('e10'), `未走分支 e10 不得点亮（实际 ${edges}）`)
+    assert.ok(!nodes.includes('taskLow'), `未走节点 taskLow 不得进历史（实际 ${nodes}）`)
+    assert.ok(!nodes.includes('end'), `未走节点 end 不得进历史（实际 ${nodes}）`)
   })
 })

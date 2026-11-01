@@ -1018,13 +1018,13 @@ export class JeeflowFacade {
     if (visited.has(nodeId)) return
     visited.add(nodeId)
     const src = (flow.nodes ?? []).find((n: any) => n.id === nodeId)
-    for (const e of flow.edges ?? []) {
-      if (e.sourceNodeId !== nodeId) continue
-      // 决策节点：输出边表达式求值过滤（对齐 boot3 recursionModel，issues/06）
-      if (src?.type === 'snaker:decision') {
-        const expr = e.properties?.expr
-        if (expr && !await this.evalDecisionExpr(flow, src, expr, vars, historyTasks, instanceId, defineId)) continue
-      }
+    let outs = (flow.edges ?? []).filter((e: any) => e.sourceNodeId === nodeId)
+    // issues/241：决策节点选边以任务行佐证为准（活跃目标 → 有任务行的目标），
+    // 一条佐证都没有才回落到按当前实例变量求值
+    if (src?.type === 'snaker:decision') {
+      outs = await this.selectDecisionEdges(flow, src, outs, active, vars, historyTasks, instanceId, defineId)
+    }
+    for (const e of outs) {
       if (e.id && !edges.includes(e.id)) edges.push(e.id)
       const target = (flow.nodes ?? []).find((n: any) => n.id === e.targetNodeId)
       if (!target) continue
@@ -1033,6 +1033,34 @@ export class JeeflowFacade {
       if (active.includes(tid)) continue // 遇活跃节点停止深入（边名已在上面收录）
       await this.collectPath(flow, tid, active, history, edges, visited, vars, historyTasks, instanceId, defineId)
     }
+  }
+
+  /** issues/241：决策节点选边——先按表达式求值（issues/06/153 旧口径），
+   *  **当表达式给出的非空结果与任务行佐证相矛盾时，以任务行为准**；求值失败/零命中时保持
+   *  既有降级面（issues/164/201 的口径不被本规则改写）。
+   *  直返单重提后实例变量已改，按当前值重放会选出没走过的分支；走过的分支在任务表里有行。 */
+  private async selectDecisionEdges(flow: any, decision: any, outs: any[], active: string[],
+    vars: Record<string, any>, historyTasks: any[],
+    instanceId: string, defineId: string): Promise<any[]> {
+    const selected: any[] = []
+    for (const e of outs) {
+      const expr = e.properties?.expr
+      if (!expr || await this.evalDecisionExpr(flow, decision, expr, vars, historyTasks, instanceId, defineId)) {
+        selected.push(e)
+      }
+    }
+    if (selected.length === 0) return selected
+    const taskNames = new Set((historyTasks ?? []).map((t: any) => t.taskName))
+    for (const e of selected) {
+      if (active.includes(e.targetNodeId) || taskNames.has(e.targetNodeId)) {
+        return selected // 表达式与执行事实一致，维持原口径
+      }
+    }
+    const activeHits = outs.filter(e => active.includes(e.targetNodeId))
+    if (activeHits.length > 0) return activeHits
+    const evidenced = outs.filter(e => taskNames.has(e.targetNodeId))
+    if (evidenced.length > 0) return evidenced
+    return selected
   }
 
   /** 决策输出边表达式求值（args = 实例变量 + 决策节点前置任务变量）
