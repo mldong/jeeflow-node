@@ -326,4 +326,42 @@ describe('任务行 ext 回退（issues/82-3 / 121 P1）× 直返保留键', () 
     assert.equal(app.instanceExt[VAR_REAPPLY_CTX], undefined,
       `合回不得污染同一响应里的 instanceExt 出口：${JSON.stringify(app.instanceExt)}`)
   })
+
+  it('issues/240：行级 isFirstTaskNode 不得随执行池写进实例变量（审批行/申请行两向）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, undefined)
+    const def = loadFlow(repo, '02-multi-task.json')
+    const started = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: def.id, operator: 'applicant' })
+    assert.equal(started.code, 0, JSON.stringify(started))
+
+    // ① 审批待办 task1 行：ext 回退实例变量，行级标记不得透出 true
+    const r1: any = await facade.flow('processTask/todoList', { operator: 'leader' })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    assert.ok(r1.data.rows.length > 0, r1)
+    const row = r1.data.rows[0]
+    assert.equal(row.taskName, 'task1', JSON.stringify(row))
+    assert.equal(row.ext.isFirstTaskNode, undefined,
+      `审批行 ext 不得带 isFirstTaskNode=true（那是 apply 行的标记随实例写回漂过来的）：${JSON.stringify(row.ext)}`)
+
+    // ② leader submitType=6 退回发起人 ⇒ 申请待办 apply 行 ext 不得透出 false
+    const r2: any = await facade.flow('processTask/execute',
+      { processTaskId: row.id, operator: 'leader', submitType: SubmitType.RollbackToOperator })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    const r3: any = await facade.flow('processTask/todoList', { operator: 'applicant', pageSize: 100 })
+    assert.equal(r3.code, 0, JSON.stringify(r3))
+    const app = r3.data.rows.filter((x: any) => x.taskName === 'apply')
+    assert.ok(app.length > 0, JSON.stringify(r3.data.rows))
+    assert.equal(app[0].ext.isFirstTaskNode, undefined,
+      `申请行 ext 不得带 isFirstTaskNode=false（那是 task1 行的标记）：${JSON.stringify(app[0].ext)}`)
+
+    // ③ 普查腿：办结后实例变量无行级标记；submitType 在（java 同形，不挡的反向钉子）
+    const r4: any = await facade.flow('processInstance/page', { operator: 'applicant' })
+    assert.equal(r4.code, 0, JSON.stringify(r4))
+    const iExt = r4.data.rows[0].ext
+    assert.equal(iExt.isFirstTaskNode, undefined,
+      `行级标记 isFirstTaskNode 不得进实例变量：${JSON.stringify(iExt)}`)
+    assert.notEqual(iExt[KeySubmitType], undefined,
+      `submitType 属实例级流转数据（java 同形），不该挡：${JSON.stringify(iExt)}`)
+  })
 })

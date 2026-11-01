@@ -1285,6 +1285,12 @@ function mergeExecIntoInstance(base: Record<string, any>, execVars: Record<strin
   const out: Record<string, any> = { ...base }
   for (const [k, v] of Object.entries(execVars)) {
     if (k.startsWith('u_')) continue
+    // isFirstTaskNode 同是**行级**建单标记（建单不变量②）：随共享执行池进 execVars，不挡就
+    // 逐节点漂移写进实例变量，把「最近办结那行」的标记透成实例级——issues/240 实测两向同错
+    // （审批行被标成申请节点、退回后申请行被标成非申请节点）。go mergeExecIntoInstance 同款
+    // 挡法（issues/121 P1 已落）；submitType 不在此列：java ProcessInstance.completeTask 的
+    // variables.putAll(args) 同样把它落进实例列。
+    if (k === 'isFirstTaskNode') continue
     // 「退回修改、重提直返」的两枚保留键（spec 04）是**行级**引擎内部状态：_branchCtx 是分支
     // 归属栈、_reapplyContext 只出现在申请待办上，实例层没有对应语义。若不挡，任务办结时它们
     // 会随执行上下文写进实例变量并落库 ⇒ 每个出口（任务行 instanceExt／实例行 ext）都透出内部
