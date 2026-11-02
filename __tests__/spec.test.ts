@@ -3877,43 +3877,42 @@ class CountDefineRepo extends MemoryRepository {
 }
 
 // ═══ issues/121 P2 退回上一步（血缘版）两格负向 ═══════════════════════════════
-describe('issues/121 P2 血缘回退负向：20010007 无血缘 / 20010008 守卫', () => {
-  it('首任务节点上退回 ⇒ 无血缘（parent 为 0 与 P1 之前老行的 undefined 两种形状）报 20010007', async () => {
+describe('issues/121 P2 血缘回退负向：20010007 无血缘 / 20010008 守卫（issues/243 甲案：报错即零写入）', () => {
+  it('首任务节点上退回 ⇒ 无血缘（parent 为 0、P1 之前老行的 undefined、指向不存在行三种形状）报 20010007 且零写入', async () => {
     const { engine, repo, def } = surrHarness('lin07', surrFlowJson('lin07',
       [{ id: 'b1', assignee: 'ln-zhang' }, { id: 'b2', assignee: 'ln-wang' }]))
     const inst = await engine.startProcessInstanceById(def.id, 'ln-boss')
     const b1 = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'b1')!
     assert.equal(b1.parentTaskId ?? '0', '0', '前置条件：发起那条 parent 应为 0')
+    const rows = (await repo.findInstanceById(inst.id))!.tasks.length
     await assert.rejects(() => engine.executeAndJumpTask(b1.id, 'ln-zhang', {}), (err: any) =>
       String(err?.message).includes('上一步任务ID为空，无法驳回至上一步处理') && !String(err?.message).includes('2001000'))
+    // issues/243 甲案：血缘守卫排在 prepareExecuteTask（内部 completeTask + updateTask 会办结当前行）
+    // 之前 ⇒ 报错那一次零写入，行总数不变，且当前待办还在办理人手里（修前会被静默办结）。
+    assert.equal(rows, (await repo.findInstanceById(inst.id))!.tasks.length, '报错即零写入：任务行总数不变')
+    assert.ok((await repo.findTaskById(b1.id))!.isDoing(), '报错后当前待办必须仍是 DOING')
 
     // 老行形状：P1 之前落的数据该列是 NULL（仓储读回 undefined），同样必须报错——
     // 不能因为"取不到 parent"就静默走"什么都不建单"那条路。
-    // 另起一条实例：上一段那次退回已把这条 b1 办结（内存仓储无事务），复用它会先撞到"任务不在进行中"。
-    const inst2 = await engine.startProcessInstanceById(def.id, 'ln-boss')
-    const legacy = (await repo.findDoingTasks(inst2.id)).find(t => t.taskName === 'b1')!
-    legacy.parentTaskId = undefined
-    await repo.updateTask(legacy)
-    const beforeRollback = (await repo.findDoingTasks(inst2.id)).length
-    await assert.rejects(() => engine.executeAndJumpTask(legacy.id, 'ln-zhang', {}), (err: any) =>
+    // 复用上面那条即可（issues/243 甲案）：上一段报错没动它（零写入），这里只把它的 parent 改成 NULL。
+    b1.parentTaskId = undefined
+    await repo.updateTask(b1)
+    await assert.rejects(() => engine.executeAndJumpTask(b1.id, 'ln-zhang', {}), (err: any) =>
       String(err?.message).includes('上一步任务ID为空，无法驳回至上一步处理') && !String(err?.message).includes('2001000'))
-    assert.ok((await repo.findDoingTasks(inst2.id)).length <= beforeRollback,
-      '报错即不建单：不该凭空多出进行中任务（内存仓储无事务，只断"不多"）')
+    assert.ok((await repo.findTaskById(b1.id))!.isDoing(), 'NULL 血缘那一档同样零写入：当前行仍是 DOING')
+    assert.equal(rows, (await repo.findInstanceById(inst.id))!.tasks.length, 'NULL 血缘也不建单：行数不变')
 
     // 第三种形状：parent 是个非 0 但**指不到真实行**的值（老数据被清理过 / 跨库迁过来）
     // ⇒ 走"取不到历史行"那条分支，同样必须报 20010007，不得静默不建单
-    const inst3 = await engine.startProcessInstanceById(def.id, 'ln-boss')
-    const dangling = (await repo.findDoingTasks(inst3.id)).find(t => t.taskName === 'b1')!
-    dangling.parentTaskId = '9223372036854775807'
-    await repo.updateTask(dangling)
-    const before3 = (await repo.findDoingTasks(inst3.id)).length
-    await assert.rejects(() => engine.executeAndJumpTask(dangling.id, 'ln-zhang', {}), (err: any) =>
+    b1.parentTaskId = '9223372036854775807'
+    await repo.updateTask(b1)
+    await assert.rejects(() => engine.executeAndJumpTask(b1.id, 'ln-zhang', {}), (err: any) =>
       String(err?.message).includes('上一步任务ID为空，无法驳回至上一步处理') && !String(err?.message).includes('2001000'))
-    assert.ok((await repo.findDoingTasks(inst3.id)).length <= before3,
-      '"取不到历史行"也不得静默不建单')
+    assert.ok((await repo.findTaskById(b1.id))!.isDoing(), '"取不到历史行"那一档同样零写入：当前行仍是 DOING')
+    assert.equal(rows, (await repo.findInstanceById(inst.id))!.tasks.length, '"取不到历史行"也不建单：行数不变')
   })
 
-  it('血缘前驱跨不过 fork（boot2 语义：遇 fork/join/start 跳过该入边不再深入）⇒ 报 20010008', async () => {
+  it('血缘前驱跨不过 fork（boot2 语义：遇 fork/join/start 跳过该入边不再深入）⇒ 报 20010008 且零写入', async () => {
     const nd = (id: string, type: string, properties: any = {}) => ({ id, type, properties, text: { value: id } })
     const ed = (a: string, b: string) => ({ id: `e_${a}_${b}`, sourceNodeId: a, targetNodeId: b, properties: {} })
     const content = JSON.stringify({
@@ -3934,8 +3933,45 @@ describe('issues/121 P2 血缘回退负向：20010007 无血缘 / 20010008 守�
     const branch = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'taskA')!
     assert.ok(branch.parentTaskId && branch.parentTaskId !== '0',
       '前置条件：分支行的 parent 应已由 P1 写入（否则这条红是因为"无血缘"而不是守卫）')
+    const rows = (await repo.findInstanceById(inst.id))!.tasks.length
     await assert.rejects(() => engine.executeAndJumpTask(branch.id, 'fk-a', {}), (err: any) =>
       String(err?.message).includes('无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务') && !String(err?.message).includes('2001000'))
+    // issues/243 甲案：canRejected 那一档同样零写入（守卫排在 completeTask 之前）——
+    // 报错后 branch 那条并行待办仍在办理人手里，且没有凭空多出的行。
+    assert.ok((await repo.findTaskById(branch.id))!.isDoing(), '报错后当前行必须仍是 DOING（零写入）')
+    assert.equal(rows, (await repo.findInstanceById(inst.id))!.tasks.length, '报错不建单：实例下任务行总数不变')
+  })
+
+  it('血缘 parent 指向旁支（非祖先的历史行）⇒ 报 20010008 且零写入（issues/243 甲案补格）', async () => {
+    const nd = (id: string, type: string, properties: any = {}) => ({ id, type, properties, text: { value: id } })
+    const ed = (a: string, b: string) => ({ id: `e_${a}_${b}`, sourceNodeId: a, targetNodeId: b, properties: {} })
+    const content = JSON.stringify({
+      name: 'lin08-side', displayName: 'lin08-side', type: 'approval',
+      nodes: [nd('start', 'snaker:start'),
+        nd('apply', 'snaker:task', { assignee: 'fk-zhang', taskType: 0, performType: 0 }),
+        nd('fork1', 'snaker:fork'),
+        nd('taskA', 'snaker:task', { assignee: 'fk-a', taskType: 0, performType: 0 }),
+        nd('taskB', 'snaker:task', { assignee: 'fk-b', taskType: 0, performType: 0 }),
+        nd('join1', 'snaker:join'), nd('end', 'snaker:end')],
+      edges: [ed('start', 'apply'), ed('apply', 'fork1'), ed('fork1', 'taskA'), ed('fork1', 'taskB'),
+        ed('taskA', 'join1'), ed('taskB', 'join1'), ed('join1', 'end')],
+    })
+    const { engine, repo, def } = surrHarness('lin08-side', content)
+    const inst = await engine.startProcessInstanceById(def.id, 'fk-boss')
+    const apply = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'apply')!
+    await engine.executeProcessTask(apply.id, 'fk-zhang')
+    const a = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'taskA')!
+    const sibling = (await repo.findDoingTasks(inst.id)).find(t => t.taskName === 'taskB')!
+    // 把 taskA 行的血缘 parent 改指到同层兄弟 taskB 的行（**旁支、非祖先**）：回溯只能经 fork1 上溯，
+    // 永远命中不了 taskB ⇒ canRejected 不过（java JeeflowFullTest test168 同款形状）。
+    a.parentTaskId = sibling.id
+    await repo.updateTask(a)
+    const rows = (await repo.findInstanceById(inst.id))!.tasks.length
+    await assert.rejects(() => engine.executeAndJumpTask(a.id, 'fk-a', {}), (err: any) =>
+      String(err?.message).includes('无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务') && !String(err?.message).includes('2001000'))
+    assert.ok((await repo.findTaskById(a.id))!.isDoing(), '报错后当前行必须仍是 DOING（零写入）')
+    assert.equal(rows, (await repo.findInstanceById(inst.id))!.tasks.length, '报错不建单：实例下任务行总数不变')
+    assert.equal((await repo.findInstanceById(inst.id))!.state, InstanceState.Doing, '实例状态不受这次失败影响')
   })
 })
 describe('issues/122 审批记录行的可空时间列必须出键', () => {

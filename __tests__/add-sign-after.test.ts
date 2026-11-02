@@ -314,20 +314,26 @@ describe('后加签（可重复）（Node）', () => {
     assert.equal(await doing(repo, inst.id, 'final'), undefined)
   })
 
-  it('13 加签链上退回上一步(3) ⇒ 既有血缘守卫拦下（同节点，报 20010008 档文案）', async () => {
+  it('13 加签链上退回上一步(3) ⇒ 既有血缘守卫拦下（同节点，报 20010008 档文案）＋报错即零写入', async () => {
     const { engine, repo } = setup()
     const inst = await startToReview(repo, engine, ADD_SIGN_ON)
     const a = (await doing(repo, inst.id, 'review'))!
     await engine.executeProcessTask(a.id, 'userA', agree('userB'))
     const b = (await doing(repo, inst.id, 'review'))!
+    const beforeRows = await rows(repo, inst.id, 'review')
     // 当前行与其血缘 parent 同节点 ⇒ canRejected 不过 ⇒ 照会签先例报那一档（零改动复用既有守卫）
     await assert.rejects(() => engine.executeAndJumpTask(b.id, 'userB', plain(SubmitType.Rollback), ''),
       /无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务/)
     assert.equal(await doing(repo, inst.id, 'final'), undefined, '被拒的这一次不得放行出边')
     assert.equal((await repo.findInstanceById(inst.id))!.state, InstanceState.Doing, '实例仍进行中')
-    // ⚠️ 本格不核对"b 那一行是否被办结"：血缘守卫排在 completeTask 之后，内存仓储无回滚 ⇒
-    // 行会被办结而流程不前进（真库那侧由动作级事务整体回滚）。这是**退回上一步那条腿**的既有
-    // 形状（会签链同款），不是本轮加签引入的，改它要动的是守卫位置、归另案。
+    // issues/243 甲案（2026-11-03）：血缘守卫由引擎排在 prepareExecuteTask（内部 completeTask +
+    // updateTask 会把当前行办结）**之前** ⇒ 报错那一次零写入：当前行仍是 DOING、待办还在办理人
+    // 手里、没有复活行。修前的形状是"点了退回、报错了、待办也没了"（守卫排在办结之后，内存仓储
+    // 无回滚）；真库（JDBC）外层有动作级事务，两种位序都整笔回滚，观察不到差别——这一档只有内存
+    // 仓储照得出来，故本格同时钉文案与零写入。
+    await assertNoWrite(repo, b, inst.id, 'review', beforeRows)
+    assert.equal((await doing(repo, inst.id, 'review'))!.id, b.id,
+      '待办还是报错那一条，不是复活出的新行')
   })
 
   // ═══ 回归与并发 ═══
