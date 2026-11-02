@@ -1,6 +1,6 @@
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite'
 import { KeySubmitType, KeyDeptID } from './engine.js'
-import { TypeEnd, TypeTask, TypeCustom, InstanceState, SubmitType, type ProcessInstance, type ProcessDefine, type FlowNode } from './model.js'
+import { TypeEnd, TypeTask, TypeCustom, InstanceState, SubmitType, type ProcessInstance, type ProcessTask, type ProcessDefine, type FlowNode } from './model.js'
 import type { FlowInterceptor } from './extensions.js'
 import type { HandlerRegistry } from './registry.js'
 
@@ -270,7 +270,7 @@ export class PersistPostInterceptor implements FlowInterceptor {
     // 表不存在等探测失败是配置错误，必须显性暴露（与 Java/Python 抛异常一致）
     if (await writer.exists(tableName, 'process_instance_id', inst.id)) return
 
-    const data = this.extractFields(inst, null, false, true) // 只 f_ 全量
+    const data = this.extractFields(inst, node, null, false, true) // 只 f_ 全量
     this.fillContext(data, inst)
     writer.fillSystemFields(data, true)
     await writer.insert(tableName, data)
@@ -288,7 +288,7 @@ export class PersistPostInterceptor implements FlowInterceptor {
     // 结束/网关等非任务节点只定稿状态，避免全量覆盖任务节点的只读/隐藏限制
     const isTask = node.type === TypeTask || node.type === TypeCustom
     const fieldPerm = isTask ? this.resolveFieldPermission(node) : null
-    const data = this.extractFields(inst, fieldPerm, !exists || isTask, !exists || isTask)
+    const data = this.extractFields(inst, node, fieldPerm, !exists || isTask, !exists || isTask)
 
     // 状态字段：优先 {节点ID}_{状态码} 列，无则 {节点ID} 列。
     // 任务节点写 DOING(10)——任务推进状态；结束节点写实例最终状态（FINISHED/REJECT）
@@ -334,10 +334,20 @@ export class PersistPostInterceptor implements FlowInterceptor {
     return true
   }
 
-  /** 提取字段：f_ 去前缀（SYNC 下按字段权限过滤——只读/隐藏不更新；
+  /**
+   * 提取字段：f_ 去前缀（SYNC 下按字段权限过滤——只读/隐藏不更新；
    *  includeFormFields=false 时不带出，用于非任务节点定稿避免覆盖只读限制）；
-   *  tf_ 去前缀冗余（有列则写，列过滤由 writer 做） */
-  private extractFields(inst: ProcessInstance, fieldPerm: Record<string, unknown> | null,
+   *  tf_ 去前缀冗余（有列则写，列过滤由 writer 做）。
+   *
+   * ⚠️ **两半的取值源不同**（后加签轮起，规范 04「流程变量约定」末注）：
+   *  - `f_` 读**实例变量**（表单数据是流程级事实，跨节点可读，规范 09 §4.3 的「表单字段」行）；
+   *  - `tf_` 读**本节点已完成那条任务行的变量**——实例变量不再收 `tf_*` 控制键（收了就会
+   *    跨请求复活：上一轮的 `tf_opinion` 会被下一节点再写一遍）。规范 09 §4.2 那句
+   *    「任务节点**提交的** `tf_` 前缀变量」由此从"实例变量里的残留"更正为"这一次提交落在
+   *    该节点任务行上的那份"，语义不变、来源换掉，`__tests__/persist.test.ts` ⑥ 的
+   *    `opinion` 断言即这条腿的取证格。
+   */
+  private extractFields(inst: ProcessInstance, node: FlowNode, fieldPerm: Record<string, unknown> | null,
                         includeTaskFields: boolean, includeFormFields: boolean): Record<string, unknown> {
     const prefix = this.fieldPrefix || 'f_'
     const taskPrefix = this.taskFieldPrefix || 'tf_'
@@ -347,11 +357,32 @@ export class PersistPostInterceptor implements FlowInterceptor {
         const name = k.slice(prefix.length)
         if (!this.isEditable(fieldPerm, name)) continue
         data[name] = v
-      } else if (includeTaskFields && k.startsWith(taskPrefix) && k.length > taskPrefix.length) {
+      }
+    }
+    if (!includeTaskFields) return data
+    for (const [k, v] of Object.entries(this.taskVarsOf(inst, node))) {
+      if (k.startsWith(taskPrefix) && k.length > taskPrefix.length) {
         data[k.slice(taskPrefix.length)] = v
       }
     }
     return data
+  }
+
+  /**
+   * 本节点**已完成**任务行里最晚办结那一条的变量（`tf_` 冗余那条腿的取值源）。
+   * 多参与者节点（会签／同圈加签）各行的变量都是"自己那次提交"的整包，取最晚办结那条＝
+   * "最后一次提交写了什么就落什么"，与改前读实例变量拿到的那份同档（改前实例变量正是
+   * 最近一次提交残留）。节点上没有已完成行 ⇒ 空包（不写 `tf_` 列，也不兜底旧值）。
+   */
+  private taskVarsOf(inst: ProcessInstance, node: FlowNode): Record<string, any> {
+    let latest: ProcessTask | undefined
+    for (const t of inst.tasks ?? []) {
+      if (t.taskName !== node.id || !t.isFinished()) continue
+      const ts = t.finishTime instanceof Date ? t.finishTime.getTime() : 0
+      const cur = latest?.finishTime instanceof Date ? latest.finishTime.getTime() : 0
+      if (!latest || ts >= cur) latest = t
+    }
+    return latest?.variables ?? {}
   }
 
   /** 任务节点字段权限（node.properties.field 的 PERMISSION_x；缺省 null=全部可编辑） */

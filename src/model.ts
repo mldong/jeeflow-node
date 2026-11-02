@@ -183,6 +183,29 @@ export enum CountersignType {
 
 export const BusinessNoKey = 'BUSINESS_NO'
 
+/**
+ * 任务执行参数前缀（规范 06 §2.5 变量前缀表：`tf_` = 任务表单字段／任务变量）。
+ * 住在模型层是因为**两条腿都要读**：聚合根 `completeTask` 的实例变量合并、引擎的执行变量写回
+ * （`mergeExecIntoInstance`）——同一枚判据只此一处。
+ */
+export const TaskFormPrefix = 'tf_'
+
+/**
+ * 剔掉控制类键（`tf_*`），只留数据类键——规范 04「流程变量约定」末注的判据本体：
+ * 办理提交的 `tf_*`（审批意见、附件、抄送人、下一节点处理人、后加签指定人）**只落该次提交的
+ * 任务行变量**，不得并进实例变量。整包合到实例上会让上一轮的控制键**跨请求复活**——
+ * `tf_addSignOperators` 使后续办结凭空多建一条本节点待办，`tf_nextNodeOperator` 同病，
+ * `tf_approvalComment` 则把某个人的审批意见污染成全流程可读的变量。
+ */
+export function omitTaskControlKeys(vars: Record<string, any> | null | undefined): Record<string, any> {
+  const out: Record<string, any> = {}
+  for (const [k, v] of Object.entries(vars ?? {})) {
+    if (k.startsWith(TaskFormPrefix)) continue
+    out[k] = v
+  }
+  return out
+}
+
 // ─── 聚合根：ProcessInstance ───────────────────────────────────────────────────
 
 export class ProcessInstance {
@@ -216,10 +239,19 @@ export class ProcessInstance {
     })
   }
 
-  /** 完成任务（子实体状态转换 + 实例变量合并） */
+  /**
+   * 完成任务（子实体状态转换 + 实例变量合并）。
+   *
+   * 两面判据（规范 04 · 聚合根方法清单 `completeTask` 行）：
+   * ① **子实体收整包参数留痕**——`task.finish` 拿的是原样 `vars`，`tf_*` 全数落在这一条任务行上，
+   *    审计与 `taskFormData` 出口读的就是它；
+   * ② **实例变量只合并数据类键**——`tf_*` 一律排除（根因见 `omitTaskControlKeys` 的注释：
+   *    上一轮的 `tf_addSignOperators` 一旦并进实例变量就会跨请求复活）。
+   * 引擎侧的 `mergeExecIntoInstance` 是同一条尺子的第二道（它还要排除 `u_*` 与行级内部键）。
+   */
   completeTask(task: ProcessTask, operator: string, vars: Record<string, any>, now: Date): void {
     task.finish(operator, vars, now)
-    this.variables = vars
+    this.variables = omitTaskControlKeys(vars)
     this.updateTime = now
     this.updateUser = operator
   }

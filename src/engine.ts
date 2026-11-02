@@ -2,15 +2,20 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import {
   type FlowModel, type FlowNode,
   TypeStart, TypeEnd, TypeTask, TypeDecision, TypeFork, TypeJoin, TypeCustom,
-  KnownNodeTypes,
+  KnownNodeTypes, TaskFormPrefix,
   ProcessInstance, type ProcessTask, type ProcessDefine,
   InstanceState, TaskState, SubmitType,
 } from './model.js'
 import {
-  attachCreated, createTaskAt, executeReapply, mergeReady, newContext,
+  attachCreated, buildScopes, createTaskAt, executeReapply, mergeReady, newContext,
   parseMode, reapplyOf, RETURN_TO_SOURCE, scopesOf, stripReserved, withInstanceLock,
   VAR_BRANCH_CTX, VAR_REAPPLY_CTX,
 } from './reapply.js'
+// 后加签（可重复）：判据/账本/解析期校验的落点在本模块，形状基准＝java `AddSignSupport`
+import {
+  AddSignRoundKey, abandonDoingOnNode, allowAddSignOf, appendHistory, checkFlowConfig,
+  hasDoingOnNode, operators as addSignOperators, roundOf as addSignRoundOf, validateSubmission,
+} from './addsign.js'
 import type { ProcessRepository, ProcessExtRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
 // issues/141 G2：cc 写侧判重的 java `default` 方法在 TS 里的对应物（第三方仓储未实现判重 SPI 时兜旧行为）
 // issues/141 G10：归属值单值/集合归一的**那一份**判据（漏斗层与写侧层共用；issues/142 B 批
@@ -40,6 +45,9 @@ export const KeyAutoGenTitle = 'autoGenTitle'
 //   f_ccActors  发起时抄送   tf_ccActors 办理时抄送
 export const KeyCcActorsStart = 'f_ccActors'
 export const KeyCcActors      = 'tf_ccActors'
+// 后加签（可重复）协议键（规范 06 §2.7）：常量本体住在 addsign.ts（引擎与加签支持层共用一份），
+// 这里按 KeyNextNodeOperator／KeyCcActors 的既有形状重导出，集成方从 `./engine` 一处取齐。
+export { KeyAddSignOperators, KeyAddSignHistory, AddSignRoundKey } from './addsign.js'
 // issues/142 A 批：记录类节点（snaker:custom）处理器返回值的**缺省变量键**
 // ——逐字对齐 Java `FlowConst.CUSTOM_RETURN_VAL`（enums/FlowConst.java:107）；
 // 节点 properties.val 给了就用 val（java CustomParser.java:20-22 的同一判据）。
@@ -416,8 +424,7 @@ export class EngineImpl implements Engine {
   private async startProcessInstanceByIdInner(defineId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
     const def = await this.repo.findDefineById(defineId)
     if (!def) throw new Error(`define not found: ${defineId}`)
-    const content = typeof def.content === 'string' ? def.content : new TextDecoder().decode(def.content as Uint8Array)
-    const flow: FlowModel = JSON.parse(content)
+    const flow = loadFlowModel(def.content)
 
     const vars = { ...args }
     await this.addUserInfo(operator, vars)
@@ -470,7 +477,7 @@ export class EngineImpl implements Engine {
     const pre = await this.repo.findTaskById(taskId)
     if (pre && pre.taskState === TaskState.Doing && reapplyOf(pre.variables))
       return await executeReapply(this, pre, operator, args)
-    const { task, inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
+    const { task, inst, flow, vars, args: execArgs } = await this.prepareExecuteTask(taskId, operator, args)
     // issues/127 / 规范 11 §11.7「办理时抄送」腿的统一出口：任务更新已在 prepareExecuteTask
     // 落库，此处建 cc 行并逐人 fire CC_CREATE(4)，再回读实例。
     // 基准＝Java JeeflowEngineImpl.executeProcessTask（node.execute 之后 handleCcActors、
@@ -566,6 +573,25 @@ export class EngineImpl implements Engine {
           if (doing.length > 0) return finishExecute()
         }
       }
+      // ── 后加签档（规范 04 · 后加签）：TaskModel 的推进闸由两档变三档 ──
+      // java 形状＝`if (performType==COUNTERSIGN) 会签 else if (allowAddSign) 加签 else 放行出边`；
+      // 会签那两档在上面（解析期已禁止会签节点配 allowAddSign，故此处再加一道 performType 判据，
+      // 双保险不替代根因）。merged 三判据**顺序不可反**：
+      //   ① 本次给了加签人 → 同节点建单、不流转；
+      //   ② 没给但本节点还有未完成待办（多选时同圈兄弟）→ 不流转；
+      //   ③ 两者皆否 → 落穿到下面的出边放行。
+      // 加签人只认**本次请求**的 execArgs（规范 04「流程变量约定」末注的根因：合并后的 vars
+      // 里可能躺着上一轮的 tf_addSignOperators）。
+      if (curNode.type === TypeTask && !isCountersign(curNode.properties?.performType) && allowAddSignOf(curNode)) {
+        const ops = addSignOperators(execArgs)
+        if (ops.length === 0) {
+          // 停止条件即本判据本身：没点人且本节点再无未完成待办 ⇒ 放行出边（不设第二判据源）
+          if (hasDoingOnNode(inst, curNode.id)) return finishExecute()
+        } else {
+          await this.execAddSign(flow, inst, curNode, task, operator, ops, now)
+          return finishExecute()
+        }
+      }
       // issues/91：会签节点 merged 后（ONE_VOTE_VETO 否决 / 全部完成任一路径），
       // 废弃该节点剩余 DOING 任务（对齐内置引擎 abandonProcessTask）：
       // SEQUENTIAL 逐人创建天然 no-op；PARALLEL 全员预创建，否决时废弃其余成员
@@ -604,7 +630,9 @@ export class EngineImpl implements Engine {
     if (pre && pre.taskState === TaskState.Doing && reapplyOf(pre.variables)) {
       throw new Error("带重提直返标记的申请待办不允许拒绝，只接受重新提交(submitType=5)")
     }
-    const { inst } = await this.prepareExecuteTask(taskId, operator, args)
+    const { task, inst, flow } = await this.prepareExecuteTask(taskId, operator, args)
+    // 拒绝结束：本节点未完成的加签任务一并废弃，不留孤儿待办（规范 04 · 后加签／语义边界表）
+    await this.abandonAddSignDoing(flow, inst, task.taskName, new Date())
     // 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
     inst.reject(new Date())
     await this.repo.updateInstance(inst)
@@ -678,11 +706,13 @@ export class EngineImpl implements Engine {
     if (pre && pre.taskState === TaskState.Doing) {
       const inst0 = await this.repo.findInstanceById(pre.processInstanceId)
       const def0 = await this.repo.findDefineById(inst0!.defineId)
-      const flow0: FlowModel = JSON.parse(typeof def0!.content === 'string' ? def0!.content : new TextDecoder().decode(def0!.content as Uint8Array))
+      const flow0 = loadFlowModel(def0!.content)
       sourceNode = findNode(flow0, pre.taskName)
       if (sourceNode && parseMode(sourceNode) === RETURN_TO_SOURCE) direct = true
     }
     const { task, inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
+    // 退回发起人：本节点未完成的加签任务一并废弃，不留孤儿待办（规范 04 · 后加签／语义边界表）
+    await this.abandonAddSignDoing(flow, inst, task.taskName, new Date())
     if (direct) {
       if (sourceNode!.type !== TypeTask) throw new Error(`节点[${sourceNode!.id}]不是普通审批任务，不支持重提直返`)
       const pt = String(sourceNode!.properties?.performType ?? '0').trim().toUpperCase()
@@ -729,8 +759,12 @@ export class EngineImpl implements Engine {
     const { task, inst } = await this.loadAndCheck(taskId, operator)
     // issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）
     const def = await this.repo.findDefineById(inst.defineId)
-    const flow: FlowModel = JSON.parse(typeof def!.content === 'string' ? def!.content : new TextDecoder().decode(def!.content as Uint8Array))
+    const flow = loadFlowModel(def!.content)
     args = filterFieldByPerm(args, findNode(flow, task.taskName))
+    // 后加签写入口四判据（互斥／开关未开／加给自己／超上限，规范 04 · 后加签）：必须排在
+    // completeTask 之前——内存仓储无回滚，报错时不得留下已完成的任务行（"报错且无写入"是
+    // 这条链的硬要求，落点与 java `prepareExecution` 同位）。
+    validateSubmission(flow, task, args, operator)
     // issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
     // 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。
     const baseVars = inst.variables
@@ -757,14 +791,12 @@ export class EngineImpl implements Engine {
       type: isRejectSubmitType(submitType) ? EventType.TaskReject : EventType.TaskComplete,
       instanceId: inst.id, taskId: task.id, nodeId: task.taskName, operator, submitType,
     })
-    return { task, inst, flow, vars }
+    return { task, inst, flow, vars, args }
   }
 
   // 是否 start 直接后继任务节点（issues/79 对齐 Java FlowUtil.isFirstTaskName）
   private isFirstTaskNode(flow: FlowModel, node: FlowNode): boolean {
-    const start = findNodeByType(flow, TypeStart)
-    if (!start) return false
-    return flow.edges.some(e => e.sourceNodeId === start.id && e.targetNodeId === node.id)
+    return isFirstTaskName(flow, node.id)
   }
 
   /**
@@ -805,6 +837,67 @@ export class EngineImpl implements Engine {
     this.createdScope.getStore()?.push(nt)
     await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id,
       taskId: nt.id, nodeId: prev.id, operator, actors: [...nt.actorIds] })
+  }
+
+  /**
+   * 后加签建单腿（规范 04 · 建单规则七条）——形状基准＝串行会签的续建腿
+   * （`CountersignHandler#createNextCountersignTask`），逐条落在这里：
+   * 1. `parentTaskId`＝**刚办结那一条** ⇒ 加签链血缘串成链；
+   * 2. `formKey` 继承节点配置、`taskType`/`performType` 走普通档（加签任务不是会签，
+   *    与 java `performType = NORMAL` 同尺——本栈 `createTask` 的 performType 缺省即 0）；
+   * 3. 参与者＝本次 `tf_addSignOperators` 的归一结果，**一人一行**（多选同圈建多行）；
+   * 4. 轮次记在任务变量 `addSignRound_{节点ID}`（不复用会签 `loopCounter`）；
+   * 5. `expire_time` 走既有那把尺子 `applyNodeExpireTime`（变量源＝实例变量，与建单同档），
+   *    不新增写点、不另造第二把尺子；
+   * 6. 分支归属与每一次普通建单同一条腿（`buildScopes` 按父任务血缘＋模型静态范围推导），
+   *    否则并行范围内的加签任务在汇合判据里读不到这一支；
+   * 7. 委托（`surrogateAgents`）在建单落库前并入参与者、拦截器与 `PROCESS_TASK_START` 事件
+   *    一律排在任务行落库之后——全部复用既有腿，不新造时序。
+   *
+   * 报错类判据不在此（互斥／开关未开／加给自己／超上限已由 `validateSubmission` 在
+   * `prepareExecuteTask` 里、改动状态之前拦下）——进到这里的提交都已判定合法。
+   */
+  private async execAddSign(flow: FlowModel, inst: ProcessInstance, node: FlowNode,
+                             completed: ProcessTask, operator: string, ops: string[], now: Date): Promise<void> {
+    const nodeId = node.id
+    const round = addSignRoundOf(completed, nodeId) + 1
+    const isFirst = this.isFirstTaskNode(flow, node)
+    const form = node.properties?.form ?? ''
+    const agents = await this.surrogateAgents(ops, await this.surrogateProcessName(flow, inst))
+    for (const actor of ops) {
+      const nt = inst.createTask(this.nextId(), nodeId, node.text?.value ?? '', actor, operator, form, now,
+        completed.id, isFirst)
+      const eff = mergeAgents([actor], agents)
+      if (eff.length > 1) nt.actorIds = eff
+      nt.variables = {
+        isFirstTaskNode: nt.variables.isFirstTaskNode,
+        [`${AddSignRoundKey}_${nodeId}`]: round,
+        [VAR_BRANCH_CTX]: buildScopes(flow, nodeId, completed.variables, completed.id, nt.id),
+      }
+      applyNodeExpireTime(nt, node.properties?.expireTime, inst.variables, now)   // 加签续建
+      await this.repo.saveTask(nt)
+      this.createdScope.getStore()?.push(nt)
+      await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id,
+        taskId: nt.id, nodeId, operator, actors: [...nt.actorIds] })
+    }
+    // 账本落在**已完成那一条**的任务行变量上（只追加不覆盖）：`tf_` 前缀使 lineageVars 的
+    // 复活腿天然剔掉它 ⇒ 审计留在历史行、不污染新待办。
+    appendHistory(completed, operator, ops, round, now)
+    await this.repo.updateTask(completed)
+  }
+
+  /**
+   * 拒绝／退回发起人：废弃本节点未完成的加签任务，不留孤儿待办（规范 04 · 语义边界）。
+   * 判据在未开开关的节点上返回空集（会签兄弟任务由既有会签腿管，不在此扩面）；
+   * 逐条落库并回写聚合副本，与上面会签那一支的持久化姿势同形。
+   */
+  private async abandonAddSignDoing(flow: FlowModel, inst: ProcessInstance, nodeId: string, now: Date): Promise<number> {
+    const abandoned = abandonDoingOnNode(flow, inst, nodeId, now)
+    for (const t of abandoned) {
+      await this.repo.updateTask(t)
+      syncTaskToAggregate(inst, t)
+    }
+    return abandoned.length
   }
 
   /**
@@ -1242,6 +1335,31 @@ function findNodeByType(flow: FlowModel, type: string): FlowNode | undefined {
   return flow.nodes.find(n => n.type === type)
 }
 
+/**
+ * 是否 start 的直接后继任务节点（＝首任务节点／申请节点），基准＝java `FlowUtil.isFirstTaskName`。
+ * 导出是因为两条腿都要用：引擎的建单/跳转档，与 `addsign.checkFlowConfig` 的解析期硬校验
+ * （「首任务节点不允许配置 allowAddSign」）——判据只此一份，不在加签侧另算一遍拓扑。
+ */
+export function isFirstTaskName(flow: FlowModel, nodeId: string): boolean {
+  const start = findNodeByType(flow, TypeStart)
+  if (!start) return false
+  return (flow.edges ?? []).some(e => e.sourceNodeId === start.id && e.targetNodeId === nodeId)
+}
+
+/**
+ * 读定义的**唯一解析口**：`JSON.parse` ＋ 后加签三条解析期硬校验（规范 02 §4.3）。
+ *
+ * <p>本栈没有 java 那一层 `ModelParser`（见 model.ts 顶部注释），所以"解析期"在本栈的对应物
+ * 就是每一次把定义内容变成 FlowModel 的那个点——java 也是每个引擎动作都 `ModelParser.parse`
+ * 一次，两侧的触发面同形（发起／办理／跳转／退发起人／直返重提），报错文案逐字一致。</p>
+ */
+export function loadFlowModel(content: Uint8Array | string | null | undefined): FlowModel {
+  const text = typeof content === 'string' ? content : new TextDecoder().decode(content as Uint8Array)
+  const flow = JSON.parse(text) as FlowModel
+  checkFlowConfig(flow)
+  return flow
+}
+
 export function unknownEdgeWarning(from: string, to: string): string {
   return `[jeeflow] WARNING 转移出边的目标节点不在模型里（该节点类型未建档，解析期已跳过），本次流转停在这条边: from=${from}, to=${to}`
 }
@@ -1284,6 +1402,10 @@ function syncTaskToAggregate(inst: ProcessInstance, task: ProcessTask): void {
 function mergeExecIntoInstance(base: Record<string, any>, execVars: Record<string, any>): Record<string, any> {
   const out: Record<string, any> = { ...base }
   for (const [k, v] of Object.entries(execVars)) {
+    // 控制类键（`tf_*`）一律不进实例变量——本函数是实例行**实际落库的那道出口**，聚合根
+    // `completeTask` 里的 `omitTaskControlKeys` 是同一条尺子的另一面（根因与逐条病因见
+    // model.ts 该函数注释；规范 04「流程变量约定」末注）。两处共用 `TaskFormPrefix` 一个常量。
+    if (k.startsWith(TaskFormPrefix)) continue
     if (k.startsWith('u_')) continue
     // isFirstTaskNode 同是**行级**建单标记（建单不变量②）：随共享执行池进 execVars，不挡就
     // 逐节点漂移写进实例变量，把「最近办结那行」的标记透成实例级——issues/240 实测两向同错

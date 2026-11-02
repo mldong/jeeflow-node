@@ -4,7 +4,7 @@
  * 状态落点与 Java/Go/Python 参考实现一致：零 DDL，全部寄存在任务变量保留键里
  * （spec 04-engine-ops「退回修改、重提直返」）。
  */
-import { KeyNextNodeOperator, KeySubmitType } from './engine.js'
+import { KeyNextNodeOperator, KeySubmitType, loadFlowModel } from './engine.js'
 import { SubmitType, TaskState, TypeCustom, TypeFork, TypeJoin, TypeStart, TypeTask } from './model.js'
 
 export const PROP_REAPPLY_MODE = 'reapplyMode'
@@ -261,7 +261,7 @@ export async function executeReapply(engine: any, task: any, operator: string, a
   const inst = await engine.repo.findInstanceById(task.processInstanceId)
   if (!inst) throw new Error('流程实例不存在')
   const def = await engine.repo.findDefineById(inst.defineId)
-  const flow = JSON.parse(typeof def.content === 'string' ? def.content : new TextDecoder().decode(def.content))
+  const flow = loadFlowModel(def.content)
   const rc = reapplyOf(task.variables)!
   const sourceId = String(rc.sourceTaskId ?? '')
   const source = (inst.tasks ?? []).find((t: any) => t.id === sourceId)
