@@ -17,6 +17,10 @@ import { normalizeActorValue } from './spi.js'
 import type { EngineImpl } from './engine.js'
 import { KeyAutoExecute, KeyAdminID, KeyCcActorsStart, KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign, parseActorIds } from './engine.js'
 import { EventType } from './extensions.js'
+// 后加签两开关的解析期硬校验（规范 02 §4.3）：java 在 deploy/redeploy/designDeploy/
+// designRedeploy 四条发布腿上都 ModelParser.parse 一遍 ⇒ 带病定义**发布即拒**；本栈对应物
+// 就是这三处内容解析点（引擎执行腿的同一判据在 engine.loadFlowModel，共用 addsign 那一份）。
+import { checkFlowConfig } from './addsign.js'
 import { VAR_BRANCH_CTX, VAR_REAPPLY_CTX } from './reapply.js'
 
 // submitType 枚举（对齐 boot3）
@@ -444,6 +448,9 @@ export class JeeflowFacade {
     }
     const name = flow?.name
     if (!name) throw new Error('流程定义缺少 name')
+    // 后加签两开关等解析期硬校验（规范 02 §4.3）：deploy／designDeploy 两条发布腿共用本口，
+    // 带病定义发布即拒（java 侧同一位置是 ModelParser.parse）
+    checkFlowConfig(flow)
     let version = 0
     const latest = await this.repo.findDefineByName(name)
     if (latest) version = (latest.version ?? 0) + 1
@@ -470,6 +477,8 @@ export class JeeflowFacade {
       // （`String(err)`/`err.toString()` 都不含 cause，见 flow() 顶层 catch 的注释）。
       throw new Error('读取流程定义 JSON 失败', { cause: e })
     }
+    // 后加签两开关等解析期硬校验（规范 02 §4.3）：原地替换内容的 redeploy 同样发布即拒
+    checkFlowConfig(flow)
     // audit8 R5/spec 06：redeploy 是原地替换内容——先读再写保留原 state/version
     // （硬编码 state:1/version:0 会把停用定义复活、把原版本号打回 0）
     const old = await this.repo.findDefineById(defineId)
@@ -725,6 +734,8 @@ export class JeeflowFacade {
       throw new Error('读取流程定义 JSON 失败', { cause: e })
     }
     if (!flow?.name) throw new Error('流程定义缺少 name')
+    // 后加签两开关等解析期硬校验（规范 02 §4.3）：带病定义在**发布腿**即拒，不留到运行时
+    checkFlowConfig(flow)
     // 按 name 取最新定义：有则替换内容（version 不变），无则新建（对齐 boot3 redeploy）
     const last = await this.repo.findDefineByName(flow.name)
     let defineId: string

@@ -479,4 +479,22 @@ describe('后加签（可重复）（Node）', () => {
     assert.equal(bad.msg, MSG_MUTEX, '失败 msg 逐字＝跨栈契约文案')
     assert.equal(await doingCount(repo, inst.id, 'review'), 1, '报错那次零写入')
   })
+
+  it('22 发布腿即拒：deploy 带病定义报解析期错误（java 侧同位置是 ModelParser.parse）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo)
+    const bad = await facade.flow('processDefine/deploy',
+      { content: chain({}, { allowAddSign: 'yes' }), operator: 'admin' })
+    assert.equal(bad.code, 99999999, JSON.stringify(bad))
+    assert.match(String(bad.msg), /节点\[review\]的 allowAddSign 配置非法: yes/, 'msg 逐字透出，不被出口吞掉')
+
+    const cs = await facade.flow('processDefine/deploy',
+      { content: chain({}, { ...ADD_SIGN_ON, performType: 1 }), operator: 'admin' })
+    assert.match(String(cs.msg), /会签节点\[review\]不允许配置 allowAddSign/)
+
+    const good = await facade.flow('processDefine/deploy',
+      { content: chain({}, ADD_SIGN_ON), operator: 'admin' })
+    assert.equal(good.code, 0, JSON.stringify(good))
+    assert.ok(good.data?.processDefineId, '合法定义照常发布')
+  })
 })
