@@ -322,7 +322,7 @@ describe('后加签（可重复）（Node）', () => {
     const b = (await doing(repo, inst.id, 'review'))!
     // 当前行与其血缘 parent 同节点 ⇒ canRejected 不过 ⇒ 照会签先例报那一档（零改动复用既有守卫）
     await assert.rejects(() => engine.executeAndJumpTask(b.id, 'userB', plain(SubmitType.Rollback), ''),
-      /无法驳回至上一步处理/)
+      /无法驳回至上一步处理，请确认上一步骤并非fork、join、suprocess以及会签任务/)
     assert.equal(await doing(repo, inst.id, 'final'), undefined, '被拒的这一次不得放行出边')
     assert.equal((await repo.findInstanceById(inst.id))!.state, InstanceState.Doing, '实例仍进行中')
     // ⚠️ 本格不核对"b 那一行是否被办结"：血缘守卫排在 completeTask 之后，内存仓储无回滚 ⇒
