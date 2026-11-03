@@ -664,6 +664,9 @@ export class EngineImpl implements Engine {
       // issues/243 甲案：血缘守卫排在 prepareExecuteTask 之前——prepareExecuteTask 内部
       // completeTask + updateTask 会把当前行办结，内存仓储无回滚，守卫后置 ⇒ 报错那次待办凭空消失。
       await this.checkRollbackPossible(pre)
+    } else {
+      // issues/243 §8-2：命名跳转的「找不到节点模型」同一族缺口，同规矩前置（报错即零写入）。
+      await this.checkJumpTargetExists(pre, targetTaskName)
     }
     const { task, inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
     if (!targetTaskName) {
@@ -820,6 +823,29 @@ export class EngineImpl implements Engine {
     const def = await this.repo.findDefineById(inst.defineId)
     if (!def) return
     await this.checkRejectable(loadFlowModel(def.content), inst, current)
+  }
+
+  /**
+   * 命名跳转（{@code targetTaskName} 非空那一支）的节点存在性前置守卫（issues/243 §8-2）。
+   *
+   * <p>与 {@link checkRollbackPossible} 同族同规矩：从前这句「根据节点名称[X]无法找到节点模型」
+   * 是在 {@link prepareExecuteTask}（内部 {@code completeTask} 已把当前行办结并 {@code updateTask}
+   * 落库）之后才抛的，内存仓储无回滚 ⇒ 名字写错一次就把自己的待办弄丢。真库有动作级事务整笔回滚，
+   * 观察不到差别，所以这一档同样只有内存仓储照得出来。</p>
+   *
+   * <p>只读；取不到任务／不在 DOING／取不到实例或定义时一律放行，由 {@link prepareExecuteTask}
+   * 去报它本来就有的固定错（那些档本就在办结之前），也不在这里发明第二种文案——
+   * 抛的还是原来那一句（对齐 java {@code JeeflowEngineImpl.checkJumpTargetExists}）。</p>
+   */
+  private async checkJumpTargetExists(current: ProcessTask | null, nodeName: string): Promise<void> {
+    if (!current || !current.isDoing()) return
+    const inst = await this.repo.findInstanceById(current.processInstanceId)
+    if (!inst) return
+    const def = await this.repo.findDefineById(inst.defineId)
+    if (!def) return
+    if (!findNode(loadFlowModel(def.content), nodeName)) {
+      throw new Error(`根据节点名称[${nodeName}]无法找到节点模型`)
+    }
   }
 
   /**

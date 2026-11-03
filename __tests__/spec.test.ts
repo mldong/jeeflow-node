@@ -2176,9 +2176,20 @@ describe('jeeflow compliance tests', () => {
     const jn = await startMultiTaskAt(facade, repo, 'task2')
     const t2n = await doingTaskId(repo, jn, 'task2')
     await repo.addTaskActor(t2n!, ['manager'])
+    const rowsBefore = (await repo.findDoingTasks(jn)).length + (await repo.findDoneTasks(jn)).length + (await repo.findHistoryTasks(jn)).length
     const jr = await facade.flow('processTask/execute', { processTaskId: t2n, operator: 'manager', submitType: 4, taskName: 'no-such-node' })
     assert.equal(jr.code, 99999999, jr.msg)
     assert.match(String(jr.msg), /无法找到节点模型/, jr.msg)
+    // issues/243 §8-2：这一档的节点存在性判据已上提到办结之前 ⇒ 报错零写入。
+    // 修前 prepareExecuteTask 先 completeTask + updateTask，内存仓储无回滚，t2n 会被静默办结、
+    // 待办就此消失（真库靠动作级事务回滚兜住，照不出来 ⇒ 这一格只有在内存仓储才有意义）。
+    assert.equal(await doingTaskId(repo, jn, 'task2'), t2n,
+      '报错后原任务必须还是那条待办（零写入：不是被办结，也不是新建行）')
+    assert.equal((await repo.findInstanceById(jn))!.state, InstanceState.Doing,
+      '失败的 JUMP 不得改实例状态')
+    assert.equal(
+      (await repo.findDoingTasks(jn)).length + (await repo.findDoneTasks(jn)).length + (await repo.findHistoryTasks(jn)).length,
+      rowsBefore, '失败的 JUMP 不得增删任何任务行')
 
     // ── submitType=5 RE_APPLY：task1 重新提交（前端 detail 抽屉场景，含 f_ 表单 + tf_nextNodeOperator）
     const ra = await startMultiTaskAt(facade, repo, 'task1')
