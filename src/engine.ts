@@ -16,6 +16,16 @@ import {
   AddSignRoundKey, abandonDoingOnNode, allowAddSignOf, appendHistory, checkFlowConfig,
   hasDoingOnNode, operators as addSignOperators, roundOf as addSignRoundOf, validateSubmission,
 } from './addsign.js'
+// 已办撤回（issues/246）：窗口判据与账本的纯函数家族在 recall.ts，判据位序＋落库序在本文件
+// （形状基准＝java `core/JeeflowEngineImpl.recallTask` ＋ go `engine/recall.go` ＋ py `engine.recall_task`）
+import {
+  allowRecallOf, appendRecallHistory, inRoster, isPrivilegedOperator,
+  MSG_INSTANCE_NOT_DOING, MSG_NO_PERMISSION, MSG_NOT_FINISHED,
+  msgSwitchOff, validateWindow,
+} from './recall.js'
+// 动态会签（issues/247，征询模式）：成员行识别/计数/投影在 collect.ts，建成员行走本文件的
+// 建单腿（`createCollectMemberRows`），推进闸复用上面后加签那一条
+import { dynamicCountersignOf, KeyAddSignReason } from './collect.js'
 import type { ProcessRepository, ProcessExtRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
 // issues/141 G2：cc 写侧判重的 java `default` 方法在 TS 里的对应物（第三方仓储未实现判重 SPI 时兜旧行为）
 // issues/141 G10：归属值单值/集合归一的**那一份**判据（漏斗层与写侧层共用；issues/142 B 批
@@ -108,6 +118,11 @@ export interface Engine {
   executeAndJumpToEnd(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessTask[]>
   executeAndJumpTask(taskId: string, operator: string, args: Record<string, any>, targetTaskName?: string): Promise<ProcessTask[]>
   executeAndJumpToFirstTaskNode(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessTask[]>
+  /**
+   * 已办撤回（issues/246，规范 04 · 已办撤回／规范 06 §processTask/recall）：办理人撤回自己
+   * 已办结的那一手，同实例内复活重办；返回复活的那条新 DOING 行。判据全排前、报错即零写入。
+   */
+  recallTask(taskId: string, operator: string): Promise<ProcessTask>
   /** 事务包裹（audit8 145-2 / spec/12 §12.2）：仓储有事务载体则并入（嵌套经 withTx 的 join 支），
    *  无（内存仓）则裸跑＝显式降级（§12.1 原则 4）。门面动作级包裹也走这一枚。 */
   inTx<T>(fn: () => Promise<T>): Promise<T>
@@ -573,17 +588,25 @@ export class EngineImpl implements Engine {
           if (doing.length > 0) return finishExecute()
         }
       }
-      // ── 后加签档（规范 04 · 后加签）：TaskModel 的推进闸由两档变三档 ──
-      // java 形状＝`if (performType==COUNTERSIGN) 会签 else if (allowAddSign) 加签 else 放行出边`；
-      // 会签那两档在上面（解析期已禁止会签节点配 allowAddSign，故此处再加一道 performType 判据，
-      // 双保险不替代根因）。merged 三判据**顺序不可反**：
+      // ── 后加签档／征询档（规范 04 · 后加签 ＋ 动态会签）：TaskModel 的推进闸由两档变三档 ──
+      // java 形状＝`if (performType==COUNTERSIGN) 会签 else if (allowAddSign) 加签
+      //   else if (dynamicCountersign) 复用加签闸 else 放行出边`（`model/TaskModel.exec`）；
+      // 会签那两档在上面（解析期已禁止会签节点配 allowAddSign／dynamicCountersign，故此处再加一道
+      // performType 判据，双保险不替代根因）。merged 三判据**顺序不可反**：
       //   ① 本次给了加签人 → 同节点建单、不流转；
-      //   ② 没给但本节点还有未完成待办（多选时同圈兄弟）→ 不流转；
+      //   ② 没给但本节点还有未完成待办（多选时同圈兄弟／主办行还 DOING／成员行还没答完）→ 不流转；
       //   ③ 两者皆否 → 落穿到下面的出边放行。
       // 加签人只认**本次请求**的 execArgs（规范 04「流程变量约定」末注的根因：合并后的 vars
       // 里可能躺着上一轮的 tf_addSignOperators）。
-      if (curNode.type === TypeTask && !isCountersign(curNode.properties?.performType) && allowAddSignOf(curNode)) {
-        const ops = addSignOperators(execArgs)
+      //
+      // 征询档（issues/247）为什么 ops 恒空：带人的提交在**门面**就分流了（不办结主办行，
+      // 到不了这里），能走进执行闸的只有「成员行办结」与「主办行收齐后的拍板」两种，两者复用
+      // 同一条加签推进闸——主办还 DOING ⇒ 不流转；主办办结且成员清零 ⇒ 放行。直连引擎带人提交
+      // 的形态由 `validateSubmission` 以「未开启 allowAddSign」拦下（解析期双开互斥 ⇒ 征询节点
+      // 必非加签节点），与 go 那侧把 nil 传进闸同判（这里显式置空，不给第二份判据留口子）。
+      if (curNode.type === TypeTask && !isCountersign(curNode.properties?.performType) &&
+          (allowAddSignOf(curNode) || dynamicCountersignOf(curNode))) {
+        const ops = allowAddSignOf(curNode) ? addSignOperators(execArgs) : []
         if (ops.length === 0) {
           // 停止条件即本判据本身：没点人且本节点再无未完成待办 ⇒ 放行出边（不设第二判据源）
           if (hasDoingOnNode(inst, curNode.id)) return finishExecute()
@@ -755,6 +778,91 @@ export class EngineImpl implements Engine {
       }
     }
     return (await this.repo.findInstanceById(inst.id))!
+  }
+
+  // ─── 已办撤回（issues/246，规范 04 · 已办撤回）───────────────────────────────
+
+  /**
+   * 已办撤回（规范 04 · 已办撤回／规范 06 §processTask/recall）：办理人撤回**自己刚办结的那一手**，
+   * 同实例内复活重办。
+   *
+   * <p>判据全部排在任何状态变更之前（报错即零写入——与后加签写入口／退回守卫同一规矩）：
+   * 行存在且已办结 → 参与者/特权 → 实例 DOING → 节点开关 → 窗口（下游无任何 FINISHED）。
+   * 落库顺序照 java `JeeflowEngineImpl.recallTask`／go `recallTaskInner`／py `_recall_task_impl`：
+   * 废弃行 updateTask → 复活行 saveTask（既有建单腿＋码 3）→ 原行盖 `tf_recallHistory`
+   * updateTask → 实例 updateTime updateInstance → fire **码 10 TASK_RECALL**。</p>
+   *
+   * <p>同实例串行化：「判窗口 → 废弃 → 建行」在同一临界区里（spec 04 并发与事务同款声明，
+   * 与 `executeProcessTask` 同口径）。复活行走既有建单腿，故登记进本次动作的产出列表
+   * （audit8 R92：执行族公开方法回传本次动作产出的任务行）。</p>
+   */
+  async recallTask(taskId: string, operator: string): Promise<ProcessTask> {
+    const pre = await this.repo.findTaskById(taskId)
+    const created: ProcessTask[] = []
+    let resurrected: ProcessTask | null = null
+    await withInstanceLock(this, pre?.processInstanceId, () =>
+      this.createdScope.run(created, async () => {
+        resurrected = await this.inTx(() => this.recallTaskInner(taskId, operator))
+      }))
+    return resurrected!
+  }
+
+  private async recallTaskInner(taskId: string, operator: string): Promise<ProcessTask> {
+    // 判据 1：目标行存在且已办结（不存在／进行中／已废弃同档）
+    const target = await this.repo.findTaskById(taskId)
+    if (!target || !target.isFinished()) throw new Error(MSG_NOT_FINISHED)
+    // 判据 2：参与者/特权——FINISHED 行按**名册**判断，不走只认 DOING 的 isAllowed（java/py/go 同规）
+    if (!isPrivilegedOperator(operator) && !inRoster(target, operator)) throw new Error(MSG_NO_PERMISSION)
+    // 判据 3：实例存在且 DOING
+    const inst = await this.repo.findInstanceById(target.processInstanceId)
+    if (!inst) throw new Error('流程实例不存在')
+    if (inst.state !== InstanceState.Doing) throw new Error(MSG_INSTANCE_NOT_DOING)
+    // 判据 4：节点开关（解析期两条禁配已由 loadFlowModel→checkFlowConfig 兜住，这里再判开关本身）
+    const def = await this.repo.findDefineById(inst.defineId)
+    if (!def) throw new Error('流程定义不存在')
+    const flow = loadFlowModel(def.content)
+    const node = findNode(flow, target.taskName)
+    if (!allowRecallOf(node)) throw new Error(msgSwitchOff(target.taskName))
+    // 判据 5：窗口（宽口径，下游任何 FINISHED ⇒ 拦；行集合＝该实例全部任务行，含 DOING/DONE/99，
+    // 内存与 SQL 两仓同形状）
+    const doingDescendants = validateWindow(await this.repo.findHistoryTasks(inst.id), target)
+    // ── 判据全过，以下才允许写 ──
+    const now = new Date()
+    // 写 1：下游全部 DOING 行废弃（后加签/征询成员行、并行分支多支自然覆盖；updateUser 记真实撤回人，
+    // 照 java `ProcessTask.abandon(operator)`／py `t.updateUser = operator` 同尺）
+    for (const t of doingDescendants) {
+      t.abandon(now, operator)
+      await this.repo.updateTask(t)
+      syncTaskToAggregate(inst, t)
+    }
+    // 写 2：同节点新建一行 DOING——参与者＝原行名册、parent＝原行 parent、`expire_time` 同尺、
+    // 委托照既有建单腿并入；**原 FINISHED 行不改写**（历史即审批记录）
+    const roster = [...(target.actorIds ?? [])]
+    const nt = inst.createTask(this.nextId(), node!.id, target.displayName, roster[0] ?? '', operator,
+      node!.properties?.form ?? '', now, target.parentTaskId ?? '0', this.isFirstTaskNode(flow, node!))
+    nt.actorIds = roster
+    applyNodeExpireTime(nt, node!.properties?.expireTime, inst.variables, now)
+    const agents = await this.surrogateAgents(roster, await this.surrogateProcessName(flow, inst))
+    const eff = mergeAgents(roster, agents)
+    if (eff.length > 1) nt.actorIds = eff
+    await this.repo.saveTask(nt)
+    this.createdScope.getStore()?.push(nt)
+    // 码 3：复活行的待办另走既有建单腿（issues/246 参考实现 14674d7 补的那一腿——只 fire 10
+    // 不 fire 3 ⇒ 集成方的待办角标/站内信拿不到这一手新待办）
+    await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id,
+      nodeId: node!.id, operator, actors: [...nt.actorIds] })
+    // 写 3：原行盖 tf_recallHistory 追加账本（recalledTaskId 指向复活行）＋落库
+    appendRecallHistory(target, operator, nt.id, now)
+    await this.repo.updateTask(target)
+    syncTaskToAggregate(inst, target)
+    inst.updateTime = now
+    inst.updateUser = operator
+    await this.repo.updateInstance(inst)
+    // 码 10 TASK_RECALL：撤回事实落库之后 fire **一次**（sourceId＝被撤的旧行）；
+    // **只发 10，不补发 5/6**——撤回不是办结也不是拒绝（理由同码 8 不补发 2，规范 11 §11.3）
+    await this.fireEvent({ type: EventType.TaskRecall, instanceId: inst.id, taskId: target.id,
+      nodeId: target.taskName, operator })
+    return nt
   }
 
   // ─── Execute 公共序言（对齐 Java prepareExecution）──────────────────────────
@@ -963,8 +1071,55 @@ export class EngineImpl implements Engine {
   }
 
   /**
+   * 动态会签（征询模式，issues/247）建成员行腿——判据已由门面在调用前拦下（开关／操作人是主办
+   * 参与人／加给自己／该人已有未答成员行／互斥／上限），本腿只负责**建与落**，不再重复判。
+   *
+   * 每人一行，逐条照后加签建单腿（规范 04 · 建单规则七条同款：`performType=NORMAL`、
+   * `expire_time` 同尺、委托照既有腿并入、拦截器与码 3 走既有腿），另加"两戳一继承"：
+   * 1. `parentTaskId`＝**主办行 id**——成员行的身份锚（闸门判据／detail 投影／去重全靠它）；
+   * 2. 轮次戳 `addSignRound_{节点ID}`＝主办行账本条数＋1（由调用方算好传入，撤回不消耗轮次）；
+   * 3. `tf_addSignReason`（选填）盖每条成员行（单行出证自足，不回查主办行），空串**不写键**；
+   * 4. 分支归属继承照后加签那一条腿（`buildScopes` 按父任务血缘＋模型静态范围推导），否则并行
+   *    范围内的成员行在汇合判据里读不到这一支。
+   *
+   * ⚠️ 主办行**不办结**＝征询挂起（发起腿的分流在门面、排在 completeTask 之前），
+   * 账本与轮次戳由调用方盖在主办行上再落库；本腿只落成员行并逐行 fire 码 3。
+   */
+  async createCollectMemberRows(flow: FlowModel, inst: ProcessInstance, node: FlowNode,
+                                 host: ProcessTask, operator: string, ops: string[], round: number,
+                                 reason: string, now: Date): Promise<ProcessTask[]> {
+    const nodeId = node.id
+    // 征询节点不可能是首任务节点（解析期已拦），沿用现成判据算、不写死 false——与后加签腿同形
+    const isFirst = this.isFirstTaskNode(flow, node)
+    const form = node.properties?.form ?? ''
+    const agents = await this.surrogateAgents(ops, await this.surrogateProcessName(flow, inst))
+    const created: ProcessTask[] = []
+    for (const actor of ops) {
+      const nt = inst.createTask(this.nextId(), nodeId, node.text?.value ?? '', actor, operator, form, now,
+        host.id, isFirst)
+      const eff = mergeAgents([actor], agents)
+      if (eff.length > 1) nt.actorIds = eff
+      nt.variables = {
+        isFirstTaskNode: nt.variables.isFirstTaskNode,
+        [`${AddSignRoundKey}_${nodeId}`]: round,
+        [VAR_BRANCH_CTX]: buildScopes(flow, nodeId, host.variables, host.id, nt.id),
+      }
+      if (reason !== '') nt.variables[KeyAddSignReason] = reason
+      applyNodeExpireTime(nt, node.properties?.expireTime, inst.variables, now)
+      await this.repo.saveTask(nt)
+      this.createdScope.getStore()?.push(nt)
+      await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id,
+        taskId: nt.id, nodeId, operator, actors: [...nt.actorIds] })
+      created.push(nt)
+    }
+    return created
+  }
+
+  /**
    * 拒绝／退回发起人：废弃本节点未完成的加签任务，不留孤儿待办（规范 04 · 语义边界）。
    * 判据在未开开关的节点上返回空集（会签兄弟任务由既有会签腿管，不在此扩面）；
+   * `allowAddSign` **或** `dynamicCountersign` 都要清场（issues/247：征询成员行同属本节点
+   * DOING，实例撤回/退回路径一并废弃——双开关判据在 `addsign.abandonDoingOnNode` 那一份）。
    * 逐条落库并回写聚合副本，与上面会签那一支的持久化姿势同形。
    */
   private async abandonAddSignDoing(flow: FlowModel, inst: ProcessInstance, nodeId: string, now: Date): Promise<number> {

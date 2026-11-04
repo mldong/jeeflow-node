@@ -4916,7 +4916,7 @@ describe('issues/127/132 事件腿：A 套码表 · 办理抄送 · 5/6 互斥 �
   const SPEC_NAME: Record<number, string> = {
     1: 'PROCESS_INSTANCE_START', 2: 'PROCESS_INSTANCE_END', 3: 'PROCESS_TASK_START',
     4: 'CC_CREATE', 5: 'TASK_COMPLETE', 6: 'TASK_REJECT', 7: 'TASK_TRANSFER',
-    8: 'TASK_WITHDRAW', 9: 'INSTANCE_TERMINATED',
+    8: 'TASK_WITHDRAW', 9: 'INSTANCE_TERMINATED', 10: 'TASK_RECALL',
   }
   /** recorder 监听器：按 fire 顺序逐条留档（浅拷贝，防对象复用串档） */
   function attachRecorder(engine: EngineImpl): ProcessEvent[] {
@@ -4959,20 +4959,21 @@ describe('issues/127/132 事件腿：A 套码表 · 办理抄送 · 5/6 互斥 �
   const MEMBER_BY_CODE: Record<number, string> = {
     1: 'ProcessInstanceStart', 2: 'ProcessInstanceEnd', 3: 'ProcessTaskStart', 4: 'CcCreate',
     5: 'TaskComplete', 6: 'TaskReject', 7: 'TaskTransfer', 8: 'TaskWithdraw', 9: 'InstanceTerminated',
+    10: 'TaskRecall',
   }
 
-  it('码表钉死：EventType 整表＝规范 11 §11.3 的 A 套 1..9，旧 0..5 套成员名一律不作 enum 成员（只作 §11.6 外部别名）', () => {
+  it('码表钉死：EventType 整表＝规范 11 §11.3 的 A 套（1..9 ＋ issues/246 的 10），旧 0..5 套成员名一律不作 enum 成员（只作 §11.6 外部别名）', () => {
     assert.deepEqual([
       EventType.ProcessInstanceStart, EventType.ProcessInstanceEnd, EventType.ProcessTaskStart,
       EventType.CcCreate, EventType.TaskComplete, EventType.TaskReject, EventType.TaskTransfer,
-      EventType.TaskWithdraw, EventType.InstanceTerminated,
-    ], [1, 2, 3, 4, 5, 6, 7, 8, 9], 'A 套码值（CcCreate 5→4、TaskComplete 4→5、实例终态统一 2、退回走 6）')
+      EventType.TaskWithdraw, EventType.InstanceTerminated, EventType.TaskRecall,
+    ], [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 'A 套码值（CcCreate 5→4、TaskComplete 4→5、实例终态统一 2、退回走 6、已办撤回 10）')
     // 旧形状退场判据**改判**（§11.6「改名兼容义务」）：旧成员名必须还在，但以 **enum 外部的同值常量别名**
     // 形态存在一代（见下方「兼容别名」格），不能塞回 enum 成员列表——数字枚举同值成员会覆盖反向映射，
-    // 那才是"拿数字码当判据"的温床。故此处只钉：enum 成员名恰 9 支、旧名不在成员名里。
+    // 那才是"拿数字码当判据"的温床。故此处只钉：enum 成员名恰 10 支、旧名不在成员名里。
     const members = Object.keys(EventType).filter(k => isNaN(Number(k)))
-    assert.equal(members.length, 9, `成员数＝9，实测 ${members.join(',')}`)
-    assert.equal(new Set(members.map(m => (EventType as any)[m])).size, 9, '码值唯一，无复用')
+    assert.equal(members.length, 10, `成员数＝10，实测 ${members.join(',')}`)
+    assert.equal(new Set(members.map(m => (EventType as any)[m])).size, 10, '码值唯一，无复用')
     for (const [legacy, alias, spec] of LEGACY_ALIAS) {
       if (legacy === spec) continue   // TaskComplete/CcCreate 名未改（只挪码值），本身就是成员名
       assert.ok(!members.includes(legacy), `旧成员名 ${legacy} 不得回流成 enum 成员（同值成员会覆盖反向映射）`)
@@ -5003,7 +5004,7 @@ describe('issues/127/132 事件腿：A 套码表 · 办理抄送 · 5/6 互斥 �
       '别名不得挂在 enum 对象上（数字枚举同值成员会覆盖反向映射）——只作模块级常量导出')
   })
 
-  it('§11.6 反向映射未被别名污染：EventType[1..9] 九支逐个仍取到规范成员名（sink 靠它写 <code>|<规范名>）', () => {
+  it('§11.6 反向映射未被别名污染：EventType[码表各号] 逐支仍取到规范成员名（sink 靠它写 <code>|<规范名>）', () => {
     assert.equal(EventType[EventType.ProcessInstanceStart], 'ProcessInstanceStart',
       '1 的反向名不能被旧别名 ProcessStart 顶掉')
     for (const [code, member] of Object.entries(MEMBER_BY_CODE)) {
@@ -5013,9 +5014,9 @@ describe('issues/127/132 事件腿：A 套码表 · 办理抄送 · 5/6 互斥 �
     for (const [legacy, alias, spec] of LEGACY_ALIAS) {
       assert.equal(EventType[alias], spec, `别名 ${legacy} 同值位的反向名＝规范成员名 ${spec}`)
     }
-    // 反向键集合也恰是 1..9 九个，多一个少一个都算污染
+    // 反向键集合也恰是码表那十个号，多一个少一个都算污染
     assert.deepEqual(Object.keys(EventType).filter(k => !isNaN(Number(k))).map(Number).sort((a, b) => a - b),
-      [1, 2, 3, 4, 5, 6, 7, 8, 9])
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
   })
 
   it('§11.6 合并语义：旧 ProcessFinish / ProcessReject 两支别名同指码 2，一次办结的流水只落一支码 2', async () => {

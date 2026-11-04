@@ -19,8 +19,8 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc -p tsconfig.check.json",
-    "test": "node --import tsx __tests__/spec.test.ts && node --import tsx --test __tests__/reapply.test.ts && node --import tsx --test __tests__/add-sign-after.test.ts && node --import tsx --test __tests__/persist.test.ts",
-    "test-mysql": "node --import tsx --test __tests__/jdbc.test.ts __tests__/tx-tier-145.test.ts __tests__/after_commit_r77.test.ts",
+    "test": "node --import tsx __tests__/spec.test.ts && node --import tsx --test __tests__/reapply.test.ts && node --import tsx --test __tests__/add-sign-after.test.ts && node --import tsx --test __tests__/recall.test.ts && node --import tsx --test __tests__/dynamic-countersign.test.ts && node --import tsx --test __tests__/persist.test.ts",
+    "test-mysql": "node --import tsx --test __tests__/jdbc.test.ts __tests__/tx-tier-145.test.ts __tests__/after_commit_r77.test.ts __tests__/recall-collect-mysql.test.ts",
     "demo": "node --import tsx demo/main.ts",
     "prepublishOnly": "npm run build"
   },

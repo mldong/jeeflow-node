@@ -15,12 +15,27 @@ import type { OrgUserProvider, ProcessExtRepository, ProcessRepository, QueryCon
 // （旧名 normalizeCcActorValue ＝ 新名 normalizeActorValue，同一函数），不在此另写一份 trim＋判空
 import { normalizeActorValue } from './spi.js'
 import type { EngineImpl } from './engine.js'
-import { KeyAutoExecute, KeyAdminID, KeyCcActorsStart, KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign, parseActorIds } from './engine.js'
+import { KeyAutoExecute, KeyAdminID, KeyCcActorsStart, KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign, loadFlowModel, parseActorIds } from './engine.js'
 import { EventType } from './extensions.js'
-// 后加签两开关的解析期硬校验（规范 02 §4.3）：java 在 deploy/redeploy/designDeploy/
+// 后加签两开关的解析期硬校验（规范 02 §4.3／§4.4）：java 在 deploy/redeploy/designDeploy/
 // designRedeploy 四条发布腿上都 ModelParser.parse 一遍 ⇒ 带病定义**发布即拒**；本栈对应物
-// 就是这三处内容解析点（引擎执行腿的同一判据在 engine.loadFlowModel，共用 addsign 那一份）。
-import { checkFlowConfig } from './addsign.js'
+// 就是这三处内容解析点（引擎执行腿的同一判据在 engine.loadFlowModel，共用 addsign 那一份——
+// 该入口自 issues/246／247 起串起「后加签两判 → 已办撤回两判 → 动态会签三判」五段，
+// 与 java ModelParser 尾部三段同位）。
+import {
+  AddSignRoundKey, MSG_MUTEX, MSG_SELF, maxRoundsOf, msgMaxRounds, nextOperatorPresent,
+  operators as addSignOperators, checkFlowConfig,
+} from './addsign.js'
+// 动态会签（征询模式，issues/247）：分流／闸门／撤回三条腿在门面（java `JeeflowFacade` 同分层——
+// 发起腿是门面分流而不是引擎执行闸，因为"带人提交不办结主办行"必须发生在 completeTask 之前
+// 且不进 execute 参数空间语义）；已办撤回（issues/246）的门面腿只做参数归一与信封包装。
+import {
+  appendCollectHistory, appendRevokeHistory, buildProjection, dynamicCountersignOf,
+  isMemberRow, lastRound, memberCounts, memberRows, MSG_MEMBER_PULL, MSG_NO_PERMISSION_REVOKE,
+  MSG_NOT_ALLOWED_EXECUTE, KeyAddSignReason, pendingMembers as collectPendingMembers,
+  msgDuplicate, msgNoPending, msgPending,
+} from './collect.js'
+import { inRoster, isPrivilegedOperator } from './recall.js'
 import { VAR_BRANCH_CTX, VAR_REAPPLY_CTX } from './reapply.js'
 
 // submitType 枚举（对齐 boot3）
@@ -368,6 +383,10 @@ export class JeeflowFacade {
         return this.taskTransfer(args)
       case 'processTask/removeTaskActor': // issues/115 残留：门面第 47 个 action（只摘不加、零留痕）
         return this.taskRemoveActor(args)
+      case 'processTask/recall': // issues/246 已办撤回（第 48 个 action）
+        return this.taskRecall(args)
+      case 'processTask/revokeDynamicCountersign': // issues/247 撤回动态会签（第 49 个 action）
+        return this.taskRevokeCountersign(args)
       case 'processTask/latest':
         return this.taskLatest(args)
       case 'processInstance/stats/overview':
@@ -547,7 +566,7 @@ export class JeeflowFacade {
 
   // ── 流程任务 ─────────────────────────────────────────────────────────────
 
-  private async execute(args: Record<string, any>): Promise<void> {
+  private async execute(args: Record<string, any>): Promise<Record<string, any> | null> {
     const taskId = toId(args.processTaskId)
     const operator = operatorArg(args)
     const submitType = toInt(args.submitType ?? SUBMIT_AGREE)
@@ -557,6 +576,13 @@ export class JeeflowFacade {
       flowArgs[k] = v
     }
     flowArgs.submitType = submitType
+    // ── 动态会签分流与闸门（issues/247）——判据全部排在任何状态变更之前 ──
+    const collect = await this.tryDynamicCountersign(taskId, operator, flowArgs)
+    if (collect !== null) {
+      // 征询模式带 tf_addSignOperators：只建成员行、不办结主办行（响应带 marker 供前端提示）
+      return collect
+    }
+    await this.gateDynamicCountersign(taskId, flowArgs)
     // boot3 execute 分发（spec §11.2）
     switch (submitType) {
       case SUBMIT_REJECT:
@@ -578,6 +604,142 @@ export class JeeflowFacade {
       default: // 0 APPLY / 1 AGREE / 5 重新提交
         await this.engine.executeProcessTask(taskId, operator, flowArgs)
     }
+    return null
+  }
+
+  // ── 已办撤回 / 动态会签（issues/246 ＋ issues/247）─────────────────────────
+
+  /**
+   * 已办撤回（issues/246，规范 06 §processTask/recall）：办理人撤回自己已办结的那一手，
+   * 同实例内复活重办。判据与落库全在引擎（{@link EngineImpl.recallTask}），门面只做参数归一
+   * （operator 硬必填、主键档缺失响亮报错，绝不拿 ''/0 当 id 落库）与信封包装。
+   * 位序照 java `taskRecall`：operator 空判在前、主键缺失判在后。
+   */
+  private async taskRecall(args: Record<string, any>): Promise<Record<string, any>> {
+    const operator = String(args.operator ?? '').trim()
+    if (!operator) throw new Error('operator 必填')
+    const taskId = toId(args.processTaskId)
+    const resurrected = await this.engine.recallTask(taskId, operator)
+    return { processTaskId: resurrected.id, taskState: resurrected.taskState }
+  }
+
+  /**
+   * 动态会签发起分流（issues/247，规范 04 · 动态会签）：征询节点带 `tf_addSignOperators` 的
+   * 提交＝只建成员行、**不办结主办行**；返回响应 marker（`data.dynamicCountersign`），
+   * 非征询提交返回 null 走普通流转。判据全排前（互斥/参与人/加给自己/重复/上限），报错即零写入。
+   * 逐字照 java `JeeflowFacade.tryDynamicCountersign`（go `facade/collect.go`、py
+   * `facade._try_dynamic_countersign` 同构）。
+   */
+  private async tryDynamicCountersign(taskId: string, operator: string,
+    flowArgs: Record<string, any>): Promise<Record<string, any> | null> {
+    const host = await this.repo.findTaskById(taskId)
+    if (!host || !host.isDoing()) return null
+    const ops = addSignOperators(flowArgs)
+    if (ops.length === 0) return null
+    const inst = await this.repo.findInstanceById(host.processInstanceId)
+    if (!inst) return null
+    const def = await this.repo.findDefineById(inst.defineId)
+    if (!def) return null
+    const flow = loadFlowModel(def.content)
+    const node = (flow.nodes ?? []).find(n => n.id === host.taskName)
+    if (!dynamicCountersignOf(node)) return null
+    const tasks = await this.repo.findHistoryTasks(inst.id)
+    // 成员行不能冒充主办发起（拉人只限主办行）——放行给闸门腿报它的逐字文案
+    if (isMemberRow(tasks, host)) return null
+    // 互斥（与 tf_nextNodeOperator 同传＝死参数，报错不静默）——判据与后加签写入口共用那一枚
+    if (nextOperatorPresent(flowArgs)) throw new Error(MSG_MUTEX)
+    // 操作人是主办参与人（host 已 DOING；java host.isAllowed＝DOING＋名册＋auto/admin 特权）
+    if (!isPrivilegedOperator(operator) && !inRoster(host, operator)) throw new Error(MSG_NOT_ALLOWED_EXECUTE)
+    const round = lastRound(host) + 1
+    const max = maxRoundsOf(node)
+    if (max > 0 && round > max) throw new Error(msgMaxRounds(node!.id, max))
+    const reason = String(flowArgs[KeyAddSignReason] ?? '')
+    const me = normalizeActorValue(operator)
+    const existing = memberRows(tasks, host)
+    for (const op of ops) {
+      if (me !== '' && me === op) throw new Error(MSG_SELF)
+      for (const m of existing) {
+        if (m.isDoing() && (m.actorIds ?? []).includes(op)) {
+          throw new Error(msgDuplicate(op, node!.id))
+        }
+      }
+    }
+    // ── 判据全过：建成员行（同节点同名、parent＝主办行、轮次/reason/分支归属三戳）＋逐行 fire 码 3；
+    //   主办行盖轮次戳＋追加账本后 updateTask（未办结＝征询挂起）──
+    const now = new Date()
+    await this.engine.createCollectMemberRows(flow, inst, node!, host, operator, ops, round, reason, now)
+    appendCollectHistory(host, operator, ops, round, reason, now)
+    host.variables = host.variables ?? {}
+    host.variables[`${AddSignRoundKey}_${node!.id}`] = round
+    await this.repo.updateTask(host)
+    const [total, submitted] = memberCounts(await this.repo.findHistoryTasks(inst.id), host)
+    return { dynamicCountersign: { round, total, submitted } }
+  }
+
+  /**
+   * 动态会签闸门（issues/247）：征询节点上——主办行未收齐成员意见 ⇒ 逐字文案报错
+   * （**挡全部 submitType，含驳回**；唯一出口＝processTask/revokeDynamicCountersign）；
+   * 成员行携带拉人参数 ⇒ 报错（拉人只限主办行）。非征询节点原样放行。
+   * 判据同样排在任何状态变更之前（报错即零写入）。
+   */
+  private async gateDynamicCountersign(taskId: string, flowArgs: Record<string, any>): Promise<void> {
+    const task = await this.repo.findTaskById(taskId)
+    if (!task || !task.isDoing()) return
+    const inst = await this.repo.findInstanceById(task.processInstanceId)
+    if (!inst) return
+    const def = await this.repo.findDefineById(inst.defineId)
+    if (!def) return
+    const flow = loadFlowModel(def.content)
+    const node = (flow.nodes ?? []).find(n => n.id === task.taskName)
+    if (!dynamicCountersignOf(node)) return
+    const tasks = await this.repo.findHistoryTasks(inst.id)
+    if (isMemberRow(tasks, task)) {
+      if (addSignOperators(flowArgs).length > 0) throw new Error(MSG_MEMBER_PULL)
+      return
+    }
+    // 收齐判据＝还有无 DOING 成员行（宽口径计数跳过撤回清场的 99 行）
+    if (collectPendingMembers(tasks, task).length > 0) {
+      const [total, submitted] = memberCounts(tasks, task)
+      throw new Error(msgPending(task.taskName, submitted, total))
+    }
+  }
+
+  /**
+   * 撤回动态会签（issues/247，规范 06 §processTask/revokeDynamicCountersign）：废弃主办行下
+   * 全部未答成员行，账本追加撤回条目；**已交意见行原样保留**；闸门自然恢复（判据＝还有无
+   * DOING 成员行）；轮次不消耗。独立 action，不进 execute 参数空间（撤回不是办结动作）。
+   * 位序照 java `taskRevokeCountersign`：operator 空判在前、主键缺失判在后。
+   * 参与人判断**按名册**（不能用只认 DOING 的 isAllowed——主办已办结时要放行，待答判据随后兜底）。
+   */
+  private async taskRevokeCountersign(args: Record<string, any>): Promise<Record<string, any>> {
+    const operator = String(args.operator ?? '').trim()
+    if (!operator) throw new Error('operator 必填')
+    const taskId = toId(args.processTaskId)
+    const reason = String(args.reason ?? '')
+    const host = await this.repo.findTaskById(taskId)
+    if (!host) throw new Error('任务不存在')
+    if (!isPrivilegedOperator(operator) && !inRoster(host, operator)) {
+      throw new Error(MSG_NO_PERMISSION_REVOKE)
+    }
+    const inst = await this.repo.findInstanceById(host.processInstanceId)
+    if (!inst) throw new Error('流程实例不存在')
+    const def = await this.repo.findDefineById(inst.defineId)
+    if (!def) throw new Error('流程定义不存在')
+    const flow = loadFlowModel(def.content)
+    const node = (flow.nodes ?? []).find(n => n.id === host.taskName)
+    if (!dynamicCountersignOf(node)) throw new Error(msgNoPending(host.taskName))
+    const pending = collectPendingMembers(await this.repo.findHistoryTasks(inst.id), host)
+    if (pending.length === 0) throw new Error(msgNoPending(host.taskName))
+    const now = new Date()
+    const revokedActors: (string | null)[] = []
+    for (const m of pending) {
+      m.abandon(now, operator) // updateUser 记真实撤回人（java abandon(operator) 同尺）
+      revokedActors.push(m.actorIds && m.actorIds.length > 0 ? m.actorIds[0] : null)
+      await this.repo.updateTask(m)
+    }
+    appendRevokeHistory(host, operator, revokedActors, lastRound(host), reason, now)
+    await this.repo.updateTask(host)
+    return { revoked: revokedActors.length, actors: revokedActors }
   }
 
   // ── 流程设计（需扩展仓储） ───────────────────────────────────────────────
@@ -1210,6 +1372,13 @@ export class JeeflowFacade {
                 name: n.id, displayName: n.text?.value ?? '', type: n.type,
                 form: n.properties?.form ?? null,
                 ext: n.properties?.field ?? null,
+              }
+              // 动态会签投影（issues/247，规范 06 §2.7）：征询主办行 ext.dynamicCountersign
+              // 从成员行**现算**、跳过 99 废弃行；无成员行 ⇒ 不写键。整段在本 try 内＝
+              // 读数失败不打断 detail 主腿（java 该段整体 try-catch-ignored 同形，投影是增强面）。
+              if (dynamicCountersignOf(n)) {
+                const dc = buildProjection(await this.repo.findHistoryTasks(inst.id), task)
+                if (dc) tExt.dynamicCountersign = dc
               }
               break
             }

@@ -406,10 +406,18 @@ export class ProcessTask {
     this.variables = vars
   }
 
-  /** 废弃任务 */
-  abandon(now: Date): void {
+  /**
+   * 废弃任务。
+   *
+   * `operator`（issues/246／247 新增的可选第二参）＝真实废弃执行人，传入则回写 `updateUser`
+   * ——基准＝java `ProcessTask.abandon(operator)`／python `t.updateUser = operator`。
+   * 既有的会签/加签清场腿历史上不带这一参（不传 ⇒ `update_user` 保持原值，行为逐字不变），
+   * 撤回两腿（已办撤回的下游废弃、撤回动态会签的成员废弃）都带：审计里"谁撤的"必须落在行上。
+   */
+  abandon(now: Date, operator?: string): void {
     this.taskState = TaskState.Abandoned
     this.updateTime = now
+    if (operator) this.updateUser = operator
   }
 
   /** 随实例撤回任务（区别于 abandon：撤回是发起人主动收回，废弃是引擎清理） */

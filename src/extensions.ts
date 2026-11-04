@@ -26,7 +26,7 @@ export type DecisionHandler = (handlerName: string, node: FlowNode, inst: Proces
  *
  * ⚠️ 破坏性变更（spec §11.6 明写）：本栈旧形状是 `iota` 起的 0..5 套
  * （ProcessStart=0 / ProcessFinish=1 / ProcessReject=2 / TaskCreate=3 / TaskComplete=4 / CcCreate=5），
- * 现整表重排到 A 套 1..9，与 Java/PHP/Rust/MoonBit/C# 同套：
+ * 现整表重排到 A 套（1..9 那一轮），与 Java/PHP/Rust/MoonBit/C# 同套：
  *   - CcCreate 5 → 4（4 号位由 Java 让出的死码 PROCESS_TASK_END 腾出，与 PHP v1.3.8 活码对齐）
  *   - TaskComplete 4 → 5
  *   - 旧 ProcessFinish(1) 与 ProcessReject(2) **合并**为 ProcessInstanceEnd(2)——办结/拒绝/撤回/终止
@@ -34,8 +34,9 @@ export type DecisionHandler = (handlerName: string, node: FlowNode, inst: Proces
  *   - TaskCreate → ProcessTaskStart（规范名）、ProcessStart → ProcessInstanceStart
  *
  * **规范名是权威，码值只是各栈内部的附带数值**（§11.3 首段）：集成层跨语言判据一律按规范名分派，
- * 不得拿数字码当判据（旧版已发布版本里数字码不可混用）。10+ 号段为超时催办/超时自动通过预留，
- * 本轮不发（§11.4 第 1 条：八栈都无时钟扫描器，发了没有触发源）。
+ * 不得拿数字码当判据（旧版已发布版本里数字码不可混用）。码 10（`TASK_RECALL`，issues/246 已办撤回）
+ * 随 246 腿启用，11+ 预留（超时催办／超时自动通过等，本轮不发——§11.4 第 1 条：八栈都无时钟扫描器，
+ * 发了没有触发源）。
  *
  * 旧成员名（`ProcessStart`/`ProcessFinish`/`ProcessReject`/`TaskCreate`/`TaskComplete`/`CcCreate`）
  * 按 §11.6「改名兼容义务」**保留一代**——别名在本 enum **外部**，见下方常量块（为什么不能写进来）。
@@ -59,6 +60,13 @@ export enum EventType {
   TaskWithdraw         = 8,
   /** 9 · 实例被终止——实例 state 写 40 落库之后（本栈当前无写 40 的门面动作，见 engine.notifyInstanceEnd） */
   InstanceTerminated   = 9,
+  /**
+   * 10 · 已办任务撤回发生（issues/246）——撤回动作落库之后 fire **一次**，sourceId＝被撤的旧行，
+   * 载荷 instanceId/taskId/operator。**只发 10，不补发 5/6**（撤回不是办结也不是拒绝，理由同码 8
+   * 不补发 2）；复活行自己的新待办另走码 3（既有建单腿）。动态会签（issues/247）**不新增事件码**：
+   * 成员行建/结走既有 3/5，撤回未答成员靠 `tf_addSignHistory` 账本留痕、不发码。
+   */
+  TaskRecall           = 10,
 }
 
 /**
@@ -73,8 +81,8 @@ export enum EventType {
  * **每个**成员生成反向映射 `E[E["X"]=1]="X"`，同值的后声明成员会**覆盖** `E[1]` —— `EventType[1]`
  * 就从 `'ProcessInstanceStart'` 变成 `'ProcessStart'`。集成层/L2-30 的事件流水 sink 靠 code→规范名
  * 映射写 `<code>|<规范名>|<sourceId>`，反向映射被污染＝线上假红。写成模块级常量则完全不进 `EventType`
- * 对象：1..9 的反向映射与 `Object.keys(EventType)` 保持九支纯净（`__tests__/spec.test.ts` 的
- * 「反向映射未被别名污染」格钉这条），别名只是同名同值的导出常量。
+ * 对象：码表各号（现 1..10）的反向映射与 `Object.keys(EventType)` 保持**成员数与码表一致**的纯净
+ * （`__tests__/spec.test.ts` 的「码表钉死」＋「反向映射未被别名污染」两格钉这条），别名只是同名同值的导出常量。
  *
  * 集成壳本轮一律**改用规范名**，不依赖别名续命（§11.6 末段）——别名只留给外部消费者一个代次的迁移窗口。
  * §11.6 的"一代"窗口到期后，本块六条别名连同注释一并删除。

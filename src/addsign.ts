@@ -16,6 +16,12 @@
 import { KeyNextNodeOperator, parseActorIds, isFirstTaskName, isCountersign } from './engine.js'
 import { normalizeActorValue, normalizeActors } from './spi.js'
 import { type FlowModel, type FlowNode, type ProcessInstance, type ProcessTask, TypeTask } from './model.js'
+// issues/246／247 两开关的解析期校验与废弃腿双判据。这三行与本文件顶部 `engine.js` 那行同族
+// （引擎↔支持层互指，求值期不碰）：`recall.ts`／`collect.ts` 反过来只 import 本文件的
+// `parseAllow`／`historyOf`／`KeyAddSignHistory` 等**函数与常量**，且一律在函数体内取用 ⇒
+// ESM 环里没有任何"求值期解引用"，模块实例化顺序怎么排都不撞 TDZ。
+import { checkRecallFlowConfig } from './recall.js'
+import { checkCollectFlowConfig, dynamicCountersignOf } from './collect.js'
 
 /** 节点属性键：后加签开关（`properties` 平铺层，缺省 false） */
 export const PROP_ALLOW_ADD_SIGN = 'allowAddSign'
@@ -39,8 +45,8 @@ export const msgSwitchOff = (nodeName: string): string =>
 export const MSG_SELF = '不能把任务加签给自己'
 export const msgMaxRounds = (nodeName: string, max: number): string =>
   `节点[${nodeName}]的加签轮次已达上限 ${max}，本次提交被拒绝`
-const msgAllowIllegal = (nodeName: string, v: string): string =>
-  `节点[${nodeName}]的 ${PROP_ALLOW_ADD_SIGN} 配置非法: ${v}`
+const msgAllowIllegal = (nodeName: string, keyName: string, v: string): string =>
+  `节点[${nodeName}]的 ${keyName} 配置非法: ${v}`
 const msgMaxRoundsNotInt = (nodeName: string, v: string): string =>
   `节点[${nodeName}]的 ${PROP_ADD_SIGN_MAX_ROUNDS} 配置非法: ${v}（必须是整数）`
 const msgMaxRoundsNotInt0 = (nodeName: string, v: string): string =>
@@ -57,8 +63,14 @@ export function formatAddSignTime(d: Date): string {
 
 // ─── 节点开关解析（非法值报配置错误，不得静默当缺省——照 reapplyMode 先例） ───────
 
-/** 解析 `allowAddSign`：缺省 false；非布尔报解析期错误。 */
-export function parseAllow(value: unknown, nodeName: string): boolean {
+/**
+ * 解析布尔开关：缺省 false；非布尔报配置错误，不得静默当缺省。
+ *
+ * `keyName`＝报错文案里的属性键名（java `AddSignSupport.parseAllow` 的第三参同位）。缺省回落在
+ * 本开关自己的键 `allowAddSign`；issues/246/247 的 `allowRecall`／`dynamicCountersign` 走
+ * **同一枚**解析器（`recall.ts`／`collect.ts` 传各自键名），文案键位逐字不串、不留第二份判据。
+ */
+export function parseAllow(value: unknown, nodeName: string, keyName: string = PROP_ALLOW_ADD_SIGN): boolean {
   if (value == null) return false
   if (typeof value === 'boolean') return value
   const v = String(value).trim()
@@ -66,7 +78,7 @@ export function parseAllow(value: unknown, nodeName: string): boolean {
   const lower = v.toLowerCase()
   if (lower === 'true') return true
   if (lower === 'false') return false
-  throw new Error(msgAllowIllegal(nodeName, v))
+  throw new Error(msgAllowIllegal(nodeName, keyName, v))
 }
 
 /** 解析 `addSignMaxRounds`：缺省 0＝不限；非整数或负数报解析期错误。 */
@@ -99,10 +111,16 @@ export function maxRoundsOf(node: FlowNode | undefined): number {
 }
 
 /**
- * 解析期三条校验（规范 02 §4.3）——本栈没有 java 那一层 `ModelParser`（`JSON.parse(content)`
- * 直接当 FlowModel 用），故落点＝引擎每次读定义的解析口（`engine.ts` 的 `loadFlowModel`）。
- * 配了就直接报错，不做运行时降级：静默跑下去会让配置者以为开关生效，实际两档推进闸各裁各的。
- * 三条：① 两键非法值；② 会签节点配 `allowAddSign`；③ 首任务节点配 `allowAddSign`。
+ * 解析期硬校验（规范 02 §4.3／§4.4）——本栈没有 java 那一层 `ModelParser`（`JSON.parse(content)`
+ * 直接当 FlowModel 用），故落点＝引擎每次读定义的解析口（`engine.ts` 的 `loadFlowModel`）＋
+ * 门面的三条发布腿。配了就直接报错，不做运行时降级：静默跑下去会让配置者以为开关生效，
+ * 实际两档推进闸各裁各的。
+ *
+ * <p>位序照 java `ModelParser.parse` 尾部三段：**后加签两判 → 已办撤回两判 → 动态会签三判**
+ * （90469a2／ffe2749）。后两段的本体在 `recall.ts`／`collect.ts`（各自的开关与禁配各自守），
+ * 本函数是三段共用的那一个入口——与 java 一样"读一次定义只校一次"，不留第二个调用面。</p>
+ *
+ * <p>本段三条：① 两键非法值；② 会签节点配 `allowAddSign`；③ 首任务节点配 `allowAddSign`。</p>
  */
 export function checkFlowConfig(flow: FlowModel): void {
   const tasks = (flow?.nodes ?? []).filter(n => n.type === TypeTask)
@@ -123,6 +141,9 @@ export function checkFlowConfig(flow: FlowModel): void {
         '申请节点的办理是发起/重提语义，与加签路由打架')
     }
   }
+  // 已办撤回两判 ＋ 动态会签三判（规范 02 §4.4，issues/246／247）
+  checkRecallFlowConfig(flow)
+  checkCollectFlowConfig(flow)
 }
 
 // ─── 本次提交的加签人 ──────────────────────────────────────────────────────────
@@ -140,6 +161,20 @@ export function operators(args: Record<string, any> | null | undefined): string[
 }
 
 /**
+ * 本次提交是否同时给了 `tf_nextNodeOperator`（互斥判据的左半，**共用这一枚**：
+ * 后加签写入口 `validateSubmission` 与动态会签发起分流 `facade.tryDynamicCountersign` 都读它）。
+ * 「归一后为空＝没传」与 §2.11 同尺：数组里全是空元素、串全是空白，都不算占用那一档。
+ */
+export function nextOperatorPresent(args: Record<string, any> | null | undefined): boolean {
+  if (!args) return false
+  const nextRaw = args[KeyNextNodeOperator]
+  if (nextRaw == null) return false
+  return Array.isArray(nextRaw) || typeof nextRaw === 'string'
+    ? parseActorIds(nextRaw).length > 0
+    : normalizeActorValue(nextRaw) !== ''
+}
+
+/**
  * 写入口校验（互斥／开关未开／加给自己／超上限）。必须在改动任何状态之前调用。
  *
  * <p>互斥这一条的理由不是语义矛盾（一个管本节点再来一轮、一个管流出后交给谁，逻辑可共存），
@@ -151,13 +186,7 @@ export function validateSubmission(flow: FlowModel, task: ProcessTask, args: Rec
                                     operator: string): void {
   if (!args || !task) return
   const ops = operators(args)
-  const nextRaw = args[KeyNextNodeOperator]
-  // 「归一后为空＝没传」与 §2.11 同尺：数组里全是空元素、串全是空白，都不算占用那一档
-  const nextPresent = nextRaw != null &&
-    (Array.isArray(nextRaw) || typeof nextRaw === 'string'
-      ? parseActorIds(nextRaw).length > 0
-      : normalizeActorValue(nextRaw) !== '')
-  if (ops.length > 0 && nextPresent) throw new Error(MSG_MUTEX)
+  if (ops.length > 0 && nextOperatorPresent(args)) throw new Error(MSG_MUTEX)
   if (ops.length === 0) {
     // 没点人＝正常流转档，其余判据不涉及（也不要求节点开开关）
     return
@@ -184,14 +213,16 @@ export function hasDoingOnNode(inst: ProcessInstance | null | undefined, nodeNam
 
 /**
  * 废弃本节点未完成的加签任务（拒绝／退回发起人时调用，不留孤儿待办）。
- * 只对开了 `allowAddSign` 的节点动手——会签节点的兄弟任务由既有会签腿管，不在此扩面。
+ * 只对开了 `allowAddSign` **或** `dynamicCountersign` 的节点动手（issues/247：征询成员行同属
+ * 本节点 DOING，实例撤回／退回路径一并清场——废弃腿条件扩成双开关，java `AddSignSupport
+ * .abandonDoingOnNode` 同判据）；会签节点的兄弟任务由既有会签腿管，不在此扩面。
  * 返回被废弃的行，由调用方落库（本栈的持久化腿在引擎侧，聚合根不写库）。
  */
 export function abandonDoingOnNode(flow: FlowModel, inst: ProcessInstance, nodeName: string,
                                     now: Date): ProcessTask[] {
   if (!flow || !inst || !nodeName) return []
   const node = (flow.nodes ?? []).find(n => n.id === nodeName)
-  if (!allowAddSignOf(node)) return []
+  if (!allowAddSignOf(node) && !dynamicCountersignOf(node)) return []
   const abandoned: ProcessTask[] = []
   for (const t of inst.tasks ?? []) {
     if (t.taskName === nodeName && t.isDoing()) {
