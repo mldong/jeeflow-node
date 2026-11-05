@@ -3,6 +3,15 @@ export { MemoryRepository } from './memory.js'
 export { MemoryExtRepository } from './memory-ext.js'
 export { HandlerRegistry, type IAssignmentHandler, type IDecisionHandler, type ICustomHandler, type HandlerMeta, type HandlerType } from './registry.js'
 export { enumDict, enumDictKeys, type DictItem } from './metadata.js'
+// issues/248：action → 权限码映射 SPI（内置默认件对齐 java DefaultActionPermissionProvider）
+export {
+  type ActionPermissionProvider,
+  DefaultActionPermissionProvider,
+  setActionPermissionProvider,
+  actionPermissionProviderOrDefault,
+  permissionCodes,
+  actionPermissionProviderMeta,
+} from './action-permission.js'
 export * from './model.js'
 export type { ProcessRepository, ProcessExtRepository, UserProvider, OrgUserProvider, IDGenerator, ExpressionEvaluator, QueryCondition } from './spi.js'
 export {
