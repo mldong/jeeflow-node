@@ -536,4 +536,6 @@ export interface TaskRow {
   defineVersion: number
   instanceVariable: string
   instanceCreateTime: Date
+  /** issues/250：所属流程实例的状态（10/20/30/40/45/50/99），前端据此把实例已结束的已办行撤回按钮置灰 */
+  instanceState: InstanceState
 }

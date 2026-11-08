@@ -1,4 +1,4 @@
-import { TaskState } from './model.js'
+import { InstanceState, TaskState } from './model.js'
 import type { CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDefine } from './model.js'
 import { cloneInstance, cloneTask, type ProcessInstance, type ProcessTask } from './model.js'
 import type { ProcessRepository, QueryCondition } from './spi.js'
@@ -431,6 +431,8 @@ export class MemoryRepository implements ProcessRepository {
       defineVersion: def?.version ?? 0,
       instanceVariable: inst ? JSON.stringify(inst.variables ?? {}) : '',
       instanceCreateTime: inst?.createTime ?? t.createTime,
+      // issues/250：与 SQL 腿 pi.state 投影对齐（孤儿行防御性回 0，同 Java rs.getInt NULL→0；引擎建单必有实例）
+      instanceState: inst?.state ?? (0 as InstanceState),
     }
   }
 

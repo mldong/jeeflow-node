@@ -722,7 +722,8 @@ export class JdbcRepository implements ProcessRepository {
         ' t.task_state, t.operator, t.finish_time, t.expire_time, t.form_key, t.task_parent_id, t.variable,' +
         ' t.create_time, t.create_user, t.update_time, t.update_user,' +
         ' pd.name, pd.display_name AS pd_display_name, pd.version AS process_define_version,' +
-        ' pi.variable AS instance_variable, pi.create_time AS instance_create_time'
+        ' pi.variable AS instance_variable, pi.create_time AS instance_create_time,' +
+        ' pi.state AS instance_state' // issues/250：列表行带所属实例状态（pi 关联本就在，不新增关联）
       const rows = await conn.fetchAll(this.sql(
         `SELECT ${cols}${where} ORDER BY t.id DESC LIMIT ? OFFSET ?`),
         [filter, ...cond.params, pageSize, (pageNum - 1) * pageSize])
@@ -808,6 +809,8 @@ export class JdbcRepository implements ProcessRepository {
       processDefineName: r.name ?? '', processDefineDisplayName: r.pd_display_name ?? '',
       defineVersion: Number(r.process_define_version ?? 0),
       instanceVariable: r.instance_variable ?? '', instanceCreateTime: r.instance_create_time,
+      // issues/250：对齐 Java rs.getInt("instance_state")（NULL→0）；todo/done 共用这一份投影
+      instanceState: Number(r.instance_state ?? 0) as InstanceState,
     }
   }
 

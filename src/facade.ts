@@ -2179,6 +2179,7 @@ function taskRowToMap(r: TaskRow): Record<string, any> {
     updateTime: fmtTime(r.updateTime), updateUser: r.updateUser,
     processDefineName: r.processDefineName, processDefineDisplayName: r.processDefineDisplayName,
     instanceCreateTime: fmtTime(r.instanceCreateTime),
+    instanceState: r.instanceState, // issues/250：前端据此把实例已结束的已办行撤回按钮置灰
     ext, instanceExt, version: r.defineVersion,
     taskFormData: formDataOf(r.variables, 'tf_'), // issues/15
   }
