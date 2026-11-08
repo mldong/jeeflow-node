@@ -1253,6 +1253,46 @@ describe('jeeflow compliance tests', () => {
     assert.match(String(crow.createTime), timeRe, '抄送行时间应为 yyyy-MM-dd HH:mm:ss')
   })
 
+  /**
+   * issues/250：列表行必须带所属实例的状态（instanceState），前端据此把「实例已非进行中」的
+   * 已办行撤回按钮置灰。承重档＝实例已结束后读已办：任务行自身仍是 20，只有 instanceState
+   * 能告诉前端这单已走完（任务态照不出来）。内部对照：同一实例结束前读待办行必须是 10、
+   * 结束后读已办行必须是 20，两格合起来挡住「恒 10 / 恒 20 / 恒 undefined」这类假绿。
+   * SQL 投影那一半由真库腿 __tests__/instance-state-mysql.test.ts 钉（内存仓照不出漏投列）。
+   */
+  it('19b issues/250：列表行带所属实例状态 instanceState（待办=10 / 办结后已办=20）', async () => {
+    const { engine, repo } = setup()
+    const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
+    const content = readFileSync(flowDir + '01-simple.json', 'utf-8')
+    const r0 = await facade.flow('processDefine/deploy', { content })
+    assert.equal(r0.code, 0, JSON.stringify(r0))
+    const r1 = await facade.flow('processInstance/startAndExecute',
+      { processDefineId: r0.data.processDefineId, operator: 'zhangsan', amount: 1000 })
+    assert.equal(r1.code, 0, JSON.stringify(r1))
+    const instanceId = r1.data.processInstanceId
+
+    // 实例进行中 ⇒ 待办行 instanceState=10（startAndExecute 已办结申请节点，task1 在办）
+    const r2 = await facade.flow('processTask/todoList', { operator: 'leader' })
+    assert.equal(r2.code, 0, JSON.stringify(r2))
+    const todoRow = r2.data.rows.find((r: any) => String(r.processInstanceId) === String(instanceId))
+    assert.ok(todoRow, 'todoList 应有本实例行')
+    assert.ok('instanceState' in todoRow, 'JSON 出口必须带 instanceState 键（camelCase）')
+    assert.equal(todoRow.instanceState, 10, '实例进行中 ⇒ 待办行 instanceState=10')
+
+    // 办结末节点 ⇒ 实例完成（20）
+    const doing = await repo.findDoingTasks(instanceId)
+    await engine.executeProcessTask(doing[0].id, 'leader', { [KeySubmitType]: SubmitType.Agree })
+    assert.equal((await repo.findInstanceById(instanceId))!.state, InstanceState.Done, '前置：实例已完成')
+
+    // 承重格：已办行自身 taskState 仍是 20，instanceState=20 才告诉前端这单已走完
+    const r3 = await facade.flow('processTask/doneList', { operator: 'leader' })
+    assert.equal(r3.code, 0, JSON.stringify(r3))
+    const doneRow = r3.data.rows.find((r: any) => String(r.processInstanceId) === String(instanceId))
+    assert.ok(doneRow, 'doneList 应有本实例行')
+    assert.equal(doneRow.taskState, 20, '前置：任务行自身仍是已完成')
+    assert.equal(doneRow.instanceState, 20, '实例已结束 ⇒ 已办行 instanceState 必须是 20，否则前端无从置灰')
+  })
+
   it('20 m_ 前缀查询参数（issues/05-5）', async () => {
     const { engine, repo } = setup()
     const facade = new JeeflowFacade(engine, repo, new MemoryExtRepository())
