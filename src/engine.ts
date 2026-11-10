@@ -21,7 +21,7 @@ import {
 import {
   allowRecallOf, appendRecallHistory, inRoster, isPrivilegedOperator,
   MSG_INSTANCE_NOT_DOING, MSG_NO_PERMISSION, MSG_NOT_FINISHED,
-  msgSwitchOff, validateWindow,
+  msgSwitchOff, stampAllowRecall, validateWindow,
 } from './recall.js'
 // 动态会签（issues/247，征询模式）：成员行识别/计数/投影在 collect.ts，建成员行走本文件的
 // 建单腿（`createCollectMemberRows`），推进闸复用上面后加签那一条
@@ -881,6 +881,11 @@ export class EngineImpl implements Engine {
     // completeTask 之前——内存仓储无回滚，报错时不得留下已完成的任务行（"报错且无写入"是
     // 这条链的硬要求，落点与 java `prepareExecution` 同位）。
     validateSubmission(flow, task, args, operator)
+    // issues/251：办理时把本节点的 allowRecall 开关快照进行变量（tf_allowRecall）——
+    // prepareExecuteTask 是全部办结路径的公共序言，一处盖键全路径覆盖。tf_ 键被实例
+    // 合并两面立法排除（不传播）；撤回校验仍以现读定义为权威，快照仅供前端预判；
+    // 出口只投已办行。
+    stampAllowRecall(args, findNode(flow, task.taskName))
     // issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
     // 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。
     const baseVars = inst.variables

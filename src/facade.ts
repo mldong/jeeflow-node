@@ -17,6 +17,7 @@ import { normalizeActorValue } from './spi.js'
 import type { EngineImpl } from './engine.js'
 import { KeyAutoExecute, KeyAdminID, KeyCcActorsStart, KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign, loadFlowModel, parseActorIds } from './engine.js'
 import { EventType } from './extensions.js'
+import { KeyAllowRecall } from './recall.js'
 // 后加签两开关的解析期硬校验（规范 02 §4.3／§4.4）：java 在 deploy/redeploy/designDeploy/
 // designRedeploy 四条发布腿上都 ModelParser.parse 一遍 ⇒ 带病定义**发布即拒**；本栈对应物
 // 就是这三处内容解析点（引擎执行腿的同一判据在 engine.loadFlowModel，共用 addsign 那一份——
@@ -2163,6 +2164,10 @@ function taskRowToMap(r: TaskRow): Record<string, any> {
   // （jeeflow-ui helpers.ts 读 ext._reapplyContext）⇒ 回退后原样合回。
   // 合回必须落在**副本**上：instanceExt 是同一响应里的另一个出口，不能被任务侧的键污染。
   const vars = r.variables ?? {}
+  // issues/251：办理时快照的节点开关投成顶层标准字段，供前端已办行置灰预判——从原行
+  // 变量取（ext 回退替换不影响）；只投已办行（本栈建单只写 isFirstTaskNode，待办行无键；
+  // DOING 守卫为防御性同形）；无键不投＝存量行＝前端退回可点
+  const rowAllowRecall = r.taskState !== 10 ? vars[KeyAllowRecall] : undefined
   const hasUserKey = Object.keys(vars).some(
     k => k !== 'isFirstTaskNode' && k !== VAR_BRANCH_CTX && k !== VAR_REAPPLY_CTX)
   let ext: Record<string, any> = vars
@@ -2170,7 +2175,7 @@ function taskRowToMap(r: TaskRow): Record<string, any> {
     ext = { ...instanceExt }
     if (vars[VAR_REAPPLY_CTX] != null) ext[VAR_REAPPLY_CTX] = vars[VAR_REAPPLY_CTX]
   }
-  return {
+  const row: Record<string, any> = {
     id: r.id, processInstanceId: r.processInstanceId, taskName: r.taskName,
     displayName: r.displayName, taskType: r.taskType, performType: r.performType,
     taskState: r.taskState, operator: r.operator, finishTime: fmtTime(r.finishTime),
@@ -2183,6 +2188,10 @@ function taskRowToMap(r: TaskRow): Record<string, any> {
     ext, instanceExt, version: r.defineVersion,
     taskFormData: formDataOf(r.variables, 'tf_'), // issues/15
   }
+  if (rowAllowRecall !== undefined && rowAllowRecall !== null) {
+    row.allowRecall = Boolean(rowAllowRecall)
+  }
+  return row
 }
 
 // ── 工具 ──────────────────────────────────────────────────────────────────────

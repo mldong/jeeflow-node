@@ -178,3 +178,20 @@ export function isPrivilegedOperator(operator: string): boolean {
   const lower = (operator ?? '').toLowerCase()
   return lower === KeyAutoExecute.toLowerCase() || lower === KeyAdminID.toLowerCase()
 }
+
+/** 已办撤回节点开关快照（issues/251）：办理时由引擎从节点属性盖到本行变量，值＝办理时刻的
+ *  `allowRecall` 定义值；查询出口搬运成行顶层 `allowRecall` 供前端预判置灰（只投已办行）。
+ *  撤回校验仍以现读定义为权威，快照仅供预判（漂移为设计内）。 */
+export const KeyAllowRecall = 'tf_allowRecall'
+
+/** 办理时把当前节点的 `allowRecall` 开关快照进行变量（issues/251）：已办行置灰的"节点开关"
+ *  预判从行上读，查询出口只搬运不解析定义。`tf_` 前缀键被实例合并排除（`omitTaskControlKeys`
+ *  ＋`mergeExecIntoInstance` 两面立法），不传播；本栈建单只写 `isFirstTaskNode`，待办行无键
+ *  （与 jeeflow/go 同形）。撤回校验仍以现读定义为权威。非任务节点与空 args 静默跳过。 */
+export function stampAllowRecall(
+  args: Record<string, any> | undefined | null,
+  node: FlowNode | undefined,
+): void {
+  if (!args || !node || node.type !== TypeTask) return
+  args[KeyAllowRecall] = allowRecallOf(node)
+}

@@ -17,7 +17,7 @@ import { EngineImpl, KeySubmitType } from '../src/engine.js'
 import { JeeflowFacade } from '../src/facade.js'
 import { KeyAddSignOperators, checkFlowConfig } from '../src/addsign.js'
 import {
-  KeyRecallHistory, MSG_INSTANCE_NOT_DOING, MSG_NO_PERMISSION, MSG_NOT_FINISHED,
+  KeyAllowRecall, KeyRecallHistory, MSG_INSTANCE_NOT_DOING, MSG_NO_PERMISSION, MSG_NOT_FINISHED,
   PROP_ALLOW_RECALL, msgRecallCountersignForbid, msgRecallFirstTaskForbid,
   msgSwitchOff, msgWindow, recallHistoryOf,
 } from '../src/recall.js'
@@ -505,5 +505,45 @@ describe('已办撤回（allowRecall）（Node）', () => {
     await engine.recallTask(review.id, 'userA')
     const after = (await repo.findInstanceById(inst.id))!
     assert.equal(after.variables.f_amount, 880, 'f_ 表单字段留在实例变量里（不随撤回回滚）')
+  })
+
+  it('格18（issues/251）办理时盖 tf_allowRecall 快照：两态/待办无键/发起腿禁配/不传播/出口投顶层', async () => {
+    const { engine, repo } = setup()
+    const inst = await startToReview(repo, engine, { assignee: 'userA', allowRecall: true })
+    const review = (await doing(repo, inst.id, 'review'))!
+    assert.ok(review, '应停在审批节点')
+    // 待办行无快照键（建单只写 isFirstTaskNode，与 jeeflow/go 同形）
+    assert.equal((await repo.findTaskById(review.id))!.variables[KeyAllowRecall], undefined,
+      '待办行不应带快照键')
+
+    // 同名隔离：办理 args 塞业务裸键 allowRecall，与快照共存
+    await engine.executeProcessTask(review.id, 'userA',
+      { [KeySubmitType]: AGREE, allowRecall: 'custom' })
+    const reviewRow = (await repo.findHistoryTasks(inst.id)).find(t => t.taskName === 'review')!
+    assert.equal(reviewRow.variables[KeyAllowRecall], true, 'review 行快照 true')
+    assert.equal(reviewRow.variables.allowRecall, 'custom', '业务同名键与快照互不干扰')
+
+    // final（未配置节点）→ false
+    const fin = (await doing(repo, inst.id, 'final'))!
+    await engine.executeProcessTask(fin.id, 'userF', plain(AGREE))
+    const finRow = (await repo.findHistoryTasks(inst.id)).find(t => t.taskName === 'final')!
+    assert.equal(finRow.variables[KeyAllowRecall], false, '未配置节点快照 false')
+
+    // apply 行（发起腿办结，禁配档）
+    const applyRow = (await repo.findHistoryTasks(inst.id)).find(t => t.taskName === 'apply')!
+    assert.equal(applyRow.variables[KeyAllowRecall], false, '申请节点禁配快照 false')
+
+    // 不传播：实例变量无 tf_allowRecall
+    const after = (await repo.findInstanceById(inst.id))!
+    assert.equal(after.variables[KeyAllowRecall], undefined, '实例变量不得含快照键')
+
+    // 出口行内搬运：doneList 已办行投顶层、ext 业务键原样
+    const facade = new JeeflowFacade(engine, repo)
+    const resp: any = await facade.flow('processTask/doneList',
+      { operator: 'userA', pageNum: 1, pageSize: 10 })
+    assert.equal(resp.code, 0)
+    const reviewDone = resp.data.rows.find((r: any) => r.taskName === 'review')
+    assert.equal(reviewDone.allowRecall, true, '已办行投顶层 true')
+    assert.equal(reviewDone.ext.allowRecall, 'custom', 'ext 业务键原样')
   })
 })
