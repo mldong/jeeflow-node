@@ -37,6 +37,9 @@ import {
   msgDuplicate, msgNoPending, msgPending,
 } from './collect.js'
 import { inRoster, isPrivilegedOperator } from './recall.js'
+// 动态协办（issues/253）：门面只做参数归一与信封包装，判据/建单/账本/闸门全在引擎
+// （形状基准＝java `JeeflowFacade.taskAidant`／`parseWaitCompletion`）
+import { MSG_NO_ACTORS as MSG_AIDANT_NO_ACTORS, buildProjection as buildAidantProjection } from './aidant.js'
 import { VAR_BRANCH_CTX, VAR_REAPPLY_CTX } from './reapply.js'
 
 // submitType 枚举（对齐 boot3）
@@ -388,6 +391,8 @@ export class JeeflowFacade {
         return this.taskRecall(args)
       case 'processTask/revokeDynamicCountersign': // issues/247 撤回动态会签（第 49 个 action）
         return this.taskRevokeCountersign(args)
+      case 'processTask/aidant': // issues/253 动态协办（第 50 个 action，data → null）
+        return this.taskAidant(args)
       case 'processTask/latest':
         return this.taskLatest(args)
       case 'processInstance/stats/overview':
@@ -622,6 +627,33 @@ export class JeeflowFacade {
     const taskId = toId(args.processTaskId)
     const resurrected = await this.engine.recallTask(taskId, operator)
     return { processTaskId: resurrected.id, taskState: resurrected.taskState }
+  }
+
+  /**
+   * 动态协办（issues/253，规范 06 §processTask/aidant）：主办把"这活"交给别人干——按人派生
+   * `task_type=1` 协办子行，主办行原样保留 DOING，节点推进仍由主办行办结触发。
+   *
+   * 门面只做参数归一与信封包装，判据/建单/账本全在引擎（`EngineImpl.aidantTask`，与 recall
+   * 同分工）。`operator` 硬必填（不接受缺省，与 transfer/withdraw 同口径）；`actorIds` 逗号串
+   * 与数组两形共用 §2.11 那枚归一单点（`engine.parseActorIds` → `spi.normalizeActors`），
+   * 空 ⇒ 逐字「actorIds 必填」。`waitCompletion` 选填 bool，缺省 false＝不等。
+   *
+   * 成功 `data → null`（规范 06）；失败 msg 见跨栈统一文案表协办六行。
+   * 权限码复用 `wf:processTask:execute`（OR 规则，照 246/247 B 案惯例）。
+   * 位序照 java taskAidant：operator 空判在前、主键缺失判在后、actorIds 空判第三。
+   */
+  private async taskAidant(args: Record<string, any>): Promise<null> {
+    const operator = String(args.operator ?? '').trim()
+    if (!operator) throw new Error('operator 必填')
+    const rawId = args.processTaskId
+    if (rawId == null || String(rawId).trim() === '') throw new Error('processTaskId 缺失')
+    const taskId = toId(rawId)
+    const actorIds = parseActorIds(args.actorIds)
+    if (actorIds.length === 0) throw new Error(MSG_AIDANT_NO_ACTORS)
+    const reason = String(args.reason ?? '')
+    const waitCompletion = parseWaitCompletion(args.waitCompletion)
+    await this.engine.aidantTask(taskId, actorIds, reason, waitCompletion, operator)
+    return null
   }
 
   /**
@@ -1381,6 +1413,11 @@ export class JeeflowFacade {
                 const dc = buildProjection(await this.repo.findHistoryTasks(inst.id), task)
                 if (dc) tExt.dynamicCountersign = dc
               }
+              // 动态协办投影（issues/253，规范 06 §2.7）：主办行 ext.aidant 从 task_parent_id＋
+              // task_type=1 现算，不落新存储。**无节点开关**——协办档只由运行期派生，任何任务
+              // 节点都可能有（故不套征询那层开关判据）。整段同在 try 内＝读数失败不打断 detail 主腿。
+              const ap = buildAidantProjection(await this.repo.findHistoryTasks(inst.id), task)
+              if (ap) tExt.aidant = ap
               break
             }
           }
@@ -2249,6 +2286,18 @@ function toStr(v: any): string {
 function operatorArg(args: Record<string, any>): string {
   const s = toStr(args.operator)
   return s.trim() !== '' ? s : 'user1'
+}
+
+/**
+ * `waitCompletion` 入参解析（issues/253，规范 06「选填 bool，缺省 false」）。
+ * 布尔与 "true"/"false" 字符串两形都认（前端 JSON 与表单串两种来源）；其余值按缺省 false
+ * 处理——契约只定义了 bool 档，**不为非法值新造文案**（跨栈统一文案表协办六行之外不加第七行）。
+ * 形状基准＝java `JeeflowFacade.parseWaitCompletion`。
+ */
+function parseWaitCompletion(value: any): boolean {
+  if (value === null || value === undefined) return false
+  if (typeof value === 'boolean') return value
+  return String(value).trim().toLowerCase() === 'true'
 }
 
 function toId(v: any): string {

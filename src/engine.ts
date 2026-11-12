@@ -4,7 +4,7 @@ import {
   TypeStart, TypeEnd, TypeTask, TypeDecision, TypeFork, TypeJoin, TypeCustom,
   KnownNodeTypes, TaskFormPrefix,
   ProcessInstance, type ProcessTask, type ProcessDefine,
-  InstanceState, TaskState, SubmitType,
+  InstanceState, TaskState, SubmitType, TaskType, PerformType,
 } from './model.js'
 import {
   attachCreated, buildScopes, createTaskAt, executeReapply, mergeReady, newContext,
@@ -26,6 +26,17 @@ import {
 // 动态会签（issues/247，征询模式）：成员行识别/计数/投影在 collect.ts，建成员行走本文件的
 // 建单腿（`createCollectMemberRows`），推进闸复用上面后加签那一条
 import { dynamicCountersignOf, KeyAddSignReason } from './collect.js'
+// 动态协办（issues/253）：协办行识别/计数/投影/账本的纯函数家族在 aidant.ts，派生腿与
+// 推进闸/等待闸/清场腿在本文件（形状基准＝java `core/AidantSupport` ＋
+// `JeeflowEngineImpl.aidantTask`／`completeAidantWithoutDrive`／`TaskModel.abandonAidantOnLeave`）
+import {
+  aidantRows, appendAbandonHistory, appendAidantHistory, filterOutAidant, gateWait,
+  isAidantRow, lastRound as aidantLastRound,
+  KeyAidantReason, KeyAidantWait,
+  MSG_DUPLICATE as MSG_AIDANT_DUPLICATE, MSG_NO_ACTORS as MSG_AIDANT_NO_ACTORS,
+  MSG_NO_PERMISSION as MSG_AIDANT_NO_PERMISSION, MSG_NO_RECURSION as MSG_AIDANT_NO_RECURSION,
+  MSG_NOT_DOING as MSG_AIDANT_NOT_DOING, MSG_TASK_NOT_FOUND as MSG_AIDANT_TASK_NOT_FOUND,
+} from './aidant.js'
 import type { ProcessRepository, ProcessExtRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
 // issues/141 G2：cc 写侧判重的 java `default` 方法在 TS 里的对应物（第三方仓储未实现判重 SPI 时兜旧行为）
 // issues/141 G10：归属值单值/集合归一的**那一份**判据（漏斗层与写侧层共用；issues/142 B 批
@@ -490,6 +501,10 @@ export class EngineImpl implements Engine {
   private async executeProcessTaskInner(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
     args = stripReserved(args)
     const pre = await this.repo.findTaskById(taskId)
+    // issues/253 推进闸：协办行（task_type=1）办结不产生执行对象、不跑输出变迁
+    if (pre && pre.taskState === TaskState.Doing && isAidantRow(pre)) {
+      return await this.completeAidantWithoutDrive(taskId, operator, args)
+    }
     if (pre && pre.taskState === TaskState.Doing && reapplyOf(pre.variables))
       return await executeReapply(this, pre, operator, args)
     const { task, inst, flow, vars, args: execArgs } = await this.prepareExecuteTask(taskId, operator, args)
@@ -527,7 +542,8 @@ export class EngineImpl implements Engine {
       const csVeto = !!ct && csCond.toUpperCase() === 'ONE_VOTE_VETO' &&
         Number(vars[KeySubmitType]) === Number(SubmitType.CountersignDisagree)
       if (ct === 'SEQUENTIAL' && !csVeto) {
-        const doing = await this.repo.findDoingTasks(inst.id)
+        // issues/253：协办行（task_type=1）不是表决票，不算"本节点还有未完成待办"
+        const doing = filterOutAidant(await this.repo.findDoingTasks(inst.id))
         if (doing.length === 0) {
           const [actors, lc] = getCsState(vars, curNode.id)
           if (actors && lc + 1 < actors.length) {
@@ -568,7 +584,9 @@ export class EngineImpl implements Engine {
           // buildCountersignVars：total＝该节点全部成员行、activate＝DOING、completed＝已完成
           // （读 inst.tasks：prepareExecuteTask 里 completeTask＋syncTaskToAggregate 已把
           // 本单同步进聚合，计数是新鲜的）。
-          const members = inst.tasks.filter(t => t.taskName === curNode.id)
+          // issues/253：会签合并判据显式排除协办行（task_type=1）——snaker 按同节点同名行
+          // 全算会把协办行误当表决票挡住合并（规范 04「不计入会签合并计数」）。
+          const members = inst.tasks.filter(t => t.taskName === curNode.id && !isAidantRow(t))
           const evalVars = {
             ...vars,
             nrOfInstances: members.length,
@@ -584,7 +602,8 @@ export class EngineImpl implements Engine {
           if (!merged) return finishExecute()
           // merged ⇒ 落穿到下面的 abandon＋跟进边（与"全部完成"走同一出口）
         } else {
-          const doing = await this.repo.findDoingTasks(inst.id)
+          // issues/253：协办行不是表决票（同上，合并判据显式排除 task_type=1）
+          const doing = filterOutAidant(await this.repo.findDoingTasks(inst.id))
           if (doing.length > 0) return finishExecute()
         }
       }
@@ -619,6 +638,11 @@ export class EngineImpl implements Engine {
       // 废弃该节点剩余 DOING 任务（对齐内置引擎 abandonProcessTask）：
       // SEQUENTIAL 逐人创建天然 no-op；PARALLEL 全员预创建，否决时废弃其余成员
       // （刚完成者已 Done 不会误伤）。逐条持久化并回写聚合副本（E25：防 updateInstance 级联回写旧状态）
+      // issues/253：离开节点先清场未办结协办行（废弃＋往主办行账本记废弃），再清剩余会签行——
+      // 顺序不能反，先被下面循环置 99 的协办行就记不上账了（java CountersignHandler 同序）。
+      // 本点覆盖四档（会签 merged／加签 merged／征询 merged／普通放行出边）＝java
+      // TaskModel.abandonAidantOnLeave 的四个调用位；上面各"留在本节点"的早返回分支不调。
+      await this.abandonAidantOnNode(inst, curNode.id, operator)
       if (ct) {
         const remaining = await this.repo.findDoingTasks(inst.id, [curNode.id])
         for (const t of remaining) {
@@ -650,11 +674,17 @@ export class EngineImpl implements Engine {
 
   private async executeAndJumpToEndInner(taskId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
     const pre = await this.repo.findTaskById(taskId)
+    // issues/253 推进闸：协办行拒绝同样不驱动流程（任何 submitType 都只办结自己那一行）
+    if (pre && pre.taskState === TaskState.Doing && isAidantRow(pre)) {
+      return await this.completeAidantWithoutDrive(taskId, operator, args)
+    }
     if (pre && pre.taskState === TaskState.Doing && reapplyOf(pre.variables)) {
       throw new Error("带重提直返标记的申请待办不允许拒绝，只接受重新提交(submitType=5)")
     }
     const { task, inst, flow } = await this.prepareExecuteTask(taskId, operator, args)
     // 拒绝结束：本节点未完成的加签任务一并废弃，不留孤儿待办（规范 04 · 后加签／语义边界表）
+    // issues/253：离开节点先清场未办结协办行（废弃＋账本记废弃），再走后加签/征询的既有废弃腿
+    await this.abandonAidantOnNode(inst, task.taskName, operator)
     await this.abandonAddSignDoing(flow, inst, task.taskName, new Date())
     // 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
     inst.reject(new Date())
@@ -680,6 +710,11 @@ export class EngineImpl implements Engine {
   private async executeAndJumpTaskInner(taskId: string, operator: string, args: Record<string, any> = {}, targetTaskName?: string): Promise<ProcessInstance> {
     // 带直返上下文的进行中申请待办只接受重新提交(5)：命名跳转/退回上一步都在改状态前拒绝
     const pre = await this.repo.findTaskById(taskId)
+    // issues/253 推进闸：四入口同闸（照 snaker，别只堵 execute 一路）——协办行跳转/退回
+    // 同样不驱动流程，且必须排在血缘/目标守卫之前，免得协办行被守卫的文案误拦。
+    if (pre && pre.taskState === TaskState.Doing && isAidantRow(pre)) {
+      return await this.completeAidantWithoutDrive(taskId, operator, args)
+    }
     if (pre && pre.taskState === TaskState.Doing && reapplyOf(pre.variables)) {
       throw new Error("带重提直返标记的申请待办不允许跳转，只接受重新提交(submitType=5)")
     }
@@ -692,6 +727,8 @@ export class EngineImpl implements Engine {
       await this.checkJumpTargetExists(pre, targetTaskName)
     }
     const { task, inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
+    // issues/253：跳转/退回离开本节点 ⇒ 未办结协办行随废弃腿清场（账本记废弃）
+    await this.abandonAidantOnNode(inst, task.taskName, operator)
     if (!targetTaskName) {
       // issues/121 P2：ROLLBACK 走血缘版——复活 task.parentTaskId 指的那条历史行，
       // 参与者＝该行办结人（首任务节点行取该行 u_userId）。无血缘/守卫不过显式报错，
@@ -729,6 +766,10 @@ export class EngineImpl implements Engine {
     args = stripReserved(args)
     // 校验放在任何状态变更之前：带直返上下文的申请待办不得再次退回
     const pre = await this.repo.findTaskById(taskId)
+    // issues/253 推进闸：协办行退回发起人同样不驱动流程
+    if (pre && pre.taskState === TaskState.Doing && isAidantRow(pre)) {
+      return await this.completeAidantWithoutDrive(taskId, operator, args)
+    }
     if (pre && pre.taskState === TaskState.Doing && reapplyOf(pre.variables)) {
       throw new Error("带重提直返标记的申请待办不允许再次退回，只接受重新提交(submitType=5)")
     }
@@ -743,6 +784,8 @@ export class EngineImpl implements Engine {
     }
     const { task, inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
     // 退回发起人：本节点未完成的加签任务一并废弃，不留孤儿待办（规范 04 · 后加签／语义边界表）
+    // issues/253：退回发起人离开本节点 ⇒ 未办结协办行随废弃腿清场（账本记废弃）
+    await this.abandonAidantOnNode(inst, task.taskName, operator)
     await this.abandonAddSignDoing(flow, inst, task.taskName, new Date())
     if (direct) {
       if (sourceNode!.type !== TypeTask) throw new Error(`节点[${sourceNode!.id}]不是普通审批任务，不支持重提直返`)
@@ -865,6 +908,155 @@ export class EngineImpl implements Engine {
     return nt
   }
 
+  // ─── 动态协办（issues/253）─────────────────────────────────────────────────
+
+  /**
+   * 动态协办（issues/253，规范 04 · 动态协办）：主办把"这活"交给别人干——按人派生
+   * `task_type=1` 协办子行，**主办行原样保留 DOING**，节点推进仍由主办行办结触发。
+   *
+   * 判据全部排在任何状态变更之前（报错即零写入——与后加签/征询/撤回同一规矩）：
+   * 任务存在 → 禁递归（协办行不能再派生）→ 主办行 DOING → actorIds 非空 → 名册鉴权
+   * （auto/admin 例外）→ 逐人去重（该人已有本主办行下未办结协办行）。
+   * 落库顺序：协办行既有建单腿（委托并入 → saveTask → 码 3）→ 主办行盖 wait 开关＋账本 updateTask。
+   * 建单形状照征询成员行腿（`createCollectMemberRows`），另落 task_type=1／performType=NORMAL。
+   */
+  async aidantTask(taskId: string, actorIds: string[], reason: string,
+                   waitCompletion: boolean, operator: string): Promise<ProcessTask[]> {
+    const created: ProcessTask[] = []
+    const pre = await this.repo.findTaskById(taskId)
+    // 同实例串行化（与 execute/recall 同口径）：「判协办行 DOING → 建协办行」在同一临界区
+    await withInstanceLock(this, pre?.processInstanceId, () =>
+      this.createdScope.run(created, () => this.inTx(() =>
+        this.aidantTaskInner(taskId, actorIds, reason, waitCompletion, operator))))
+    return created
+  }
+
+  private async aidantTaskInner(taskId: string, actorIds: string[], reason: string,
+                                 waitCompletion: boolean, operator: string): Promise<ProcessTask[]> {
+    let host = await this.repo.findTaskById(taskId)
+    if (!host) throw new Error(MSG_AIDANT_TASK_NOT_FOUND)
+    // 禁递归：协办行携带派生参数 ⇒ 报错（规范 04 派生规则 4）
+    if (isAidantRow(host)) throw new Error(MSG_AIDANT_NO_RECURSION)
+    if (!host.isDoing()) throw new Error(MSG_AIDANT_NOT_DOING)
+    const actors = normalizeActors(actorIds)
+    if (actors.length === 0) throw new Error(MSG_AIDANT_NO_ACTORS)
+    // 以参与者表为判据（聚合副本可能滞后于加签/转办的增量写入，与 transfer 同源）
+    const roster = await this.repo.findTaskActors(taskId)
+    if (!isPrivilegedOperator(operator) && !roster.includes(operator)) {
+      throw new Error(MSG_AIDANT_NO_PERMISSION)
+    }
+    const inst = await this.repo.findInstanceById(host.processInstanceId)
+    if (!inst) throw new Error('流程实例不存在')
+    // issues/249 同一课：账本必须盖在聚合内的同一对象上——findTaskById 在 SQL 仓是独立副本，
+    // 后续 updateInstance 的级联会拿聚合里没账本的旧副本抹掉它。这里重指到聚合内那份。
+    const inAgg = (inst.tasks ?? []).find(t => t.id === taskId)
+    if (inAgg) host = inAgg
+    const def = await this.repo.findDefineById(inst.defineId)
+    if (!def) throw new Error('流程定义不存在')
+    // loadFlowModel 内含解析期硬校验（节点级 taskType=1 禁配等），与 java ModelParser 同位
+    const flow = loadFlowModel(def.content)
+    const node = findNode(flow, host.taskName)
+    if (!node || node.type !== TypeTask) throw new Error(MSG_AIDANT_NOT_DOING)
+    // 去重：该人已有本主办行下**未办结**协办行 ⇒ 报错（规范 04 派生规则 5）
+    const existing = aidantRows(inst.tasks ?? [], host)
+    for (const actor of actors) {
+      for (const t of existing) {
+        if (t.isDoing() && (t.actorIds ?? []).includes(actor)) throw new Error(MSG_AIDANT_DUPLICATE)
+      }
+    }
+    // ── 判据全过，以下才允许写 ──
+    const now = new Date()
+    const round = aidantLastRound(host) + 1
+    const isFirst = this.isFirstTaskNode(flow, node)
+    const form = node.properties?.form ?? ''
+    const agents = await this.surrogateAgents(actors, await this.surrogateProcessName(flow, inst))
+    const created: ProcessTask[] = []
+    for (const actor of actors) {
+      const nt = inst.createTask(this.nextId(), node.id, node.text?.value ?? '', actor, operator,
+        form, now, host.id, isFirst)
+      nt.taskType = TaskType.Secondary
+      nt.performType = PerformType.Normal
+      const eff = mergeAgents([actor], agents)
+      if (eff.length > 1) nt.actorIds = eff
+      // 分支归属与每一次普通建单同一条腿（照征询成员行）：并行范围内的协办行继承父任务归属
+      nt.variables[VAR_BRANCH_CTX] = buildScopes(flow, node.id, host.variables, host.id, nt.id)
+      if (reason !== '') nt.variables[KeyAidantReason] = reason
+      applyNodeExpireTime(nt, node.properties?.expireTime, inst.variables, now)
+      await this.repo.saveTask(nt)
+      this.createdScope.getStore()?.push(nt)
+      await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id,
+        taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
+      created.push(nt)
+    }
+    // 等待闸开关＋账本落主办行（主办不办结，变量合并序保证账本活到办结后）
+    host.variables[KeyAidantWait] = !!waitCompletion
+    appendAidantHistory(host, operator, actors, round, reason ?? '', now)
+    // ⚠️ 严禁覆写任务 actor_id/operator 列（转办那条 ⚠️ 同尺）：进行中任务该列恒无值是家族
+    // 不变量，派生协办不改主办行的办理人归属，审计由 update_user＋账本 operator 承载。
+    host.updateUser = operator
+    host.updateTime = now
+    await this.repo.updateTask(host)
+    syncTaskToAggregate(inst, host)
+    return created
+  }
+
+  /**
+   * 协办行办结的**推进闸**（issues/253，规范 04「推进闸与等待闸」；参照 snaker
+   * `SnakerEngineImpl.execute` 的「协办任务完成不产生执行对象」）：只完成任务行
+   * （`prepareExecuteTask` 内含 completeTask／updateTask／fire 码 5 或 6），
+   * **不跑节点执行、不跑输出变迁**，本次动作产出列表为空（无 saveTask ⇒ ALS sink 空）。
+   *
+   * 四入口同闸：executeProcessTask／executeAndJumpTask／executeAndJumpToEnd／
+   * executeAndJumpToFirstTaskNode——协办行任何 submitType 都不得驱动流程。
+   */
+  private async completeAidantWithoutDrive(taskId: string, operator: string,
+                                            args: Record<string, any>): Promise<ProcessInstance> {
+    const { inst } = await this.prepareExecuteTask(taskId, operator, args)
+    return inst
+  }
+
+  /**
+   * 离开节点时清场未办结协办行（规范 04：waitCompletion=false 时主办可随时推进，未办结协办行
+   * 随废弃腿清场、账本记废弃，不留孤儿待办）。
+   *
+   * 只对协办行（task_type=1）动手，且**不要求节点开任何开关**——协办无节点开关，普通节点上的
+   * 协办行同样要清（这是与 `abandonAddSignDoing` 的关键差别，后者有双开关守卫）。按 parent 分组，
+   * 废弃事实追加到各自主办行的账本上。幂等：已废弃(99)/已办结(20) 的行不再命中，重复调用不重复
+   * 记账。返回实际废弃的行数。
+   */
+  private async abandonAidantOnNode(inst: ProcessInstance, nodeName: string, operator: string): Promise<number> {
+    if (!inst || !nodeName) return 0
+    // parent → 该主办行下待清场的协办行（Map 保插入序＝行序，照 java LinkedHashMap）
+    const byHost = new Map<string, ProcessTask[]>()
+    for (const t of inst.tasks ?? []) {
+      if (t.taskName === nodeName && t.isDoing() && isAidantRow(t)) {
+        const key = t.parentTaskId ?? '0'
+        const bucket = byHost.get(key)
+        if (bucket) bucket.push(t)
+        else byHost.set(key, [t])
+      }
+    }
+    const now = new Date()
+    let abandoned = 0
+    for (const [parentId, rows] of byHost) {
+      const actors: (string | null)[] = []
+      for (const t of rows) {
+        t.abandon(now, operator) // java abandon(operator) 同尺：update_user 回写真实清场人
+        await this.repo.updateTask(t)
+        syncTaskToAggregate(inst, t)
+        actors.push(t.actorIds && t.actorIds.length > 0 ? t.actorIds[0] : null)
+        abandoned++
+      }
+      const host = (inst.tasks ?? []).find(t => t.id === parentId)
+      if (host) {
+        appendAbandonHistory(host, operator, actors, aidantLastRound(host), now)
+        await this.repo.updateTask(host)
+        syncTaskToAggregate(inst, host)
+      }
+    }
+    return abandoned
+  }
+
   // ─── Execute 公共序言（对齐 Java prepareExecution）──────────────────────────
 
   // 执行公共序言（对齐 Java prepareExecution）：权限校验 → f_ 字段权限过滤 →
@@ -886,6 +1078,10 @@ export class EngineImpl implements Engine {
     // 合并两面立法排除（不传播）；撤回校验仍以现读定义为权威，快照仅供前端预判；
     // 出口只投已办行。
     stampAllowRecall(args, findNode(flow, task.taskName))
+    // issues/253 等待闸：waitCompletion=true 的主办行办结前判"不存在 DOING 协办行"，
+    // 未齐 ⇒ 逐字文案报错、零写入。同样必须排在 completeTask 之前（内存仓储无回滚）。
+    // 协办行自身不受本闸约束（它办结本来就不驱动流程）；缺省 false 原样放行。
+    gateWait(inst.tasks ?? [], task)
     // issues/97：捕获原始实例变量（start 注入的发起人 u_*）——操作人 u_* 只进执行上下文
     // 与任务行，不得整体写回实例（对齐 Java completeTask=putAll(args)，args 不含 u_*）。
     const baseVars = inst.variables

@@ -30,6 +30,8 @@
 import { isFirstTaskName, isCountersign } from './engine.js'
 import { parseAllow, allowAddSignOf, historyOf, KeyAddSignHistory, formatAddSignTime } from './addsign.js'
 import { type FlowModel, type FlowNode, type ProcessTask, TaskState, TypeTask } from './model.js'
+// issues/253：协办行排除判据（两族子行靠 task_type 分辨；函数体内取用，求值期不碰）
+import { isAidantRow } from './aidant.js'
 
 /** 节点属性键：动态会签（征询模式）开关（`properties` 平铺层，缺省 false） */
 export const PROP_DYNAMIC_COUNTERSIGN = 'dynamicCountersign'
@@ -108,12 +110,14 @@ export function checkCollectFlowConfig(flow: FlowModel): void {
 /**
  * 成员行＝parent 指向主办行**且同节点同名**的行（成员不能再拉人 ⇒ 无更深层级）。
  * 同名过滤不可省，理由见文件头「成员行识别」段。
+ * issues/253：协办行（task_type=1）也满足 parent＋同名，但它属另一族——征询收齐闸只数
+ * 征询成员行（task_type=0），两闸各数各的（规范 04「与征询允许同节点并存」）。
  */
 export function memberRows(tasks: ProcessTask[], host: ProcessTask | null | undefined): ProcessTask[] {
   const out: ProcessTask[] = []
   if (!host || !host.id) return out
   for (const t of tasks ?? []) {
-    if (t.parentTaskId === host.id && t.taskName === host.taskName) out.push(t)
+    if (t.parentTaskId === host.id && t.taskName === host.taskName && !isAidantRow(t)) out.push(t)
   }
   return out
 }
@@ -121,9 +125,11 @@ export function memberRows(tasks: ProcessTask[], host: ProcessTask | null | unde
 /**
  * 成员行判定：parent 指向**同节点同名**行（成员行禁带拉人参数的判据）。
  * 无 parent（空／'0'）的行一律 false——普通建单那条不是成员。
+ * issues/253：协办行（task_type=1）不是征询成员行——两族靠 task_type 分辨。
  */
 export function isMemberRow(tasks: ProcessTask[], row: ProcessTask | null | undefined): boolean {
   if (!row || !row.parentTaskId || row.parentTaskId === '0') return false
+  if (isAidantRow(row)) return false
   for (const t of tasks ?? []) {
     if (t.id === row.parentTaskId && t.taskName === row.taskName) return true
   }

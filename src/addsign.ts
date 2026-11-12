@@ -22,6 +22,8 @@ import { type FlowModel, type FlowNode, type ProcessInstance, type ProcessTask, 
 // ESM 环里没有任何"求值期解引用"，模块实例化顺序怎么排都不撞 TDZ。
 import { checkRecallFlowConfig } from './recall.js'
 import { checkCollectFlowConfig, dynamicCountersignOf } from './collect.js'
+// issues/253：协办行排除判据（与 collect.ts 同款跨模块引用——函数体内取用，求值期不碰）
+import { isAidantRow } from './aidant.js'
 
 /** 节点属性键：后加签开关（`properties` 平铺层，缺省 false） */
 export const PROP_ALLOW_ADD_SIGN = 'allowAddSign'
@@ -223,10 +225,13 @@ export function validateSubmission(flow: FlowModel, task: ProcessTask, args: Rec
 
 // ─── 推进闸与废弃 ──────────────────────────────────────────────────────────────
 
-/** 本节点是否还有未完成任务（刚办结那条此刻已是 DONE，不计入）。 */
+/** 本节点是否还有未完成任务（刚办结那条此刻已是 DONE，不计入）。
+ *  issues/253：协办行（task_type=1）不算"兄弟待办"——它不驱动流程、不是接力链的一环，
+ *  算进来会让 waitCompletion=false 的主办在加签/征询节点上被协办行挡住推进（规范 04
+ *  「缺省 false 主办可随时推进」）。协办行的等待由 `aidant.gateWait` 单独裁决。 */
 export function hasDoingOnNode(inst: ProcessInstance | null | undefined, nodeName: string): boolean {
   if (!inst || !nodeName) return false
-  return (inst.tasks ?? []).some(t => t.taskName === nodeName && t.isDoing())
+  return (inst.tasks ?? []).some(t => t.taskName === nodeName && t.isDoing() && !isAidantRow(t))
 }
 
 /**

@@ -41,6 +41,9 @@ export const ACTION_PERMISSION_OR_RULES: Readonly<Record<string, readonly string
   // 按引擎判据本来就必然是该行参与者（＝有办理权的人），拆独立码实际给不出去。
   'processTask/recall': Object.freeze(['wf:processTask:execute']),
   'processTask/revokeDynamicCountersign': Object.freeze(['wf:processTask:execute']),
+  // issues/253 动态协办：照 246/247 B 案惯例复用"办理"这枚码，不建按钮种子行——
+  // 派生协办的主体按引擎判据本来就必然是主办行名册内的人（＝有办理权的人）。
+  'processTask/aidant': Object.freeze(['wf:processTask:execute']),
 })
 
 /**

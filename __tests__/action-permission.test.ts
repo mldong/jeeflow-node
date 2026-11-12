@@ -76,9 +76,10 @@ describe('可选覆盖位（java ServiceContext.find 同语义）', () => {
 })
 
 describe('两张表形状与元数据（跨栈契约锚）', () => {
-  it('⑥ OR 表 7 条／放行清单 11 条（钉死数字：加一条要八栈同批改）', () => {
-    assert.equal(Object.keys(ACTION_PERMISSION_OR_RULES).length, 7,
-      `OR 规则条数应为 7（对齐 java DefaultActionPermissionProvider），现读 ${Object.keys(ACTION_PERMISSION_OR_RULES).length}`)
+  it('⑥ OR 表 8 条／放行清单 11 条（钉死数字：加一条要八栈同批改）', () => {
+    // issues/253 动态协办 processTask/aidant 复用 execute 码进 OR 表 ⇒ 7→8（本轮同批 +1）
+    assert.equal(Object.keys(ACTION_PERMISSION_OR_RULES).length, 8,
+      `OR 规则条数应为 8（对齐 java DefaultActionPermissionProvider），现读 ${Object.keys(ACTION_PERMISSION_OR_RULES).length}`)
     assert.equal(ACTION_PERMISSION_NO_PERM_ACTIONS.size, 11,
       `放行清单条数应为 11（含统计三条），现读 ${ACTION_PERMISSION_NO_PERM_ACTIONS.size}`)
   })
