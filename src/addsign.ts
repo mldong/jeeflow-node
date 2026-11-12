@@ -111,6 +111,17 @@ export function maxRoundsOf(node: FlowNode | undefined): number {
 }
 
 /**
+ * 节点级 taskType 协办档判定（规范 02 §4.4，issues/252）：本栈建单恒落 taskType=0、
+ * 没有 java 那枚 taskType codeOf 容错表，判定照 isCountersign 同尺（String＋trim＋toUpperCase，
+ * 大小写不敏感）：1／"1"／"协办"／"SECONDARY" ⇒ 协办；其余值维持既有静默回落主办
+ * （issues/245 口径，不扩成 fail-fast）。
+ */
+export function isSecondaryTaskType(v: unknown): boolean {
+  const s = String(v ?? '').trim().toUpperCase()
+  return s === '1' || s === 'SECONDARY' || s === '协办'
+}
+
+/**
  * 解析期硬校验（规范 02 §4.3／§4.4）——本栈没有 java 那一层 `ModelParser`（`JSON.parse(content)`
  * 直接当 FlowModel 用），故落点＝引擎每次读定义的解析口（`engine.ts` 的 `loadFlowModel`）＋
  * 门面的三条发布腿。配了就直接报错，不做运行时降级：静默跑下去会让配置者以为开关生效，
@@ -120,12 +131,19 @@ export function maxRoundsOf(node: FlowNode | undefined): number {
  * （90469a2／ffe2749）。后两段的本体在 `recall.ts`／`collect.ts`（各自的开关与禁配各自守），
  * 本函数是三段共用的那一个入口——与 java 一样"读一次定义只校一次"，不留第二个调用面。</p>
  *
- * <p>本段三条：① 两键非法值；② 会签节点配 `allowAddSign`；③ 首任务节点配 `allowAddSign`。</p>
+ * <p>本段四条：⓪ 节点级 `taskType=1`（协办）禁配（issues/252，先于开关解析——java 同判据
+ * 在 TaskParser 读 taskType 处）；① 两键非法值；② 会签节点配 `allowAddSign`；③ 首任务节点配
+ * `allowAddSign`。</p>
  */
 export function checkFlowConfig(flow: FlowModel): void {
   const tasks = (flow?.nodes ?? []).filter(n => n.type === TypeTask)
   // ① 键的合法性：每个任务节点都判（与 java TaskParser 逐节点解析同档），不是只判开了开关的
   for (const n of tasks) {
+    // 节点级协办禁配（规范 02 §4.4，issues/252）：协办档只由运行期 processTask/aidant 派生
+    // （issues/253），snaker 原义下协办节点办结不驱动且跳转同闸，节点级配了就是流程悬挂陷阱。
+    if (isSecondaryTaskType(n.properties?.taskType)) {
+      throw new Error(`节点[${n.id}]不允许配置协办任务类型（taskType=1）`)
+    }
     parseAllow(n.properties?.[PROP_ALLOW_ADD_SIGN], n.id)
     parseMaxRounds(n.properties?.[PROP_ADD_SIGN_MAX_ROUNDS], n.id)
   }
