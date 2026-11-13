@@ -25,7 +25,7 @@ export interface ActionPermissionProvider {
 }
 
 /**
- * OR 规则表（对齐 java DefaultActionPermissionProvider.OR_RULES，7 条——
+ * OR 规则表（对齐 java DefaultActionPermissionProvider.OR_RULES，8 条——
  * boot3 `@SaCheckPermission(value={...}, mode=OR)` 语义的 action，任选其一即有权）。
  * 条目数在测试里钉死：加一条规则要八栈同批改。
  */
