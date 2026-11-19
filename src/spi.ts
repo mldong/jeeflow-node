@@ -210,6 +210,10 @@ export interface TaskStatsRow {
 }
 
 export interface ProcessRepository {
+  /** 实例级事务排他（spec 04）；未实现的仓储退化为引擎进程内互斥 */
+  lockInstance?(instanceId: string): Promise<void>
+  /** 实例级事务排他（spec 04）；未实现的仓储退化为引擎进程内互斥 */
+  lockInstance?(instanceId: string): Promise<void>
   /** 事务载体（audit8 145-2，spec/12 §12.2）——JDBC 仓储天然实现（AsyncLocalStorage）；
    *  内存仓没有此方法 ⇒ 引擎 inTx 显式降级裸跑（§12.1 原则 4）。 */
   withTx?<T>(fn: () => Promise<T>): Promise<T>
@@ -452,4 +456,24 @@ export interface ProcessExtRepository {
   // 该作用域无记录才兜底 processName 为空的"全流程委托"；最新一条不生效 ⇒ null，
   // 同层内不回落更旧那条，但精确作用域判否后仍要看全流程作用域（条款 1.4 后半句）。见 src/surrogate-rule.ts。
   getSurrogate(operator: string, processName: string, at?: Date): Promise<ProcessSurrogate | null>
+}
+
+
+/** 任务时限动作凭证（spec 04 · 任务时限动作）：dueAt 用 UTC 毫秒。 */
+export interface TimeAction {
+  type: 'REMIND' | 'AUTO_COMPLETE' | 'CALLBACK'
+  dueAt: number
+  instanceId: string
+  taskId: string
+  nodeKey: string
+  occurrenceNo: number
+  idempotencyKey: string
+}
+
+/** 时限动作凭证仓储侧实现（集成层按框架执行队列实现，引擎在业务事务内回调）。
+ * 取消只清 REMIND/AUTO_COMPLETE；CALLBACK 表达既成事实、不随失效取消。 */
+export interface TimeActionSink {
+  insertTimeAction(action: TimeAction): Promise<void>
+  cancelTaskTimeActions(taskId: string): Promise<void>
+  cancelInstanceTimeActions(instanceId: string): Promise<void>
 }

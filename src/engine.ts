@@ -38,6 +38,7 @@ import {
   MSG_NOT_DOING as MSG_AIDANT_NOT_DOING, MSG_TASK_NOT_FOUND as MSG_AIDANT_TASK_NOT_FOUND,
 } from './aidant.js'
 import type { ProcessRepository, ProcessExtRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
+import type { TimeAction, TimeActionSink } from './spi.js'
 // issues/141 G2：cc 写侧判重的 java `default` 方法在 TS 里的对应物（第三方仓储未实现判重 SPI 时兜旧行为）
 // issues/141 G10：归属值单值/集合归一的**那一份**判据（漏斗层与写侧层共用；issues/142 B 批
 // 按 spec 06 §2.11 从"只挂 cc 一支"升为 cc 腿与任务腿共用同一枚，见 spi.normalizeActors）
@@ -152,6 +153,10 @@ export interface EngineOptions {
   surrogateRepository?: SurrogateLookup | null
   /** 委托自动生效开关，**默认 true（引擎内置开启）**；显式传 false → 回到"仅台账"行为 */
   surrogateEnabled?: boolean
+  /** 时限动作凭证（spec 04）；不传 = 全部时限动作静默跳过 */
+  timeActionSink?: TimeActionSink
+  /** 引擎时钟（spec 04 · 时间基准）；不传 = this.now() */
+  clock?: () => Date
 }
 
 /**
@@ -192,6 +197,10 @@ export class EngineImpl implements Engine {
   private registry?: HandlerRegistry
   // issues/116：委托代理自动生效——内置能力，注入查询源后默认开启
   private surrogateRepo?: SurrogateLookup | null
+  /** 时限动作凭证（spec 04）：不传＝全部时限动作静默跳过 */
+  private timeActionSink?: TimeActionSink
+  /** 引擎时钟（spec 04）：不传＝系统钟 */
+  private clock: () => Date = () => new Date()
   private surrogateOn = true
 
   constructor(
@@ -203,6 +212,8 @@ export class EngineImpl implements Engine {
   ) {
     if (opts?.surrogateRepository !== undefined) this.surrogateRepo = opts.surrogateRepository
     if (opts?.surrogateEnabled !== undefined) this.surrogateOn = opts.surrogateEnabled
+    if (opts?.timeActionSink !== undefined) this.timeActionSink = opts.timeActionSink
+    if (opts?.clock !== undefined) this.clock = opts.clock
   }
 
   /**
@@ -456,7 +467,7 @@ export class EngineImpl implements Engine {
     await this.addUserInfo(operator, vars)
     this.addAutoGenTitle(def.displayName, vars)
 
-    const now = new Date()
+    const now = this.now()
     // 聚合根工厂创建实例
     const inst = ProcessInstance.create(this.nextId(), defineId, operator, vars, now)
     // issues/137 A · 裁定 A（批二 §3-4）· **实例级 expire_time 的唯一写点**：
@@ -517,7 +528,7 @@ export class EngineImpl implements Engine {
       await this.handleCcActors(inst.id, operator, args[KeyCcActors])
       return (await this.repo.findInstanceById(inst.id))!
     }
-    const now = new Date()
+    const now = this.now()
     const curNode = findNode(flow, task.taskName)
     if (curNode) {
       // 1.8.0：任务完成节点自身的后置拦截器（SYNC 同步演进——任务节点推进更新状态/字段）。
@@ -567,6 +578,7 @@ export class EngineImpl implements Engine {
             applyNodeExpireTime(nt, curNode.properties?.expireTime, inst.variables, now)
             await this.repo.saveTask(nt)
             this.createdScope.getStore()?.push(nt)
+            await this.scheduleTimeActions(nt, curNode, inst)
             // PROCESS_TASK_START：顺序会签推进新任务落库后 fire（对齐 Java CreateTaskHandler / Rust）
             await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: curNode.id, operator, actors: [...nt.actorIds] })
             return finishExecute()
@@ -685,10 +697,11 @@ export class EngineImpl implements Engine {
     // 拒绝结束：本节点未完成的加签任务一并废弃，不留孤儿待办（规范 04 · 后加签／语义边界表）
     // issues/253：离开节点先清场未办结协办行（废弃＋账本记废弃），再走后加签/征询的既有废弃腿
     await this.abandonAidantOnNode(inst, task.taskName, operator)
-    await this.abandonAddSignDoing(flow, inst, task.taskName, new Date())
+    await this.abandonAddSignDoing(flow, inst, task.taskName, this.now())
     // 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
-    inst.reject(new Date())
+    inst.reject(this.now())
     await this.repo.updateInstance(inst)
+    await this.cancelInstanceTimeActions(inst.id)
     // §11.3 code 2：拒绝也是"实例进入终态"（state=45 落库后 fire，靠载荷 state 与办结分家）；
     // "任务被退回"这一事实另由 prepareExecuteTask 的 TASK_REJECT(6) 承载（场景 31/32 两支并存）
     await this.notifyInstanceEnd(inst, operator)
@@ -786,7 +799,7 @@ export class EngineImpl implements Engine {
     // 退回发起人：本节点未完成的加签任务一并废弃，不留孤儿待办（规范 04 · 后加签／语义边界表）
     // issues/253：退回发起人离开本节点 ⇒ 未办结协办行随废弃腿清场（账本记废弃）
     await this.abandonAidantOnNode(inst, task.taskName, operator)
-    await this.abandonAddSignDoing(flow, inst, task.taskName, new Date())
+    await this.abandonAddSignDoing(flow, inst, task.taskName, this.now())
     if (direct) {
       if (sourceNode!.type !== TypeTask) throw new Error(`节点[${sourceNode!.id}]不是普通审批任务，不支持重提直返`)
       const pt = String(sourceNode!.properties?.performType ?? '0').trim().toUpperCase()
@@ -851,6 +864,9 @@ export class EngineImpl implements Engine {
   }
 
   private async recallTaskInner(taskId: string, operator: string): Promise<ProcessTask> {
+    // 实例级事务排他（spec 04 · 并发保护）：先锁再读
+    const preForLock = await this.repo.findTaskById(taskId)
+    await this.lockInstance(preForLock?.processInstanceId)
     // 判据 1：目标行存在且已办结（不存在／进行中／已废弃同档）
     const target = await this.repo.findTaskById(taskId)
     if (!target || !target.isFinished()) throw new Error(MSG_NOT_FINISHED)
@@ -870,7 +886,7 @@ export class EngineImpl implements Engine {
     // 内存与 SQL 两仓同形状）
     const doingDescendants = validateWindow(await this.repo.findHistoryTasks(inst.id), target)
     // ── 判据全过，以下才允许写 ──
-    const now = new Date()
+    const now = this.now()
     // 写 1：下游全部 DOING 行废弃（后加签/征询成员行、并行分支多支自然覆盖；updateUser 记真实撤回人，
     // 照 java `ProcessTask.abandon(operator)`／py `t.updateUser = operator` 同尺）
     for (const t of doingDescendants) {
@@ -890,6 +906,7 @@ export class EngineImpl implements Engine {
     if (eff.length > 1) nt.actorIds = eff
     await this.repo.saveTask(nt)
     this.createdScope.getStore()?.push(nt)
+    await this.scheduleTimeActions(nt, node, inst)
     // 码 3：复活行的待办另走既有建单腿（issues/246 参考实现 14674d7 补的那一腿——只 fire 10
     // 不 fire 3 ⇒ 集成方的待办角标/站内信拿不到这一手新待办）
     await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id,
@@ -934,6 +951,7 @@ export class EngineImpl implements Engine {
   private async aidantTaskInner(taskId: string, actorIds: string[], reason: string,
                                  waitCompletion: boolean, operator: string): Promise<ProcessTask[]> {
     let host = await this.repo.findTaskById(taskId)
+    await this.lockInstance(host?.processInstanceId)
     if (!host) throw new Error(MSG_AIDANT_TASK_NOT_FOUND)
     // 禁递归：协办行携带派生参数 ⇒ 报错（规范 04 派生规则 4）
     if (isAidantRow(host)) throw new Error(MSG_AIDANT_NO_RECURSION)
@@ -965,7 +983,7 @@ export class EngineImpl implements Engine {
       }
     }
     // ── 判据全过，以下才允许写 ──
-    const now = new Date()
+    const now = this.now()
     const round = aidantLastRound(host) + 1
     const isFirst = this.isFirstTaskNode(flow, node)
     const form = node.properties?.form ?? ''
@@ -984,6 +1002,7 @@ export class EngineImpl implements Engine {
       applyNodeExpireTime(nt, node.properties?.expireTime, inst.variables, now)
       await this.repo.saveTask(nt)
       this.createdScope.getStore()?.push(nt)
+      await this.scheduleTimeActions(nt, node, inst, false)
       await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id,
         taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
       created.push(nt)
@@ -1036,7 +1055,7 @@ export class EngineImpl implements Engine {
         else byHost.set(key, [t])
       }
     }
-    const now = new Date()
+    const now = this.now()
     let abandoned = 0
     for (const [parentId, rows] of byHost) {
       const actors: (string | null)[] = []
@@ -1064,6 +1083,9 @@ export class EngineImpl implements Engine {
   // 返回流程模型 + 合并后执行变量。Java jump 路径不废弃其余 DOING 任务
   // （会签兄弟任务不受影响），此处保持一致。
   private async prepareExecuteTask(taskId: string, operator: string, args: Record<string, any>) {
+    // 实例级事务排他（spec 04 · 并发保护）：先锁再读，堵"读后锁前"的二次推进窗口
+    const pre = await this.repo.findTaskById(taskId)
+    await this.lockInstance(pre?.processInstanceId)
     const { task, inst } = await this.loadAndCheck(taskId, operator)
     // issues/26：办理提交的 f_ 字段按任务节点字段权限过滤（只读/隐藏不入变量）
     const def = await this.repo.findDefineById(inst.defineId)
@@ -1088,13 +1110,15 @@ export class EngineImpl implements Engine {
     const vars = { ...baseVars, ...task.variables, ...args }
     await this.addUserInfo(operator, vars)
 
-    const now = new Date()
+    const now = this.now()
     // §11.2 原则 2「码粗、载荷细」＋场景 30/31 互斥：本次动作是"办掉"还是"退回"由 submitType 定，
     // 同一动作只发其中一支（旧形状无论 submitType 一律 fire TaskComplete 即本案病灶）
     const submitType = normalizeSubmitType(vars[KeySubmitType])
     // 聚合根：完成任务（子实体状态转换 + 实例变量合并）
     inst.completeTask(task, operator, vars, now)
     await this.repo.updateTask(task)
+    // 时限动作联动（spec 04 · 写路径）：任务离开 DOING ⇒ 取消该任务 pending 提醒/自动行
+    await this.cancelTaskTimeActions(task.id)
     // v1.0.1：updateInstance 级联持久化依赖聚合内任务副本为最新状态，
     // completeTask 改的是外部任务对象，需同步回聚合根
     syncTaskToAggregate(inst, task)
@@ -1104,6 +1128,10 @@ export class EngineImpl implements Engine {
     await this.repo.updateInstance(inst)
     // §11.2 原则 3：任务行与实例**都落库之后**才 fire（旧形状排在 updateInstance 之前，
     // 监听器反查实例读到旧状态——与 issues/121/126 两轮"回写序"同族）
+    // 完成回调（spec 04 · CALLBACK）：只对应 TASK_COMPLETE 事实（退回族不触发）
+    if (!isRejectSubmitType(submitType)) {
+      await this.insertCallbackAction(task, findNode(flow, task.taskName))
+    }
     await this.fireEvent({
       type: isRejectSubmitType(submitType) ? EventType.TaskReject : EventType.TaskComplete,
       instanceId: inst.id, taskId: task.id, nodeId: task.taskName, operator, submitType,
@@ -1205,7 +1233,7 @@ export class EngineImpl implements Engine {
                                   task: ProcessTask, operator: string): Promise<void> {
     const { his, prev, actor, isFirst } = await this.checkRejectable(flow, inst, task)
     // 取时基准只取一次：本行 createTime 与 expire_time 共用同一个 Date（写点内不另起时钟）
-    const now = new Date()
+    const now = this.now()
     const nt = inst.createTask(this.nextId(), prev.id, prev.text.value, actor,
       his.createUser ?? '', prev.properties?.form ?? '', now,
       his.parentTaskId ?? '0', isFirst, his.performType)
@@ -1220,6 +1248,7 @@ export class EngineImpl implements Engine {
     if (eff.length > 1) nt.actorIds = eff
     await this.repo.saveTask(nt)
     this.createdScope.getStore()?.push(nt)
+    await this.scheduleTimeActions(nt, prev, inst)
     await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id,
       taskId: nt.id, nodeId: prev.id, operator, actors: [...nt.actorIds] })
   }
@@ -1262,6 +1291,7 @@ export class EngineImpl implements Engine {
       applyNodeExpireTime(nt, node.properties?.expireTime, inst.variables, now)   // 加签续建
       await this.repo.saveTask(nt)
       this.createdScope.getStore()?.push(nt)
+      await this.scheduleTimeActions(nt, node, inst)
       await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id,
         taskId: nt.id, nodeId, operator, actors: [...nt.actorIds] })
     }
@@ -1309,6 +1339,7 @@ export class EngineImpl implements Engine {
       applyNodeExpireTime(nt, node.properties?.expireTime, inst.variables, now)
       await this.repo.saveTask(nt)
       this.createdScope.getStore()?.push(nt)
+      await this.scheduleTimeActions(nt, node, inst)
       await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id,
         taskId: nt.id, nodeId, operator, actors: [...nt.actorIds] })
       created.push(nt)
@@ -1338,11 +1369,74 @@ export class EngineImpl implements Engine {
    * 未配置查询源、显式关闭、无参与人 → 空映射（= 原样参与者，不打断建单）；
    * 单条查询异常只记录不传播（委托是增强能力，建单主流程不得被拖崩）。
    */
+  // ─── 任务时限动作（spec 04 · 零 schema）────────────────────────────────
+
+  private now(): Date {
+    return this.clock()
+  }
+
+  private async lockInstance(instanceId?: string | null): Promise<void> {
+    if (!instanceId) return
+    const fn = (this.repo as any).lockInstance
+    if (typeof fn === 'function') await fn.call(this.repo, instanceId)
+  }
+
+  private async cancelTaskTimeActions(taskId?: string | null): Promise<void> {
+    if (this.timeActionSink && taskId) await this.timeActionSink.cancelTaskTimeActions(taskId)
+  }
+
+  private async cancelInstanceTimeActions(instanceId?: string | null): Promise<void> {
+    if (this.timeActionSink && instanceId) await this.timeActionSink.cancelInstanceTimeActions(instanceId)
+  }
+
+  /** 建单侧动作行：autoExecute=Y→AUTO_COMPLETE；有效 reminderTime→首条 REMIND。 */
+  private async scheduleTimeActions(nt: ProcessTask, node: FlowNode | null | undefined,
+                                    inst: ProcessInstance, allow = true): Promise<void> {
+    if (!this.timeActionSink || !allow || !nt || !node) return
+    if (nt.taskState !== TaskState.Doing) return
+    if (String(node.properties?.autoExecute ?? '') === 'Y') {
+      if (!nt.expireTime) {
+        console.warn(`[jeeflow] 时限配置诊断 task=${nt.id} node=${node.id} autoExecute=Y 但无有效到期时间`)
+      } else {
+        await this.timeActionSink.insertTimeAction({
+          type: 'AUTO_COMPLETE', dueAt: nt.expireTime.getTime(),
+          instanceId: String(nt.processInstanceId), taskId: String(nt.id), nodeKey: node.id,
+          occurrenceNo: 0, idempotencyKey: `wf:auto:${nt.id}:0`,
+        })
+      }
+    }
+    const raw = node.properties?.reminderTime
+    if (raw != null && String(raw).trim() !== '') {
+      const due = firstReminderTime(String(raw), inst.variables ?? {}, nt.createTime)
+      if (!due) {
+        console.warn(`[jeeflow] 时限配置诊断 task=${nt.id} node=${node.id} reminderTime=${raw} 解析不出`)
+      } else {
+        await this.timeActionSink.insertTimeAction({
+          type: 'REMIND', dueAt: due.getTime(),
+          instanceId: String(nt.processInstanceId), taskId: String(nt.id), nodeKey: node.id,
+          occurrenceNo: 1, idempotencyKey: `wf:remind:${nt.id}:1`,
+        })
+      }
+    }
+  }
+
+  /** 任务完成（state 落 20）插入 CALLBACK（dueAt=now）。 */
+  private async insertCallbackAction(task: ProcessTask, node: FlowNode | null | undefined): Promise<void> {
+    if (!this.timeActionSink || !node || !task?.id) return
+    const name = String(node.properties?.callback ?? '').trim()
+    if (!name) return
+    await this.timeActionSink.insertTimeAction({
+      type: 'CALLBACK', dueAt: this.now().getTime(),
+      instanceId: String(task.processInstanceId), taskId: String(task.id), nodeKey: node.id,
+      occurrenceNo: 0, idempotencyKey: `wf:callback:${task.id}:0`,
+    })
+  }
+
   private async surrogateAgents(actors: string[], processName: string): Promise<Map<string, string>> {
     const map = new Map<string, string>()
     const ext = this.surrogateRepo
     if (!ext || !this.surrogateOn || actors.length === 0) return map
-    const now = new Date()
+    const now = this.now()
     for (const actor of actors) {
       try {
         const hit = await ext.getSurrogate(actor, processName ?? '', now)
@@ -1404,13 +1498,14 @@ export class EngineImpl implements Engine {
         // 对齐 Java EndProcessHandler：submitType=REJECT → reject，否则 finish
         const submitType = inst.variables[KeySubmitType]
         if (submitType != null && Number(submitType) === SubmitType.Reject) {
-          inst.reject(new Date())
+          inst.reject(this.now())
         } else {
-          inst.finish(new Date())
+          inst.finish(this.now())
         }
         // issues/97：结束节点写回同样排除操作人 u_*（保留发起人 u_*，与 prepareExecuteTask 一致）
         inst.variables = mergeExecIntoInstance(inst.variables, vars)
         await this.repo.updateInstance(inst)
+        await this.cancelInstanceTimeActions(inst.id)
         // §11.3 code 2：办结(20)/拒绝(45) 共用 PROCESS_INSTANCE_END，state 落库后 fire（§11.6）
         await this.notifyInstanceEnd(inst, operator)
         return
@@ -1515,7 +1610,7 @@ export class EngineImpl implements Engine {
     // 随任务一起 saveTask 落 wf_process_task_actor（严禁"事后 addTaskActor 补写"）
     const agents = await this.surrogateAgents(actors, processName)
     const ct = node.properties?.countersignType as string | undefined
-    const now = new Date()
+    const now = this.now()
     const form = node.properties?.form ?? ''
     // issues/126 案 A：节点到期表达式（properties.expireTime）+ 实例变量 + 本函数取时基准 now
     // —— 三处写点（串行首位 / 并行全员 / 普通建单）共用 applyNodeExpireTime 这一把尺子
@@ -1534,6 +1629,7 @@ export class EngineImpl implements Engine {
             applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 并行会签全员
             await this.repo.saveTask(nt)
             this.createdScope.getStore()?.push(nt)
+            await this.scheduleTimeActions(nt, node, inst)
             // PROCESS_TASK_START：任务落库后逐个 fire（会签多任务逐个，对齐 Java CreateTaskHandler）
             await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
           }
@@ -1552,6 +1648,7 @@ export class EngineImpl implements Engine {
           applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 串行会签首位成员
           await this.repo.saveTask(nt)
           this.createdScope.getStore()?.push(nt)
+          await this.scheduleTimeActions(nt, node, inst)
           await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
           return
         }
@@ -1563,6 +1660,7 @@ export class EngineImpl implements Engine {
             applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 未配会签类型＝全员预创建，与并行同档
             await this.repo.saveTask(nt)
             this.createdScope.getStore()?.push(nt)
+            await this.scheduleTimeActions(nt, node, inst)
             await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
           }
           return
@@ -1579,6 +1677,7 @@ export class EngineImpl implements Engine {
     applyNodeExpireTime(nt, expireExpr, expireArgs, now)   // 普通建单
     await this.repo.saveTask(nt)
     this.createdScope.getStore()?.push(nt)
+    await this.scheduleTimeActions(nt, node, inst)
     await this.fireEvent({ type: EventType.ProcessTaskStart, instanceId: inst.id, taskId: nt.id, nodeId: node.id, operator, actors: [...nt.actorIds] })
   }
 
@@ -1638,7 +1737,7 @@ export class EngineImpl implements Engine {
       console.warn(`[jeeflow] custom 节点未配置 clazz（缺失或空串），跳过执行、只落历史行并继续流转: ` +
         `nodeId=${node.id}（这是流程定义属性问题，不是注册表未命中；判据见 spec 02 §6.2 第 2 条）`)
     }
-    const now = new Date()
+    const now = this.now()
     const ht = inst.createHistoryTask(this.nextId(), node.id, node.text?.value ?? '', operator, now,
       parentId, this.isFirstTaskNode(flow, node))
     await this.repo.saveTask(ht)
@@ -1728,7 +1827,7 @@ export class EngineImpl implements Engine {
   /** issue 29：自动生成标题；issues/232 R64 拍 A 钉秒 yyyy-MM-dd HH:mm:ss（标题专用格式化点，勿并 expire_time 腿） */
   private addAutoGenTitle(displayName: string, vars: Record<string, any>) {
     const realName = vars[KeyRealName] || ''
-    const now = new Date()
+    const now = this.now()
     const pad = (n: number) => n.toString().padStart(2, '0')
     const timeStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`
     vars[KeyAutoGenTitle] = `${realName}的${displayName}-${timeStr}`
@@ -1965,6 +2064,40 @@ function intPrefix(s: string): number | null {
  *
  * @param now 取时基准＝**本栈写 createTime 用的同一个 Date**（本栈无时钟槽，与 Java 直接用系统钟同档）
  */
+const HHMM_RE = /^(\d{2}):(\d{2})$/
+
+/**
+ * 首次提醒时刻（规范 02 §4.5）：变量 → 相对量（锚点＝任务创建时刻）→ 严格 HH:mm → 绝对。
+ * 任何一档都不得回落"当前时刻"或 expireTime。
+ */
+export function firstReminderTime(expr: string, args: Record<string, any> | undefined,
+                                  createTime: Date): Date | null {
+  const raw = expr ?? ''
+  if (raw.trim() === '') return null
+  if (args && Object.prototype.hasOwnProperty.call(args, raw)) {
+    const v = args[raw]
+    if (v instanceof Date) return v
+    if (typeof v === 'number') return new Date(v)
+    if (typeof v === 'string') {
+      const t = new Date(v.replace(' ', 'T'))
+      return isNaN(t.getTime()) ? null : t
+    }
+  }
+  const rel = processTime(raw, {}, createTime)
+  if (rel) return rel
+  const m = HHMM_RE.exec(raw)
+  if (m) {
+    const h = Number(m[1])
+    const mi = Number(m[2])
+    if (h <= 23 && mi <= 59) {
+      const t = new Date(createTime)
+      t.setHours(h, mi, 0, 0)
+      return t.getTime() >= createTime.getTime() ? t : new Date(t.getTime() + 86400000)
+    }
+  }
+  return null
+}
+
 export function processTime(expr: string, args: Record<string, any> | undefined, now: Date): Date | null {
   const a = args ?? {}
   // ① 变量档：优先于相对档（args 里真有个键叫 "2h" 时取变量值）

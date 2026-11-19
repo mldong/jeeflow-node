@@ -394,6 +394,18 @@ export class JdbcRepository implements ProcessRepository {
     }
   }
 
+  /** 实例级事务排他（spec 04 · 并发保护）：实例行 SELECT … FOR UPDATE，
+   * 锁随最外层 withTx 提交/回滚释放；行不存在不新造失败面。 */
+  async lockInstance(instanceId: string): Promise<void> {
+    if (!instanceId) return
+    const conn = await this.c()
+    try {
+      await conn.fetchOne(this.sql('SELECT id FROM wf_process_instance WHERE id = ? FOR UPDATE'), [instanceId])
+    } finally {
+      await this.done(conn)
+    }
+  }
+
   async saveTask(task: ProcessTask): Promise<void> {
     const conn = await this.c()
     try {
