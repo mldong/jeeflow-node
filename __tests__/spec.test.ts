@@ -6707,7 +6707,7 @@ describe('issues/142 记录类节点 custom 落 DONE 历史行并真落库 ＋ �
     assert.deepEqual(r.listHandlers('CustomHandler').map(m => m.name), [CLAZZ], 'CustomHandler 类型清单出得来（SPI 字典同一把尺子）')
     assert.equal(r.listHandlers('CustomHandler')[0].displayName, '外部系统通知', '元数据同族复用（displayName/order 走既有 HandlerMeta）')
     assert.deepEqual(r.listHandlerNames(), [CLAZZ], '名称清单含 custom —— 与 assignment/decision 同一家，没有第二个注册中心')
-    assert.equal(r.listHandlers('AssignmentHandler').length, 7, '内置 7 个 assignment 元数据不受影响（既有清单没被动）')
+    assert.equal(r.listHandlers('AssignmentHandler').length, 9, '内置 9 个 assignment 元数据不受影响（既有清单没被动）')
     assert.deepEqual(r.listHandlers('DecisionHandler'), [], 'decision 清单未被 custom 串台')
   })
 

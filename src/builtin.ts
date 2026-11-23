@@ -15,6 +15,11 @@ export const HANDLER_DEPT_MAIN_LEADER = ORG_HANDLERS_PREFIX + 'DeptMainLeaderAss
 export const HANDLER_APPLICANT_DEPT_LEADER = ORG_HANDLERS_PREFIX + 'ApplicantDeptLeaderAssignmentHandler'
 export const HANDLER_APPLICANT_DEPT_MAIN_LEADER = ORG_HANDLERS_PREFIX + 'ApplicantDeptMainLeaderAssignmentHandler'
 export const HANDLER_TASK_ROLE_ASSIGNEE = ORG_HANDLERS_PREFIX + 'TaskRoleAssigneeHandler'
+// 两个「表单指定用户」类是顶级类（不带 OrgUserAssignmentHandlers$ 前缀），注册名与其余语言逐字一致
+export const HANDLER_FORM_USER_DEPT_LEADER =
+  'com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler'
+export const HANDLER_FORM_USER_DEPT_MAIN_LEADER =
+  'com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler'
 
 // 表单字段编号后缀正则（task_01 → task）
 const NUMBER_SUFFIX_PATTERN = /^(.+?)_(\d+)$/
@@ -84,6 +89,14 @@ class OrgBase {
     const u = await this.userProv.getUser(userId)
     return u?.deptId ?? ''
   }
+
+  /** 表单字段 → 用户 id → 该用户部门 → 领导（main=true 取分管领导）。 */
+  protected async byFormUser(node: FlowNode, inst: ProcessInstance | null, main: boolean): Promise<string[]> {
+    if (!node || !inst) return []
+    const userId = firstFormUserId(findFormUserFieldValue(inst.variables, node.id))
+    if (userId === '') return []
+    return this.byDept(await this.deptIdOf(userId), main)
+  }
 }
 
 /** 当前用户（任务操作人）部门领导 */
@@ -126,6 +139,64 @@ export class TaskRoleAssigneeHandler implements IAssignmentHandler {
   }
 }
 
+// ─── 表单指定用户 → 该用户所属部门领导 ───────────────────────────────────────
+//
+// 场景（参照 mldong-fastapi-wf 提交 fe9233d）：HR 代员工提交、代理申请——表单里给出被代理人的
+// 用户 id，取**该员工**所属部门的经理／分管领导，与当前操作人无关。
+
+/** 表单指定用户所属部门的经理 */
+export class FormUserDeptLeaderAssignmentHandler extends OrgBase implements IAssignmentHandler {
+  async assign(node: FlowNode, inst: ProcessInstance | null, _operator: string): Promise<string[]> {
+    return this.byFormUser(node, inst, false)
+  }
+}
+
+/** 表单指定用户所属部门的分管领导 */
+export class FormUserDeptMainLeaderAssignmentHandler extends OrgBase implements IAssignmentHandler {
+  async assign(node: FlowNode, inst: ProcessInstance | null, _operator: string): Promise<string[]> {
+    return this.byFormUser(node, inst, true)
+  }
+}
+
+/**
+ * 两个「表单指定用户」handler 专用的四档并集查找（顺序即优先级）：
+ *   1. `f_<nodeKey>`  2. `<nodeKey>`  3. 含 `#` 时取右半：先裸名、再 `f_`  4. 匹配 `_NN` 时取 base：先 `f_`、再裸名
+ *
+ * 与 `FormFieldAssigneeHandler.findFieldValue` 的差别只在 3、4 两档各补了 `f_` 变体
+ * （参照实现没有 f_ 分支，jeeflow 家族变量存 f_ 必须有）。**现存 7 个 handler 仍走原查找。**
+ */
+export function findFormUserFieldValue(variables: Record<string, any> | null | undefined, nodeKey: string): any {
+  if (!variables || !nodeKey) return null
+  if ('f_' + nodeKey in variables) return variables['f_' + nodeKey]
+  if (nodeKey in variables) return variables[nodeKey]
+  const hash = nodeKey.lastIndexOf('#')
+  if (hash >= 0) {
+    const field = nodeKey.slice(hash + 1)
+    if (field in variables) return variables[field]
+    if ('f_' + field in variables) return variables['f_' + field]
+  }
+  const m = NUMBER_SUFFIX_PATTERN.exec(nodeKey)
+  if (m) {
+    if ('f_' + m[1] in variables) return variables['f_' + m[1]]
+    if (m[1] in variables) return variables[m[1]]
+  }
+  return null
+}
+
+/**
+ * 取**第一个**非空用户 id（逗号串／数组同样只取第一个，多值语义不在本轮承诺）。
+ * 判空只比空串 ⇒ `'0'` 是合法 id（不被 JS 真值判据吃掉）。
+ */
+export function firstFormUserId(value: any): string {
+  if (value === null || value === undefined) return ''
+  const items = Array.isArray(value) ? value.map((v) => String(v)) : String(value).split(',')
+  for (const item of items) {
+    const id = item.trim()
+    if (id !== '') return id
+  }
+  return ''
+}
+
 // ─── 注册 ──────────────────────────────────────────────────────────────────────
 
 /**
@@ -144,4 +215,6 @@ export function registerBuiltinAssignments(
   reg.registerAssignment(HANDLER_APPLICANT_DEPT_LEADER, new ApplicantDeptLeaderAssignmentHandler(userProv, orgProv))
   reg.registerAssignment(HANDLER_APPLICANT_DEPT_MAIN_LEADER, new ApplicantDeptMainLeaderAssignmentHandler(userProv, orgProv))
   reg.registerAssignment(HANDLER_TASK_ROLE_ASSIGNEE, new TaskRoleAssigneeHandler(orgProv))
+  reg.registerAssignment(HANDLER_FORM_USER_DEPT_LEADER, new FormUserDeptLeaderAssignmentHandler(userProv, orgProv))
+  reg.registerAssignment(HANDLER_FORM_USER_DEPT_MAIN_LEADER, new FormUserDeptMainLeaderAssignmentHandler(userProv, orgProv))
 }
