@@ -142,6 +142,21 @@ describe('回归：现存 handler 没被并集查找渗进去', () => {
     const h = new FormFieldAssigneeHandler() as any
     assert.deepEqual(await h.assign(node('manager#userId'), inst('hr', { f_userId: 'emp' }), 'hr'), [])
   })
+  it('老类第三档＝_NN 去后缀查裸名 base（issues/255 正／负）', async () => {
+    const h = new FormFieldAssigneeHandler() as any
+    const legacy = (id: string, variables: Record<string, any>) =>
+      h.assign(node(id), inst('hr', variables), 'hr')
+    assert.deepEqual(await legacy('task_01', { task: 'userA,userB' }), ['userA', 'userB'])
+    // 惰性量词的最早可切点：a_b_01 的 base 是 a_b，不是 a
+    assert.deepEqual(await legacy('a_b_01', { a: 'u_x', a_b: 'u_c' }), ['u_c'])
+    // 优先级：f_<id> → 裸名 → base 裸名
+    assert.deepEqual(await legacy('task_01', { f_task_01: 'u_1', task_01: 'u_2', task: 'u_3' }), ['u_1'])
+    assert.deepEqual(await legacy('task_01', { task_01: 'u_2', task: 'u_3' }), ['u_2'])
+    // 反向：尾巴非纯数字、base 为空、base 只有 f_ 形 ⇒ 三档全落空
+    assert.deepEqual(await legacy('task_01x', { task: 'u_3' }), [])
+    assert.deepEqual(await legacy('_01', { '': 'u_3' }), [])
+    assert.deepEqual(await legacy('task_02', { f_task: 'u_3' }), [])
+  })
 })
 
 describe('注册名／元数据', () => {
