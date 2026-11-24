@@ -1,8 +1,10 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import {
-  type FlowModel, type FlowNode,
+  type FlowModel, type FlowNode, type DefineRow,
   TypeStart, TypeEnd, TypeTask, TypeDecision, TypeFork, TypeJoin, TypeCustom,
-  KnownNodeTypes, TaskFormPrefix,
+  TypeSubProcess, TypeSubProcessLower, TypeSubProcessWf,
+  KnownNodeTypes, TaskFormPrefix, compareDefineRecency,
+  isSubProcessNodeType, parseSubProcessNode,
   ProcessInstance, type ProcessTask, type ProcessDefine,
   InstanceState, TaskState, SubmitType, TaskType, PerformType,
 } from './model.js'
@@ -37,7 +39,7 @@ import {
   MSG_NO_PERMISSION as MSG_AIDANT_NO_PERMISSION, MSG_NO_RECURSION as MSG_AIDANT_NO_RECURSION,
   MSG_NOT_DOING as MSG_AIDANT_NOT_DOING, MSG_TASK_NOT_FOUND as MSG_AIDANT_TASK_NOT_FOUND,
 } from './aidant.js'
-import type { ProcessRepository, ProcessExtRepository, UserProvider, IDGenerator, ExpressionEvaluator } from './spi.js'
+import type { ProcessRepository, ProcessExtRepository, UserProvider, IDGenerator, ExpressionEvaluator, QueryCondition } from './spi.js'
 import type { TimeAction, TimeActionSink } from './spi.js'
 // issues/141 G2：cc 写侧判重的 java `default` 方法在 TS 里的对应物（第三方仓储未实现判重 SPI 时兜旧行为）
 // issues/141 G10：归属值单值/集合归一的**那一份**判据（漏斗层与写侧层共用；issues/142 B 批
@@ -47,6 +49,8 @@ import { type EngineExtensions, type FlowInterceptor, type AssignmentHandler, ty
 import { HandlerRegistry } from './registry.js'
 
 export const KeySubmitType   = 'submitType'
+/** issues/257：子流程定义不存在（与 Java WfErrEnum.NOT_FOUND_PROCESS_DEFINE 同码）。 */
+export const ErrNotFoundProcessDefine = 20010002
 export const KeyBusinessNo   = 'BUSINESS_NO'
 export const KeyUserID       = 'u_userId'
 export const KeyRealName     = 'u_realName'
@@ -126,6 +130,8 @@ function isRejectSubmitType(submitType: number): boolean {
 
 export interface Engine {
   startProcessInstanceById(defineId: string, operator: string, args?: Record<string, any>): Promise<ProcessInstance>
+  /** issues/257：startAndExecute 共享腿——初始 DOING 快照逐任务加 applicant 后由 flow.auto 自办。 */
+  applyInitialTasks(instanceId: string, applicant: string, args?: Record<string, any>): Promise<ProcessTask[]>
   executeProcessTask(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessTask[]>
   executeAndJumpToEnd(taskId: string, operator: string, args?: Record<string, any>): Promise<ProcessTask[]>
   executeAndJumpTask(taskId: string, operator: string, args: Record<string, any>, targetTaskName?: string): Promise<ProcessTask[]>
@@ -161,19 +167,49 @@ export interface EngineOptions {
 
 /**
  * 照 mldong-boot2 NodeModel.canRejected：自 current 的入边回溯，命中 parent 放行；
- * 入边来源是 fork/join/start 时**跳过该条入边、不再深入**（boot2 是 continue，不是穿越），
- * 其余来源递归。subprocess 在 boot2 里被注释掉，等同普通节点。
+ * 入边来源是 fork/join/start/subProcess 时**跳过该条入边、不再深入**（不能穿越子流程边界），
+ * 其余来源递归。parent 为会签节点（performType≠NORMAL）时不可退。
  */
-function canRejected(flow: FlowModel, currentId: string, parentId: string): boolean {
+export function canRejected(flow: FlowModel, currentId: string, parentId: string): boolean {
+  const parent = findNode(flow, parentId)
+  if (parent?.type === TypeTask && isCountersign(parent.properties?.performType)) return false
   for (const edge of flow.edges) {
     if (edge.targetNodeId !== currentId) continue
     if (edge.sourceNodeId === parentId) return true
     const src = findNode(flow, edge.sourceNodeId)
     if (!src) continue
-    if (src.type === TypeFork || src.type === TypeJoin || src.type === TypeStart) continue
+    if (src.type === TypeFork || src.type === TypeJoin || src.type === TypeStart || isSubProcessNodeType(src.type)) continue
     if (canRejected(flow, src.id, parentId)) return true
   }
   return false
+}
+
+/** issues/257：系统代执行/管理员回退父实例 operator，其余保留真实触发人。 */
+function realOperator(operator: string, parent: ProcessInstance): string {
+  return operator.toLowerCase() === KeyAutoExecute || operator.toLowerCase() === KeyAdminID
+    ? parent.operator
+    : operator
+}
+
+/** issues/257：复制父业务参数并剥除父提交/任务控制/分支与重提上下文。 */
+function childProcessArgs(parentArgs: Record<string, any> | null | undefined): Record<string, any> {
+  const out: Record<string, any> = { ...(parentArgs ?? {}) }
+  delete out[KeySubmitType]
+  delete out[KeyProcessStartNextNodeOperator]
+  delete out[KeyNextNodeOperator]
+  delete out[VAR_BRANCH_CTX]
+  delete out[VAR_REAPPLY_CTX]
+  for (const key of Object.keys(out)) {
+    if (key.startsWith(TaskFormPrefix)) delete out[key]
+  }
+  return out
+}
+
+/** 裸 Error + code 属性，保留门面既有中文契约文案判别形状。 */
+function subProcessDefineNotFound(processName: string): Error & { code: number } {
+  const err = new Error(`子流程${processName}定义不存在`) as Error & { code: number }
+  err.code = ErrNotFoundProcessDefine
+  return err
 }
 
 // 复活行的变量净化：剔控制类残留（submitType / taskName / tf_ 前缀 / csv_ 前缀 / 会签簿记），
@@ -193,6 +229,8 @@ function lineageVars(src: Record<string, any> | undefined): Record<string, any> 
 export class EngineImpl implements Engine {
   /** R92：执行族产出列表的每次调用作用域（AsyncLocalStorage，并发安全）。 */
   private readonly createdScope = new AsyncLocalStorage<ProcessTask[]>()
+  /** issues/257：同一动作的父子终态先落库、整支流转成功后统一播。 */
+  private readonly pendingEndScope = new AsyncLocalStorage<Array<{ inst: ProcessInstance; operator: string }>>()
   private ext?: EngineExtensions
   private registry?: HandlerRegistry
   // issues/116：委托代理自动生效——内置能力，注入查询源后默认开启
@@ -450,15 +488,115 @@ export class EngineImpl implements Engine {
     await fn()
   }
 
+  private async withPendingInstanceEnds<T>(fn: () => Promise<T>): Promise<T> {
+    const pending: Array<{ inst: ProcessInstance; operator: string }> = []
+    return this.pendingEndScope.run(pending, async () => {
+      const result = await fn()
+      for (const end of pending.splice(0)) await this.notifyInstanceEnd(end.inst, end.operator)
+      return result
+    })
+  }
+
+  // ─── issues/257 · 子流程定义定位与 startAndExecute 共享腿 ──────────────────
+
+  private async findSubProcessDefine(name: string, version?: number | null): Promise<ProcessDefine | null> {
+    if (this.repo.findDefineByNameAndVersion) {
+      return this.repo.findDefineByNameAndVersion(name, version)
+    }
+    // 第三方仓储兼容：pageDefines 只按 name/version 过滤，选版仍由同一枚 version desc,id desc 判据决定。
+    const conditions: QueryCondition[] = [{ column: 't.name', operator: 'EQ', value: name }]
+    if (version != null) conditions.push({ column: 't.version', operator: 'EQ', value: version })
+    const pageSize = 100
+    let latest: DefineRow | null = null
+    for (let pageNum = 1; ; pageNum++) {
+      const page = await this.repo.pageDefines(pageNum, pageSize, conditions)
+      for (const row of page.rows) {
+        if (row.name !== name) continue
+        if (version != null && Number(row.version) !== Number(version)) continue
+        if (!latest || compareDefineRecency(row, latest) < 0) latest = row
+      }
+      if (pageNum * pageSize >= page.total) break
+    }
+    return latest ? this.repo.findDefineById(latest.id) : null
+  }
+
+  /** 当前任务直接出边指向子流程时先查定义；失败必须发生在 completeTask 之前。 */
+  private async validateSubProcessTargets(flow: FlowModel, current?: FlowNode): Promise<void> {
+    if (!current) return
+    for (const target of followEdges(flow, current.id)) {
+      if (!isSubProcessNodeType(target.type)) continue
+      const sub = parseSubProcessNode(target)
+      const define = await this.findSubProcessDefine(sub.processName, sub.version)
+      if (!define) throw subProcessDefineNotFound(sub.processName)
+    }
+  }
+
+  /**
+   * startAndExecute 的唯一自办腿（顶层门面与子流程共用）。
+   * 只取一次初始 DOING 快照；逐任务先加 applicant，再以 submitType=0 / flow.auto 办理。
+   * 每次 execute 都有独立 createdScope，子流程启动时再用空作用域隔离，避免子任务并入父产出。
+   */
+  async applyInitialTasks(instanceId: string, applicant: string, args: Record<string, any> = {}): Promise<ProcessTask[]> {
+    return this.applyInitialTasksUsing(instanceId, applicant, args,
+      (taskId, applyArgs) => this.executeProcessTask(taskId, KeyAutoExecute, applyArgs))
+  }
+
+  private async applyInitialTasksUsing(
+    instanceId: string, applicant: string, args: Record<string, any>,
+    execute: (taskId: string, applyArgs: Record<string, any>) => Promise<ProcessTask[] | void>,
+  ): Promise<ProcessTask[]> {
+    const snapshot = await this.repo.findDoingTasks(instanceId)
+    const created: ProcessTask[] = []
+    for (const task of snapshot) {
+      await this.repo.addTaskActor(task.id, [applicant])
+      const applyArgs: Record<string, any> = { ...args, [KeySubmitType]: SubmitType.Apply }
+      const startNext = applyArgs[KeyProcessStartNextNodeOperator]
+      if (startNext != null && String(startNext) !== '') {
+        applyArgs[KeyNextNodeOperator] = startNext
+      }
+      const result = await execute(task.id, applyArgs)
+      if (result) created.push(...result)
+    }
+    return created
+  }
+
+  /** 启动真子实例并自动办理初始任务；parentId/parentNodeName 在实例 start 事件前落库。 */
+  private async startSubProcess(inst: ProcessInstance, node: FlowNode, operator: string,
+                                vars: Record<string, any>): Promise<ProcessInstance> {
+    const sub = parseSubProcessNode(node)
+    const define = await this.findSubProcessDefine(sub.processName, sub.version)
+    if (!define) throw subProcessDefineNotFound(sub.processName)
+    const applicant = realOperator(operator, inst)
+    const childArgs = childProcessArgs(vars)
+    const parentCreated = this.createdScope.getStore()
+    const parentTasksBefore = new Set((await this.repo.findDoingTasks(inst.id)).map(t => t.id))
+    // 关键隔离：子实例启动/子申请推进产生的任务只属于子实例，不得进入父 execution 的 createdScope。
+    const child = await this.createdScope.run([], async () => {
+      const started = await this.startProcessInstanceByIdInner(
+        define.id, applicant, childArgs, inst.id, node.id)
+      await this.applyInitialTasksUsing(started.id, applicant, childArgs,
+        async (taskId, applyArgs) => { await this.executeProcessTaskInner(taskId, KeyAutoExecute, applyArgs) })
+      return started
+    })
+    // 子申请即办结时，回父新任务已由父 continuation 持久化；只把父实例新增差集送回父产出。
+    if (parentCreated) {
+      for (const task of await this.repo.findDoingTasks(inst.id)) {
+        if (!parentTasksBefore.has(task.id) && !parentCreated.some(t => t.id === task.id)) parentCreated.push(task)
+      }
+    }
+    return child
+  }
+
   // ─── Start ─────────────────────────────────────────────────────────────────
 
   async startProcessInstanceById(defineId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
     // audit8 145-2①：入口级包裹——直连引擎的调用方也拿到"一次动作一笔原子"（spec/12 §12.2）。
     // 门面动作级包裹在流内再调本入口时，经 withTx join 支并入同一段事务（不双开）。
-    return this.inTx(() => this.startProcessInstanceByIdInner(defineId, operator, args))
+    return this.withPendingInstanceEnds(() => this.inTx(() => this.startProcessInstanceByIdInner(defineId, operator, args)))
   }
 
-  private async startProcessInstanceByIdInner(defineId: string, operator: string, args: Record<string, any> = {}): Promise<ProcessInstance> {
+  private async startProcessInstanceByIdInner(defineId: string, operator: string, args: Record<string, any> = {},
+                                              parentId?: string, parentNodeName?: string): Promise<ProcessInstance> {
     const def = await this.repo.findDefineById(defineId)
     if (!def) throw new Error(`define not found: ${defineId}`)
     const flow = loadFlowModel(def.content)
@@ -470,6 +608,8 @@ export class EngineImpl implements Engine {
     const now = this.now()
     // 聚合根工厂创建实例
     const inst = ProcessInstance.create(this.nextId(), defineId, operator, vars, now)
+    if (parentId != null) inst.parentId = parentId
+    if (parentNodeName != null) inst.parentNodeName = parentNodeName
     // issues/137 A · 裁定 A（批二 §3-4）· **实例级 expire_time 的唯一写点**：
     // 取流程定义**顶层** expireTime 表达式（spec 02:21/55「流程期望完成时间」），非空才求值写入。
     // 基准＝Java JeeflowEngineImpl.java:93-96（`if (StringUtils.isNotEmpty(...)) instance.setExpireTime(
@@ -485,6 +625,7 @@ export class EngineImpl implements Engine {
     await this.repo.saveInstance(inst)
     // §11.3 code 1：实例行 insert **之后** fire（场景 28：发起前先 fire ⇒ 红）
     await this.fireEvent({ type: EventType.ProcessInstanceStart, instanceId: inst.id, operator })
+    await this.handleCcActors(inst.id, operator, vars[KeyCcActorsStart])
 
     const startNode = findNodeByType(flow, TypeStart)
     if (!startNode) throw new Error('no start node')
@@ -504,8 +645,8 @@ export class EngineImpl implements Engine {
     // 作用域用 AsyncLocalStorage：一个 EngineImpl 实例并发处理多个请求，class 字段会互踩；
     // 而 node 没有 go 那样的 ctx 可挂，ALS 是等价的每次调用作用域（见 R92 notes）。
     const pre = await this.repo.findTaskById(taskId)
-    await withInstanceLock(this, pre?.processInstanceId, () =>
-      this.createdScope.run(created, () => this.inTx(() => this.executeProcessTaskInner(taskId, operator, args))))
+    await this.withPendingInstanceEnds(() => withInstanceLock(this, pre?.processInstanceId, () =>
+      this.createdScope.run(created, () => this.inTx(() => this.executeProcessTaskInner(taskId, operator, args)))))
     return created
   }
 
@@ -680,7 +821,8 @@ export class EngineImpl implements Engine {
     // spec04 §完成任务：公开方法回传「本次动作产出的任务行」（基准＝java exec.getProcessTaskList()）。
     // 作用域用 AsyncLocalStorage：一个 EngineImpl 实例并发处理多个请求，class 字段会互踩；
     // 而 node 没有 go 那样的 ctx 可挂，ALS 是等价的每次调用作用域（见 R92 notes）。
-    await this.createdScope.run(created, () => this.inTx(() => this.executeAndJumpToEndInner(taskId, operator, args)))
+    await this.withPendingInstanceEnds(() => this.createdScope.run(created,
+      () => this.inTx(() => this.executeAndJumpToEndInner(taskId, operator, args))))
     return created
   }
 
@@ -693,19 +835,89 @@ export class EngineImpl implements Engine {
     if (pre && pre.taskState === TaskState.Doing && reapplyOf(pre.variables)) {
       throw new Error("带重提直返标记的申请待办不允许拒绝，只接受重新提交(submitType=5)")
     }
-    const { task, inst, flow } = await this.prepareExecuteTask(taskId, operator, args)
+    const { task, inst, flow, vars } = await this.prepareExecuteTask(taskId, operator, args)
     // 拒绝结束：本节点未完成的加签任务一并废弃，不留孤儿待办（规范 04 · 后加签／语义边界表）
     // issues/253：离开节点先清场未办结协办行（废弃＋账本记废弃），再走后加签/征询的既有废弃腿
     await this.abandonAidantOnNode(inst, task.taskName, operator)
     await this.abandonAddSignDoing(flow, inst, task.taskName, this.now())
-    // 门面 submitType=2 REJECT 唯一入口（对齐 Java executeAndJumpToEnd 语义）
-    inst.reject(this.now())
+    // issues/257：与正常结束共用主办守卫、协办清结、终态落库后播与子流程回父腿。
+    // 本入口历史上恒为驳回，即使调用方省略 submitType 也必须落 45。
+    await this.finishInstanceAtEnd(inst, operator, { ...vars, [KeySubmitType]: SubmitType.Reject })
+    return (await this.repo.findInstanceById(inst.id))!
+  }
+
+  /**
+   * 结束节点统一收口（issues/257，对齐 Java EndProcessHandler）。
+   * 仍有非协办 DOING 任务时拒绝结束；协办由 flow.auto 逐行办结；实例终态落库后才播码 2；
+   * 子实例终态后按 parentId/parentNodeName 回父执行一次出边。
+   */
+  private async finishInstanceAtEnd(inst: ProcessInstance, operator: string,
+                                    vars: Record<string, any>): Promise<void> {
+    const active = inst.tasks.filter(task => task.isDoing())
+    const knownTaskIds = new Set(inst.tasks.map(task => task.id))
+    for (const task of await this.repo.findDoingTasks(inst.id)) {
+      if (!knownTaskIds.has(task.id)) active.push(task)
+    }
+    if (active.some(task => !isAidantRow(task))) {
+      throw new Error('存在未完成的主办任务,请确认.')
+    }
+    // 协办清结可能改写实例变量，先冻结本次结束语义（拒绝仍为 45，其余为办结 20）。
+    const submitType = normalizeSubmitType(vars[KeySubmitType] ?? inst.variables[KeySubmitType])
+    const activeTaskIds = new Set(active.map(task => task.id))
+    for (const task of active) {
+      // 已处于本实例的执行锁内，不能再走公开 executeProcessTask 的 withInstanceLock（会自锁）。
+      // 协办清结只办自己的行、不驱动出边，直接复用同一私有序言即可。
+      await this.completeAidantWithoutDrive(task.id, KeyAutoExecute, {
+        ...vars, [KeySubmitType]: SubmitType.Agree,
+      })
+    }
+    if (active.length > 0) {
+      const refreshed = await this.repo.findInstanceById(inst.id)
+      if (refreshed) {
+        for (const task of refreshed.tasks) {
+          const index = inst.tasks.findIndex(t => t.id === task.id)
+          if (activeTaskIds.has(task.id) || index < 0) {
+            if (index < 0) inst.tasks.push(task)
+            else inst.tasks[index] = task
+          }
+        }
+        Object.assign(inst.variables, refreshed.variables)
+      }
+    }
+    const now = this.now()
+    if (submitType === SubmitType.Reject) inst.reject(now)
+    else inst.finish(now)
+    inst.variables = mergeExecIntoInstance(inst.variables, vars)
     await this.repo.updateInstance(inst)
     await this.cancelInstanceTimeActions(inst.id)
-    // §11.3 code 2：拒绝也是"实例进入终态"（state=45 落库后 fire，靠载荷 state 与办结分家）；
-    // "任务被退回"这一事实另由 prepareExecuteTask 的 TASK_REJECT(6) 承载（场景 31/32 两支并存）
-    await this.notifyInstanceEnd(inst, operator)
-    return (await this.repo.findInstanceById(inst.id))!
+    // 终态先入动作队列；父子 continuation 全部持久化成功后统一 fire，回滚不播。
+    this.pendingEndScope.getStore()!.push({ inst, operator })
+    await this.continueParentFromChild(inst, operator)
+  }
+
+  /** 子办结/拒绝后只执行父 SubProcess 节点的出边，不重新启动子流程。 */
+  private async continueParentFromChild(child: ProcessInstance, operator: string): Promise<void> {
+    if (!child.parentId) return
+    const parent = await this.repo.findInstanceById(child.parentId)
+    if (!parent) return
+    const define = await this.repo.findDefineById(parent.defineId)
+    if (!define) return
+    const parentFlow = loadFlowModel(define.content)
+    const parentNode = findNode(parentFlow, child.parentNodeName)
+    if (!parentNode || !isSubProcessNodeType(parentNode.type)) return
+    const parentOperator = realOperator(operator, child)
+    // 回父执行读取子流程最新参数（SnakerFlow 共用 args 语义），但父实例变量仍只由父聚合维护。
+    const parentVars = { ...parent.variables, ...child.variables }
+    if (!(await this.firePre(parentNode, parent))) return
+    try {
+      for (const target of followEdges(parentFlow, parentNode.id)) {
+        await this.executeNode(parentFlow, parent, target, parentOperator, parentVars, '0')
+      }
+    } finally {
+      await this.firePost(parentNode, parent)
+    }
+    // 父聚合可能已被结束节点更新，也可能只新建了任务；统一按父聚合持久化一次。
+    await this.repo.updateInstance(parent)
   }
 
   // ─── Jump（ROLLBACK 空 target / JUMP 命名 target，boot2 executeAndJumpTask）────
@@ -716,7 +928,8 @@ export class EngineImpl implements Engine {
     // spec04 §完成任务：公开方法回传「本次动作产出的任务行」（基准＝java exec.getProcessTaskList()）。
     // 作用域用 AsyncLocalStorage：一个 EngineImpl 实例并发处理多个请求，class 字段会互踩；
     // 而 node 没有 go 那样的 ctx 可挂，ALS 是等价的每次调用作用域（见 R92 notes）。
-    await this.createdScope.run(created, () => this.inTx(() => this.executeAndJumpTaskInner(taskId, operator, args, targetTaskName)))
+    await this.withPendingInstanceEnds(() => this.createdScope.run(created,
+      () => this.inTx(() => this.executeAndJumpTaskInner(taskId, operator, args, targetTaskName))))
     return created
   }
 
@@ -1095,6 +1308,8 @@ export class EngineImpl implements Engine {
     // completeTask 之前——内存仓储无回滚，报错时不得留下已完成的任务行（"报错且无写入"是
     // 这条链的硬要求，落点与 java `prepareExecution` 同位）。
     validateSubmission(flow, task, args, operator)
+    // issues/257：直接出边缺失子流程定义必须在 completeTask 之前拦下，内存仓报错即零写入。
+    await this.validateSubProcessTargets(flow, findNode(flow, task.taskName))
     // issues/251：办理时把本节点的 allowRecall 开关快照进行变量（tf_allowRecall）——
     // prepareExecuteTask 是全部办结路径的公共序言，一处盖键全路径覆盖。tf_ 键被实例
     // 合并两面立法排除（不传播）；撤回校验仍以现读定义为权威，快照仅供前端预判；
@@ -1495,21 +1710,15 @@ export class EngineImpl implements Engine {
         return
       }
       case TypeEnd: {
-        // 对齐 Java EndProcessHandler：submitType=REJECT → reject，否则 finish
-        const submitType = inst.variables[KeySubmitType]
-        if (submitType != null && Number(submitType) === SubmitType.Reject) {
-          inst.reject(this.now())
-        } else {
-          inst.finish(this.now())
-        }
-        // issues/97：结束节点写回同样排除操作人 u_*（保留发起人 u_*，与 prepareExecuteTask 一致）
-        inst.variables = mergeExecIntoInstance(inst.variables, vars)
-        await this.repo.updateInstance(inst)
-        await this.cancelInstanceTimeActions(inst.id)
-        // §11.3 code 2：办结(20)/拒绝(45) 共用 PROCESS_INSTANCE_END，state 落库后 fire（§11.6）
-        await this.notifyInstanceEnd(inst, operator)
+        // issues/257：结束节点统一走主办守卫/协办清结/终态事件/子流程回父收口。
+        await this.finishInstanceAtEnd(inst, operator, vars)
         return
       }
+      case TypeSubProcess:
+      case TypeSubProcessLower:
+      case TypeSubProcessWf:
+        await this.startSubProcess(inst, node, operator, vars)
+        return
       default:
         // issues/141 G4 义务 2（spec/02「类型键的三条义务」第 2 条）：**未知档不得静默丢节点**
         // ——类型不在表里时先记一条可诊断日志，再决定跳过。
@@ -1521,10 +1730,8 @@ export class EngineImpl implements Engine {
         // 该节点打一条；令牌停在原地不再有后续推进，所以不存在按请求刷屏
         // （反例：挂到每次读定义的出口上，start/execute/highLight/detail 各打一遍）。
         //
-        // **为什么必须带实得类型串原文**：spec/02 义务 3 段 owner 二拍「子流程暂不进契约面」，
-        // 六栈不补 `snaker:subProcess` 档 ⇒ 设计器画出的子流程节点在本栈唯一的痕迹就是这条日志。
-        // 少了 type= 那一半，"snaker:subProcess 被吞了"和"手写的 snaker:Task 拼错大小写被吞了"
-        // 长得一模一样，那条裁定就没有可诊断面，等于没立法依据。nodeId 同理：没它连哪个节点都找不到。
+        // **为什么必须带实得类型串原文**：未知类型与已建档类型执行失败是两类问题，
+        // 诊断日志必须能直接看出 nodeId 与 type= 原文；子流程三别名已在类型表与 switch 建档。
         //
         // ⚠️ 只记日志，不改行为：跳过形状（不建行、不沿出边推进、令牌停住）已由 issues/143 在
         // java/php/c# 收口，本栈本来就是"按 id 现查目标、查不到就停"那一派，行为已对。
@@ -1888,6 +2095,10 @@ export function loadFlowModel(content: Uint8Array | string | null | undefined): 
   const text = typeof content === 'string' ? content : new TextDecoder().decode(content as Uint8Array)
   const flow = JSON.parse(text) as FlowModel
   checkFlowConfig(flow)
+  // issues/257：本栈没有独立 ModelParser，解析口在这里补子流程模型快照。
+  for (const node of flow.nodes ?? []) {
+    if (isSubProcessNodeType(node.type)) parseSubProcessNode(node)
+  }
   return flow
 }
 

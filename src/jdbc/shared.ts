@@ -307,6 +307,30 @@ export class JdbcRepository implements ProcessRepository {
     }
   }
 
+  // issues/257：子流程定义定位；null 取 version desc,id desc，显式版本精确匹配，无额外 state 过滤。
+  async findDefineByNameAndVersion(name: string, version?: number | null): Promise<ProcessDefine | null> {
+    const conn = await this.c()
+    try {
+      const exact = version != null
+      const row = await conn.fetchOne(this.sql(
+        'SELECT id, name, display_name, type, state, content, version, ' +
+        'create_time, create_user, update_time, update_user FROM wf_process_define ' +
+        'WHERE name = ?' + (exact ? ' AND version = ?' : '') +
+        ' ORDER BY version DESC, id DESC LIMIT 1'),
+        exact ? [name, version] : [name])
+      if (!row) return null
+      return {
+        id: rowId(row.id), name: row.name, displayName: row.display_name, type: row.type,
+        state: row.state,
+        content: row.content ? Buffer.from(row.content).toString('utf8') : '',
+        version: row.version, createTime: row.create_time, createUser: rowId(row.create_user),
+        updateTime: row.update_time, updateUser: rowId(row.update_user),
+      }
+    } finally {
+      await this.done(conn)
+    }
+  }
+
   // ── ProcessInstance ───────────────────────────────────────────────────────
 
   private static INSTANCE_COLS =

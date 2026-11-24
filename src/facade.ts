@@ -15,7 +15,7 @@ import type { OrgUserProvider, ProcessExtRepository, ProcessRepository, QueryCon
 // （旧名 normalizeCcActorValue ＝ 新名 normalizeActorValue，同一函数），不在此另写一份 trim＋判空
 import { normalizeActorValue } from './spi.js'
 import type { EngineImpl } from './engine.js'
-import { KeyAutoExecute, KeyAdminID, KeyCcActorsStart, KeyNextNodeOperator, KeyProcessStartNextNodeOperator, isCountersign, loadFlowModel, parseActorIds } from './engine.js'
+import { KeyAutoExecute, KeyAdminID, isCountersign, loadFlowModel, parseActorIds } from './engine.js'
 import { EventType } from './extensions.js'
 import { KeyAllowRecall } from './recall.js'
 // 后加签两开关的解析期硬校验（规范 02 §4.3／§4.4）：java 在 deploy/redeploy/designDeploy/
@@ -43,7 +43,6 @@ import { MSG_NO_ACTORS as MSG_AIDANT_NO_ACTORS, buildProjection as buildAidantPr
 import { VAR_BRANCH_CTX, VAR_REAPPLY_CTX } from './reapply.js'
 
 // submitType 枚举（对齐 boot3）
-const SUBMIT_APPLY = 0
 const SUBMIT_AGREE = 1
 const SUBMIT_REJECT = 2
 const SUBMIT_ROLLBACK = 3
@@ -417,24 +416,9 @@ export class JeeflowFacade {
       flowArgs[k] = v
     }
     const inst = await this.engine.startProcessInstanceById(defineId, operator, flowArgs)
-    // issues/56 E28 ＋ issues/127：发起时抄送（f_ccActors）——cc 行落库后逐人 fire CC_CREATE(4)。
-    // 与办理腿 tf_ccActors、手动腿 createCCInstance 共用引擎那一个漏斗（Java handleCcActors 同形），
-    // 三条路径同一码，不在门面各写一份 fire 循环。
-    await this.engine.handleCcActors(inst.id, operator, flowArgs[KeyCcActorsStart])
     // startAndExecute：自动完成申请节点（assignee="applicant" → 发起人）
-    const doing = await this.repo.findDoingTasks(inst.id)
-    for (const task of doing) {
-      await this.repo.addTaskActor(task.id, [operator])
-      flowArgs.submitType = SUBMIT_APPLY
-      // 对齐 boot3：f_nextNodeOperator（发起时预指派人）→ tf_nextNodeOperator（引擎执行参数）
-      const startNextOp = flowArgs[KeyProcessStartNextNodeOperator]
-      if (startNextOp != null && String(startNextOp) !== '') {
-        flowArgs[KeyNextNodeOperator] = startNextOp
-      }
-      // issues/176：spec 04:60-62——apply 节点由 flow.auto 代执行（operator 列=flow.auto，
-      // 不进发起人已办）；u_* 由发起腿留下、引擎对 flow.auto 跳过注入（对齐 boot2 :317）
-      await this.engine.executeProcessTask(task.id, KeyAutoExecute, flowArgs)
-    }
+    // issues/257：顶层与子流程共用同一自办腿，避免两处语义漂移。
+    await this.engine.applyInitialTasks(inst.id, operator, flowArgs)
     return { processInstanceId: inst.id }
   }
 

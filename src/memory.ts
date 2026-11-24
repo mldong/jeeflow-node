@@ -1,4 +1,4 @@
-import { InstanceState, TaskState } from './model.js'
+import { compareDefineRecency, InstanceState, TaskState } from './model.js'
 import type { CcInstanceRow, DefineRow, InstanceRow, TaskRow, ProcessDefine } from './model.js'
 import { cloneInstance, cloneTask, type ProcessInstance, type ProcessTask } from './model.js'
 import type { ProcessRepository, QueryCondition } from './spi.js'
@@ -132,6 +132,18 @@ export class MemoryRepository implements ProcessRepository {
     for (const d of this.defines.values()) {
       // BigInt 比较：id 为 string（issue 38 E9），大整数数字比较不可靠
       if (d.name === name && (!latest || BigInt(d.id) > BigInt(latest.id))) latest = d
+    }
+    return latest
+  }
+
+  // issues/257：子流程按 name + version 定位；null 取 version desc,id desc，显式版本精确匹配。
+  // 与顶层启动一致，不按 define.state 额外设闸。
+  async findDefineByNameAndVersion(name: string, version?: number | null) {
+    let latest: ProcessDefine | null = null
+    for (const d of this.defines.values()) {
+      if (d.name !== name) continue
+      if (version != null && Number(d.version) !== Number(version)) continue
+      if (!latest || compareDefineRecency(d, latest) < 0) latest = d
     }
     return latest
   }

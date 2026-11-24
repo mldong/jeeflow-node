@@ -35,6 +35,13 @@ export interface FlowEdge {
   text?: { value: string }
 }
 
+/** 子流程节点模型（issues/257）：processName 是定义名，version/form 是节点属性快照。 */
+export interface SubProcessNode extends FlowNode {
+  processName: string
+  version: number | null
+  form?: string
+}
+
 // ─── Node Type Constants ──────────────────────────────────────────────────────
 
 // 删除定义的实例守卫文案（内部码 20010005，逐字沿用 boot2）
@@ -47,6 +54,36 @@ export const TypeDecision = 'snaker:decision'
 export const TypeFork     = 'snaker:fork'
 export const TypeJoin     = 'snaker:join'
 export const TypeCustom   = 'snaker:custom'
+export const TypeSubProcess      = 'snaker:subProcess'
+export const TypeSubProcessLower = 'snaker:subprocess'
+export const TypeSubProcessWf    = 'snaker:wfSubProcess'
+
+/** 子流程三别名同值（规范名为设计器输出的驼峰 subProcess）。 */
+export const SubProcessNodeTypes: readonly string[] = [
+  TypeSubProcess, TypeSubProcessLower, TypeSubProcessWf,
+]
+
+export function isSubProcessNodeType(type: string): boolean {
+  return SubProcessNodeTypes.includes(type)
+}
+
+/**
+ * 把 LogicFlow 节点属性解析成子流程模型快照。
+ * processName 优先级固定为 properties.processName → properties.name → 节点 id；
+ * form 只保留，不参与定义查找；version 缺省/null 表示最新版。
+ */
+export function parseSubProcessNode(node: FlowNode): SubProcessNode {
+  const props = node.properties ?? {}
+  const named = (v: unknown): string | undefined =>
+    typeof v === 'string' && v.trim() !== '' ? v : undefined
+  const rawVersion = props.version
+  const version = rawVersion == null ? null : Number(rawVersion)
+  return Object.assign(node, {
+    processName: named(props.processName) ?? named(props.name) ?? node.id,
+    version,
+    form: props.form == null ? undefined : String(props.form),
+  }) as SubProcessNode
+}
 
 /**
  * 类型表全集（spec/02「类型键的三条义务」第 2 条 · issues/141 G4 立的判据本体）。
@@ -55,13 +92,10 @@ export const TypeCustom   = 'snaker:custom'
  * `snaker:start` 也是表里的一档，但它在执行链上是**入口**（引擎从 start 的出边起步，start 自身
  * 正常不会被 `executeNode` 走到）。用"没人认领"当未知判据，会把"令牌真走到 start 上"这种拓扑病
  * 误报成"类型不在表里"——两个病得分别可诊断。义务 2 要的是**串 ∉ 表**那一判。
- *
- * ⚠️ 表里**没有** `snaker:subProcess`／`snaker:subprocess`：owner 2026-10-01 二拍「子流程暂不进
- * 契约面」（spec/02 义务 3 段），六栈不补这一档。设计器画出子流程节点时，本栈就靠 `executeNode`
- * 那条未知档日志把它**显式暴露**出来——那条裁定唯一的可诊断面就是这条日志。
  */
 export const KnownNodeTypes: ReadonlySet<string> = new Set<string>([
   TypeStart, TypeEnd, TypeTask, TypeDecision, TypeFork, TypeJoin, TypeCustom,
+  ...SubProcessNodeTypes,
 ])
 
 // ─── Domain Types ─────────────────────────────────────────────────────────────
@@ -81,6 +115,22 @@ export interface ProcessDefine {
   createUser: string
   updateTime: Date
   updateUser: string
+}
+
+/** 定义选版顺序：version desc, id desc；返回负数表示 a 比 b 新。 */
+export function compareDefineRecency(
+  a: Pick<ProcessDefine, 'version' | 'id'>,
+  b: Pick<ProcessDefine, 'version' | 'id'>,
+): number {
+  const byVersion = Number(b.version) - Number(a.version)
+  if (byVersion !== 0) return byVersion
+  try {
+    const ai = BigInt(a.id), bi = BigInt(b.id)
+    return ai === bi ? 0 : (ai > bi ? -1 : 1)
+  } catch {
+    // 第三方仓储可能用非数字 id；BigInt 不可比时退回字符串字典序，仍保持 id desc。
+    return a.id === b.id ? 0 : (a.id > b.id ? -1 : 1)
+  }
 }
 
 // ─── 管理扩展（v1.1.0）──────────────────────────────────────────────────────

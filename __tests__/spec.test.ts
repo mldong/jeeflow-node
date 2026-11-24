@@ -7335,8 +7335,6 @@ describe('issues/141 G4 义务 2 未知节点档必须留一条带 nodeId＋实�
 
   it('①未知档矩阵：每个实得类型串都留下一条同时带 nodeId 与 type 原串的日志；行为侧不建行、不推进、不炸办理', async () => {
     const vectors: Array<[string, string]> = [
-      ['snaker:subProcess', '设计器实际输出的驼峰子流程串——owner 二拍暂不进契约面，全靠这条日志显影'],
-      ['snaker:subprocess', '契约里那条小写档同样不在表里（查表大小写敏感，不许偷偷认）'],
       ['snaker:Task', '拼错大小写：不许再塌成 Custom/Task 任一档'],
       ['task', '裸名（没带 snaker: 前缀）不在本栈表里'],
       ['snaker:not-a-node', '纯杜撰'],
@@ -7366,7 +7364,7 @@ describe('issues/141 G4 义务 2 未知节点档必须留一条带 nodeId＋实�
     }
   })
 
-  it('②反向哨兵：类型表里那 7 档一律不许被报成"不在类型表里"', async () => {
+  it('②反向哨兵：非子流程的已知档一律不许被报成"不在类型表里"', async () => {
     for (const known of ['snaker:task', 'snaker:decision', 'snaker:fork', 'snaker:join',
                          'snaker:end', 'snaker:custom', 'snaker:start']) {
       const h = g4Harness(chainContent({ id: 'known1', type: known,

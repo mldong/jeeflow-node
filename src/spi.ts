@@ -224,6 +224,12 @@ export interface ProcessRepository {
   findDefineById(id: string): Promise<ProcessDefine | null>
   // findDefineByName 按流程编码查最新一条定义（v1.1.0，Facade deploy 版本管理用）
   findDefineByName(name: string): Promise<ProcessDefine | null>
+  /**
+   * issues/257 子流程定义定位：name 精确匹配；version=null/undefined 取 version desc,id desc 首条，
+   * 显式版本精确匹配。**不额外过滤 state**，与顶层 startProcessInstanceById 同口径。
+   * 可选是为了兼容第三方仓储；未实现时引擎回退 pageDefines + findDefineById。
+   */
+  findDefineByNameAndVersion?(name: string, version?: number | null): Promise<ProcessDefine | null>
   // 定义写操作（v1.0.1，集成反馈①）：保存/更新/启停/删除流程定义
   saveDefine(define: ProcessDefine): Promise<void>
   updateDefine(define: ProcessDefine): Promise<void>
