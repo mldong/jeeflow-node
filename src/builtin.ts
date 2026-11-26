@@ -20,6 +20,11 @@ export const HANDLER_FORM_USER_DEPT_LEADER =
   'com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler'
 export const HANDLER_FORM_USER_DEPT_MAIN_LEADER =
   'com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler'
+// issues/258：两个「表单指定部门」类同样是顶级类（不带 OrgUserAssignmentHandlers$ 前缀）
+export const HANDLER_FORM_DEPT_LEADER =
+  'com.mldong.jeeflow.interceptor.impl.FormDeptLeaderAssignmentHandler'
+export const HANDLER_FORM_DEPT_MAIN_LEADER =
+  'com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler'
 
 // 表单字段编号后缀正则（task_01 → task）
 const NUMBER_SUFFIX_PATTERN = /^(.+?)_(\d+)$/
@@ -197,6 +202,75 @@ export function firstFormUserId(value: any): string {
   return ''
 }
 
+// ─── 表单指定部门 → 各部门负责人／分管领导（issues/258）─────────────────────────
+
+/** 字符串按英文逗号拆；数组／Set 逐元素读取（元素不二次拆逗号）；去重保序。 */
+function formDeptIds(value: any): string[] {
+  if (value === null || value === undefined) return []
+  try {
+    const tokens: any[] = Array.isArray(value)
+      ? value
+      : value instanceof Set
+        ? [...value]
+        : String(value).split(',')
+    const ids: string[] = []
+    const seen = new Set<string>()
+    for (const token of tokens) {
+      if (token === null || token === undefined) continue
+      const id = String(token).trim()
+      if (id !== '' && !seen.has(id)) {
+        seen.add(id)
+        ids.push(id)
+      }
+    }
+    return ids
+  } catch {
+    return []
+  }
+}
+
+/** 两枚「表单指定部门」handler 的共用取数档；不改动 issues/254 的老 handler。 */
+class FormDeptBase extends OrgBase {
+  protected async byFormDept(node: FlowNode | null, inst: ProcessInstance | null, main: boolean): Promise<string[]> {
+    const org = this.orgProv
+    if (!node || !inst || !org) return []
+    const deptIds = formDeptIds(findFormUserFieldValue(inst.variables, node.id))
+    const userIds: string[] = []
+    const seen = new Set<string>()
+    for (const deptId of deptIds) {
+      try {
+        const leaders = (main ? await org.findDeptMainLeaders(deptId) : await org.findDeptLeaders(deptId)) ?? []
+        if (!Array.isArray(leaders)) continue
+        for (const leader of leaders) {
+          if (leader === null || leader === undefined) continue
+          const userId = String(leader).trim()
+          if (userId !== '' && !seen.has(userId)) {
+            seen.add(userId)
+            userIds.push(userId)
+          }
+        }
+      } catch {
+        // 单个部门取数失败按无领导处理：结果保持为空或已收集结果，且不向引擎抛错。
+      }
+    }
+    return userIds
+  }
+}
+
+/** 表单指定 1–N 个部门，取这些部门的负责人。 */
+export class FormDeptLeaderAssignmentHandler extends FormDeptBase implements IAssignmentHandler {
+  async assign(node: FlowNode | null, inst: ProcessInstance | null, _operator: string): Promise<string[]> {
+    return this.byFormDept(node, inst, false)
+  }
+}
+
+/** 表单指定 1–N 个部门，取这些部门的分管领导。 */
+export class FormDeptMainLeaderAssignmentHandler extends FormDeptBase implements IAssignmentHandler {
+  async assign(node: FlowNode | null, inst: ProcessInstance | null, _operator: string): Promise<string[]> {
+    return this.byFormDept(node, inst, true)
+  }
+}
+
 // ─── 注册 ──────────────────────────────────────────────────────────────────────
 
 /**
@@ -217,4 +291,6 @@ export function registerBuiltinAssignments(
   reg.registerAssignment(HANDLER_TASK_ROLE_ASSIGNEE, new TaskRoleAssigneeHandler(orgProv))
   reg.registerAssignment(HANDLER_FORM_USER_DEPT_LEADER, new FormUserDeptLeaderAssignmentHandler(userProv, orgProv))
   reg.registerAssignment(HANDLER_FORM_USER_DEPT_MAIN_LEADER, new FormUserDeptMainLeaderAssignmentHandler(userProv, orgProv))
+  reg.registerAssignment(HANDLER_FORM_DEPT_LEADER, new FormDeptLeaderAssignmentHandler(userProv, orgProv))
+  reg.registerAssignment(HANDLER_FORM_DEPT_MAIN_LEADER, new FormDeptMainLeaderAssignmentHandler(userProv, orgProv))
 }

@@ -46,8 +46,8 @@ describe('HandlerRegistry 清单（v1.4.0）', () => {
       { displayName: '老板审批', order: 1 })
 
     const list = r.listHandlers('AssignmentHandler')
-    // 内置通用 handler（9 条：issues/16 那 7 条 ＋ 表单指定用户两条）+ 2 个自定义
-    assert.equal(list.length, 11)
+    // 内置通用 handler（11 条：issues/16 那 7 条 ＋ 表单指定用户两条 ＋ 表单指定部门两条）+ 2 个自定义
+    assert.equal(list.length, 13)
     assert.equal(list[0].name, 'com.mldong.jeeflow.interceptor.impl.OperatorAssignmentHandler')
     assert.equal(list[0].displayName, '流程发起人')
     assert.equal(list[1].name, 'com.example.BossHandler')
@@ -60,20 +60,22 @@ describe('HandlerRegistry 清单（v1.4.0）', () => {
     assert.deepEqual(r.listHandlersGroup('AssignmentHandler', 'pre'), [])
   })
 
-  it('空注册表（构造即内置通用 handler：issues/16 那 7 条 ＋ 表单指定用户两条）', () => {
+  it('空注册表（构造即内置通用 handler：issues/16 那 7 条 ＋ 表单指定用户两条 ＋ 表单指定部门两条）', () => {
     const r = new HandlerRegistry()
     const metas = r.listHandlers('AssignmentHandler')
-    assert.equal(metas.length, 9)
+    assert.equal(metas.length, 11)
     assert.deepEqual(metas.slice(7), [
       { type: 'AssignmentHandler', name: 'com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler', displayName: '表单指定用户所属部门经理', order: 70 },
       { type: 'AssignmentHandler', name: 'com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler', displayName: '表单指定用户所属部门分管领导', order: 80 },
-    ], 'order 70/80 两条新项排在 TaskRoleAssignee(60) 之后')
+      { type: 'AssignmentHandler', name: 'com.mldong.jeeflow.interceptor.impl.FormDeptLeaderAssignmentHandler', displayName: '表单指定部门负责人', order: 90 },
+      { type: 'AssignmentHandler', name: 'com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler', displayName: '表单指定部门分管领导', order: 100 },
+    ], 'order 70/80/90/100 四项按序排在 TaskRoleAssignee(60) 之后')
     assert.deepEqual(r.listHandlerNames(), [])
   })
 
   it('类型清单 listHandlerTypes（issues/186 · audit8 R20 第四能力补齐）：去重、与 listHandlers 同口径', () => {
     const r = new HandlerRegistry()
-    assert.deepEqual(r.listHandlerTypes(), ['AssignmentHandler'], '内置 9 条同型 ⇒ 去重后单类型（首次出现序）')
+    assert.deepEqual(r.listHandlerTypes(), ['AssignmentHandler'], '内置 11 条同型 ⇒ 去重后单类型（首次出现序）')
 
     r.registerMeta('CandidateHandler', { name: 'com.example.CandidateProvider', displayName: '候选人提供者', order: 1 })
     assert.deepEqual(r.listHandlerTypes(), ['AssignmentHandler', 'CandidateHandler'], '显式元数据类型入场（对齐 Java 参考口径）')

@@ -41,6 +41,10 @@ export {
   FormUserDeptMainLeaderAssignmentHandler,
   HANDLER_FORM_USER_DEPT_LEADER,
   HANDLER_FORM_USER_DEPT_MAIN_LEADER,
+  FormDeptLeaderAssignmentHandler,
+  FormDeptMainLeaderAssignmentHandler,
+  HANDLER_FORM_DEPT_LEADER,
+  HANDLER_FORM_DEPT_MAIN_LEADER,
   findFormUserFieldValue,
   firstFormUserId,
 } from './builtin.js'

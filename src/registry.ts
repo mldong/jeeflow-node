@@ -56,6 +56,8 @@ export const BUILTIN_ASSIGNMENT_METAS: HandlerMeta[] = [
   { type: 'AssignmentHandler', name: 'com.mldong.jeeflow.interceptor.impl.OrgUserAssignmentHandlers$TaskRoleAssigneeHandler', displayName: '根据任务节点唯一编码关联角色分配参与者', order: 60 },
   { type: 'AssignmentHandler', name: 'com.mldong.jeeflow.interceptor.impl.FormUserDeptLeaderAssignmentHandler', displayName: '表单指定用户所属部门经理', order: 70 },
   { type: 'AssignmentHandler', name: 'com.mldong.jeeflow.interceptor.impl.FormUserDeptMainLeaderAssignmentHandler', displayName: '表单指定用户所属部门分管领导', order: 80 },
+  { type: 'AssignmentHandler', name: 'com.mldong.jeeflow.interceptor.impl.FormDeptLeaderAssignmentHandler', displayName: '表单指定部门负责人', order: 90 },
+  { type: 'AssignmentHandler', name: 'com.mldong.jeeflow.interceptor.impl.FormDeptMainLeaderAssignmentHandler', displayName: '表单指定部门分管领导', order: 100 },
 ]
 
 /** 处理器注册表——按名称注册/解析 + 元数据清单（对标 Spring IoC / Java HandlerRegistry） */
@@ -65,7 +67,7 @@ export class HandlerRegistry {
   private customs     = new Map<string, ICustomHandler>()
   private metas       = new Map<string, HandlerMeta>()
 
-  /** 构造即内置通用 AssignmentHandler 元数据（issues/16 那 7 条 ＋ 表单指定用户两条；注册名与 Java 类全限定名一致） */
+  /** 构造即内置通用 AssignmentHandler 元数据（issues/16 那 7 条 ＋ 表单指定用户两条 ＋ 表单指定部门两条；注册名与 Java 类全限定名一致） */
   constructor() {
     for (const meta of BUILTIN_ASSIGNMENT_METAS) {
       this.metas.set(meta.name, meta)
